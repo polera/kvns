@@ -5,10 +5,27 @@ A Redis-compatible in-memory key-value store written in Rust. Speaks the [RESP p
 ## Features
 
 - RESP protocol — compatible with `redis-cli` and Redis client libraries
+- Key namespacing via `namespace/key` syntax
 - Configurable memory limit with OOM rejection
 - Key expiry via `SET … EX` / `SET … PX`
-- Prometheus metrics endpoint
+- Prometheus metrics endpoint with per-namespace labels
 - Structured logging via `tracing`
+
+## Key namespacing
+
+Keys may optionally include a namespace prefix separated by `/`:
+
+```
+namespace/localkey
+```
+
+- `SET db1/x 42` — stores key `x` in namespace `db1`
+- `GET db1/x` — retrieves `x` from namespace `db1`
+- Keys with no `/` are placed in the `default` namespace
+
+Only the **first** `/` is treated as the separator, so local keys may themselves contain slashes (e.g. `SET ns/a/b value` → namespace `ns`, key `a/b`).
+
+Namespaces are fully isolated: `db1/x` and `db2/x` are independent keys and their memory usage is tracked separately in metrics.
 
 ## Supported commands
 
@@ -23,6 +40,8 @@ A Redis-compatible in-memory key-value store written in Rust. Speaks the [RESP p
 | `INCR` | `INCR key` | Atomically increments an integer value; initialises to 0 if missing |
 | `LPUSH` | `LPUSH key value [value …]` | Prepends values to a list; creates list if missing |
 | `QUIT` | `QUIT` | Closes the connection |
+
+All commands accept namespaced keys: `SET ns/counter 0`, `INCR ns/counter`, `LPUSH ns/queue item`, etc.
 
 ## Building and running
 
@@ -59,13 +78,15 @@ KVNS_PORT=6379 KVNS_MEMORY_LIMIT=536870912 cargo run
 
 kvns exposes a Prometheus scrape endpoint at `http://<KVNS_METRICS_HOST>:<KVNS_METRICS_PORT>/metrics`.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `kvns_keys_total` | Gauge | Current number of live keys |
-| `kvns_memory_used_bytes` | Gauge | Memory currently used by the store |
-| `kvns_memory_limit_bytes` | Gauge | Configured memory limit |
-| `kvns_command_duration_seconds{command="set"}` | Histogram | SET command latency |
-| `kvns_command_duration_seconds{command="get"}` | Histogram | GET command latency |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `kvns_keys_total` | Gauge | `namespace` | Current number of live keys per namespace |
+| `kvns_memory_used_bytes` | Gauge | `namespace` | Memory currently used per namespace |
+| `kvns_memory_used_bytes_total` | Gauge | — | Total memory used across all namespaces |
+| `kvns_memory_limit_bytes` | Gauge | — | Configured memory limit |
+| `kvns_command_duration_seconds` | Histogram | `command`, `namespace` | Command latency (`set` / `get`) |
+
+Per-namespace gauges are created on first write and set to `0` when the last key in a namespace is removed.
 
 ## Quick smoke test
 
@@ -73,12 +94,24 @@ kvns exposes a Prometheus scrape endpoint at `http://<KVNS_METRICS_HOST>:<KVNS_M
 # Start the server
 cargo run &
 
-# Write and read a key
-redis-cli -p 6480 SET foo bar
-redis-cli -p 6480 GET foo
+# Write keys in different namespaces
+redis-cli -p 6480 SET db1/x 42
+redis-cli -p 6480 SET db2/x 99
+redis-cli -p 6480 SET counter 0
+redis-cli -p 6480 INCR counter
 
-# Check metrics
-curl -s http://localhost:9090/metrics | grep kvns
+# Read them back
+redis-cli -p 6480 GET db1/x   # → 42
+redis-cli -p 6480 GET db2/x   # → 99
+redis-cli -p 6480 GET counter # → 1
+
+# Check per-namespace metrics
+curl -s http://localhost:9090/metrics | grep kvns_memory
+# kvns_memory_used_bytes{namespace="db1"} 6
+# kvns_memory_used_bytes{namespace="db2"} 6
+# kvns_memory_used_bytes{namespace="default"} 16
+# kvns_memory_used_bytes_total 28
+# kvns_memory_limit_bytes 1073741824
 ```
 
 ## Running tests
