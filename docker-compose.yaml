@@ -1,0 +1,22 @@
+services:
+  kvns:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kvns:local
+    container_name: kvns
+    restart: unless-stopped
+    ports:
+      - "6480:6480"
+      - "9090:9090"
+    environment:
+      KVNS_HOST: 0.0.0.0
+      KVNS_PORT: 6480
+      KVNS_METRICS_HOST: 0.0.0.0
+      KVNS_METRICS_PORT: 9090
+      KVNS_PERSIST_PATH: /data/kvns.db
+    volumes:
+      - kvns-data:/data
+
+volumes:
+  kvns-data:

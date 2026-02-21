@@ -81,6 +81,41 @@ Or for development:
 cargo run
 ```
 
+## Container usage (Podman)
+
+Build a local image:
+
+```sh
+make podman-build IMAGE=kvns:local
+```
+
+Run the container directly:
+
+```sh
+make podman-run IMAGE=kvns:local
+```
+
+Use `podman compose` with the included `docker-compose.yaml`:
+
+```sh
+make podman-compose-up
+make podman-compose-logs
+make podman-compose-down
+```
+
+Push a multi-arch image to GitHub Container Registry (GHCR):
+
+```sh
+make podman-login-ghcr GHCR_USER="<github-user>" GHCR_TOKEN="<github-token>"
+make podman-push-ghcr GHCR_IMAGE="ghcr.io/<owner>/<repo>" TAG="v0.1.0"
+```
+
+Notes:
+
+- `podman-push-ghcr` builds and pushes `linux/amd64,linux/arm64` by default
+- Set `PLATFORMS` to override target platforms
+- Set `PUSH_LATEST=false` to skip pushing the `latest` tag
+
 ## Configuration
 
 All settings are read from environment variables at startup.
