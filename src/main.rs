@@ -35,6 +35,7 @@ async fn main() {
     metrics::describe_gauge!("kvns_memory_used_bytes_total", "Total memory currently used by the store in bytes across all namespaces");
     metrics::describe_gauge!("kvns_memory_limit_bytes", "Configured memory limit in bytes");
     metrics::describe_histogram!("kvns_command_duration_seconds", "Command processing latency in seconds");
+    metrics::describe_counter!("kvns_evictions_total", "Number of keys evicted from the store");
 
     // Load persisted state from disk, or start fresh.
     let initial_db = match &config.persist_path {
@@ -63,6 +64,11 @@ async fn main() {
         }
     };
 
+    let initial_db = initial_db.with_eviction(
+        config.eviction_threshold,
+        config.eviction_policy.clone(),
+        config.namespace_eviction_policies.clone(),
+    );
     let store = Arc::new(RwLock::new(initial_db));
 
     // Spawn background flush task if persistence is configured.
