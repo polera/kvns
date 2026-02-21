@@ -130,6 +130,4 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t FILES < <(find dist -type f \( -name '*.tar.gz' -o -name 'SHA256SUMS' \) | sort)
-          gh release create "${GITHUB_REF_NAME}" "${FILES[@]}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" "${FILES[@]}" \
