@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build release check test lint fmt fmt-check clean run \
+.PHONY: help build release check checks ensure-check-tools test lint fmt fmt-check clean run \
 	podman-build podman-run podman-compose-up podman-compose-down podman-compose-logs \
 	podman-login-ghcr podman-push-ghcr
 
@@ -26,6 +26,20 @@ release:
 
 check:
 	$(CARGO_ENV) cargo check
+
+ensure-check-tools:
+	$(CARGO_ENV) if ! cargo clippy --version >/dev/null 2>&1; then \
+		echo "clippy is not installed; bootstrapping via rustup..."; \
+		rustup component add clippy; \
+	fi
+	$(CARGO_ENV) if ! command -v cargo-audit >/dev/null 2>&1; then \
+		echo "cargo-audit is not installed; bootstrapping via cargo install..."; \
+		cargo install --locked cargo-audit; \
+	fi
+
+checks: ensure-check-tools
+	$(CARGO_ENV) cargo clippy -- -D warnings
+	$(CARGO_ENV) cargo audit
 
 test:
 	$(CARGO_ENV) cargo test

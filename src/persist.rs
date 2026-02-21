@@ -4,25 +4,52 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::store::{Db, Entry, Store, Value};
 
 // ── Serializable mirror types ─────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+/// rkyv mirror of `Value`. Uses `Vec` instead of `VecDeque` (not yet supported
+/// by rkyv) and is converted to/from the store type at persist boundaries.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+enum PersistedValue {
+    String(Vec<u8>),
+    List(Vec<Vec<u8>>),
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct PersistedEntry {
-    value: Value,
+    value: PersistedValue,
     hits: u64,
     /// Milliseconds since the Unix epoch at which this entry expires.
     /// `None` means no expiry.
     expiry_unix_ms: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct PersistedDb {
     entries: HashMap<String, HashMap<String, PersistedEntry>>,
+}
+
+// ── Value conversion helpers ──────────────────────────────────────────────────
+
+impl From<&Value> for PersistedValue {
+    fn from(v: &Value) -> Self {
+        match v {
+            Value::String(b) => PersistedValue::String(b.clone()),
+            Value::List(items) => PersistedValue::List(items.iter().cloned().collect()),
+        }
+    }
+}
+
+impl From<PersistedValue> for Value {
+    fn from(p: PersistedValue) -> Self {
+        match p {
+            PersistedValue::String(b) => Value::String(b),
+            PersistedValue::List(items) => Value::List(items.into_iter().collect()),
+        }
+    }
 }
 
 // ── Entry conversion helpers ──────────────────────────────────────────────────
@@ -36,7 +63,7 @@ fn entry_to_persisted(entry: &Entry) -> PersistedEntry {
             .map(|d| d.as_millis() as u64)
     });
     PersistedEntry {
-        value: entry.value.clone(),
+        value: PersistedValue::from(&entry.value),
         hits: entry.hits,
         expiry_unix_ms,
     }
@@ -53,7 +80,7 @@ fn persisted_to_entry(p: PersistedEntry) -> Option<Entry> {
             Some(Instant::now() + remaining)
         }
     };
-    Some(Entry { value: p.value, hits: p.hits, expiry })
+    Some(Entry { value: Value::from(p.value), hits: p.hits, expiry })
 }
 
 // ── Public I/O functions ──────────────────────────────────────────────────────
@@ -79,10 +106,12 @@ pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&persisted)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp)?;
-    bincode::serialize_into(&mut file, &persisted)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    file.write_all(&bytes)?;
     file.flush()?;
     drop(file);
     fs::rename(&tmp, path)?;
@@ -94,9 +123,9 @@ pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
 /// Returns `Err` with `ErrorKind::NotFound` if the file does not exist, which
 /// callers can use to distinguish "first run" from genuine I/O errors.
 pub(crate) fn load(path: &Path, memory_limit: usize) -> io::Result<Db> {
-    let file = File::open(path)?;
-    let persisted: PersistedDb = bincode::deserialize_from(file)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes = fs::read(path)?;
+    let persisted = rkyv::from_bytes::<PersistedDb, rkyv::rancor::Error>(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     let mut db = Db::new(memory_limit);
     for (ns, ns_map) in persisted.entries {

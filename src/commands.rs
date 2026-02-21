@@ -245,10 +245,10 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let old_size = if is_new_key { 0 } else { Db::entry_size(&ns, &key, existing_byte_len) };
     let new_size = Db::entry_size(&ns, &key, existing_byte_len + added_byte_len);
     let net_delta = new_size.saturating_sub(old_size);
-    if db.used_bytes.saturating_add(net_delta) > db.memory_limit {
-        if !db.evict_for_write(&ns, net_delta) {
-            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
-        }
+    if db.used_bytes.saturating_add(net_delta) > db.memory_limit
+        && !db.evict_for_write(&ns, net_delta)
+    {
+        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
 
     // Mutate the list in place — no clone of the existing contents.
