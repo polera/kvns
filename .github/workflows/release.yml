@@ -1,0 +1,142 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure Rust target is installed
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          BIN_NAME="kvns"
+          TARGET="aarch64-apple-darwin"
+          TAG="${GITHUB_REF_NAME}"
+          OUT_DIR="dist"
+          mkdir -p "$OUT_DIR"
+          cp "target/${TARGET}/release/${BIN_NAME}" "$OUT_DIR/${BIN_NAME}"
+          tar -C "$OUT_DIR" -czf "$OUT_DIR/${BIN_NAME}-${TAG}-${TARGET}.tar.gz" "$BIN_NAME"
+          rm "$OUT_DIR/${BIN_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvns-aarch64-apple-darwin
+          path: dist/*.tar.gz
+
+  build-cross:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-linux-gnu
+          - target: x86_64-unknown-freebsd
+            zig_target: x86_64-freebsd
+          - target: aarch64-unknown-freebsd
+            zig_target: aarch64-freebsd
+          - target: x86_64-unknown-openbsd
+            zig_target: x86_64-openbsd
+          - target: aarch64-unknown-openbsd
+            zig_target: aarch64-openbsd
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure Rust target is installed
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Install Zig
+        run: |
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
+          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          mv "zig-linux-x86_64-${ZIG_VERSION}" zig
+
+      - name: Configure linker
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/bin
+          LINKER_SCRIPT=".ci/bin/zigcc-${{ matrix.target }}"
+          cat > "$LINKER_SCRIPT" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          "${GITHUB_WORKSPACE}/zig/zig" cc -target "${{ matrix.zig_target }}" "$@"
+          EOF
+          chmod +x "$LINKER_SCRIPT"
+
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${TARGET_ENV}_LINKER=${GITHUB_WORKSPACE}/${LINKER_SCRIPT}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          BIN_NAME="kvns"
+          TARGET="${{ matrix.target }}"
+          TAG="${GITHUB_REF_NAME}"
+          OUT_DIR="dist"
+          mkdir -p "$OUT_DIR"
+          cp "target/${TARGET}/release/${BIN_NAME}" "$OUT_DIR/${BIN_NAME}"
+          tar -C "$OUT_DIR" -czf "$OUT_DIR/${BIN_NAME}-${TAG}-${TARGET}.tar.gz" "$BIN_NAME"
+          rm "$OUT_DIR/${BIN_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvns-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-macos-arm64
+      - build-cross
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          find dist -type f -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(find dist -type f \( -name '*.tar.gz' -o -name 'SHA256SUMS' \) | sort)
+          gh release create "${GITHUB_REF_NAME}" "${FILES[@]}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
