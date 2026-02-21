@@ -1,8 +1,11 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
+
+use crate::config::EvictionPolicy;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Value {
@@ -64,6 +67,9 @@ pub(crate) struct Db {
     pub(crate) memory_limit: usize,
     /// Per-namespace byte totals used to drive per-namespace gauge labels.
     pub(crate) namespace_bytes: HashMap<String, usize>,
+    pub(crate) eviction_threshold: f64,
+    pub(crate) eviction_policy: EvictionPolicy,
+    pub(crate) namespace_eviction_policies: HashMap<String, EvictionPolicy>,
 }
 
 impl Db {
@@ -75,7 +81,115 @@ impl Db {
             used_bytes: 0,
             memory_limit,
             namespace_bytes: HashMap::new(),
+            eviction_threshold: 1.0,
+            eviction_policy: EvictionPolicy::None,
+            namespace_eviction_policies: HashMap::new(),
         }
+    }
+
+    /// Builder-style setter for eviction configuration.
+    pub(crate) fn with_eviction(
+        mut self,
+        threshold: f64,
+        policy: EvictionPolicy,
+        namespace_policies: HashMap<String, EvictionPolicy>,
+    ) -> Self {
+        self.eviction_threshold = threshold;
+        self.eviction_policy = policy;
+        self.namespace_eviction_policies = namespace_policies;
+        self
+    }
+
+    /// Returns the effective eviction policy for `namespace`, preferring a
+    /// per-namespace override over the global default.
+    fn policy_for_namespace(&self, namespace: &str) -> EvictionPolicy {
+        self.namespace_eviction_policies
+            .get(namespace)
+            .cloned()
+            .unwrap_or_else(|| self.eviction_policy.clone())
+    }
+
+    /// Attempt to free enough memory in `namespace` so that a write of
+    /// `net_delta` additional bytes can succeed.
+    ///
+    /// Returns `true` if there is now enough room for the write; `false` if
+    /// eviction is not configured or could not free enough space.
+    pub(crate) fn evict_for_write(&mut self, namespace: &str, net_delta: usize) -> bool {
+        // 1. Zero-delta writes always fit.
+        if net_delta == 0 {
+            return true;
+        }
+        // 2. No eviction policy → cannot help.
+        let policy = self.policy_for_namespace(namespace);
+        if policy == EvictionPolicy::None {
+            return false;
+        }
+        // 3. Only evict when we are at or above the threshold fraction.
+        let threshold_bytes = (self.memory_limit as f64 * self.eviction_threshold) as usize;
+        if self.used_bytes < threshold_bytes {
+            return false;
+        }
+        // 4. How many bytes do we need to free?
+        let would_use = self.used_bytes.saturating_add(net_delta);
+        if would_use <= self.memory_limit {
+            return true; // already fits
+        }
+        let overflow = would_use - self.memory_limit;
+
+        // 5. Collect (key, hits, size) snapshot — must not hold a live
+        //    reference into self.entries while we call self.delete below.
+        let mut candidates: Vec<(String, u64, usize)> =
+            match self.entries.get(namespace) {
+                None => return false,
+                Some(ns_map) => ns_map
+                    .iter()
+                    .map(|(k, e)| {
+                        (k.clone(), e.hits, Self::entry_size(namespace, k, e.value.byte_len()))
+                    })
+                    .collect(),
+            };
+
+        // 6. Sort by eviction order.
+        match policy {
+            EvictionPolicy::Lru => candidates.sort_by_key(|(_, hits, _)| *hits),
+            EvictionPolicy::Mru => candidates.sort_by_key(|(_, hits, _)| Reverse(*hits)),
+            EvictionPolicy::None => unreachable!(),
+        }
+
+        // 7. Evict until we have freed enough bytes.
+        let mut freed = 0usize;
+        let mut count = 0u64;
+        for (key, _, size) in candidates {
+            if freed >= overflow {
+                break;
+            }
+            self.delete(namespace, &key);
+            freed += size;
+            count += 1;
+        }
+
+        // 8. Trace log.
+        tracing::debug!(namespace, freed, overflow, "evicted keys");
+        // 9. Metric.
+        metrics::counter!("kvns_evictions_total", "namespace" => namespace.to_owned())
+            .increment(count);
+
+        // 10. Did we free enough?
+        self.used_bytes.saturating_add(net_delta) <= self.memory_limit
+    }
+
+    /// Net additional bytes required to store `new_value_byte_len` bytes under
+    /// `(namespace, key)`, accounting for any existing entry that will be
+    /// replaced.  Returns 0 when the new value is smaller than the old one.
+    pub(crate) fn net_delta(&self, namespace: &str, key: &str, new_value_byte_len: usize) -> usize {
+        let new_size = Self::entry_size(namespace, key, new_value_byte_len);
+        let old_size = self
+            .entries
+            .get(namespace)
+            .and_then(|ns| ns.get(key))
+            .map(|e| Self::entry_size(namespace, key, e.value.byte_len()))
+            .unwrap_or(0);
+        new_size.saturating_sub(old_size)
     }
 
     /// Bytes attributed to one entry: namespace + key lengths + value payload.
@@ -148,6 +262,9 @@ pub(crate) type Store = Arc<RwLock<Db>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EvictionPolicy;
+
+    // ── Entry tests ───────────────────────────────────────────────────────────
 
     #[test]
     fn entry_no_ttl_never_expires() {
@@ -172,5 +289,124 @@ mod tests {
         };
         assert!(e.is_expired());
         assert_eq!(e.time_to_expiry_secs(), 0);
+    }
+
+    // ── Eviction tests ────────────────────────────────────────────────────────
+
+    fn make_db_with_eviction(memory_limit: usize, threshold: f64, policy: EvictionPolicy) -> Db {
+        Db::new(memory_limit).with_eviction(threshold, policy, HashMap::new())
+    }
+
+    // Populate a namespace with three entries whose sizes are all equal.
+    // Returns the per-entry size: ns.len() + key.len() + value.len().
+    fn populate_ns(db: &mut Db, ns: &str, entries: &[(&str, u64)], value: &[u8]) -> usize {
+        for (key, hits) in entries {
+            db.put(ns.to_string(), key.to_string(), Entry::new(value.to_vec(), None));
+            db.entries.get_mut(ns).unwrap().get_mut(*key).unwrap().hits = *hits;
+        }
+        Db::entry_size(ns, entries[0].0, value.len())
+    }
+
+    #[test]
+    fn evict_for_write_returns_true_when_net_delta_zero() {
+        let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lru);
+        assert!(db.evict_for_write("ns", 0));
+    }
+
+    #[test]
+    fn evict_for_write_returns_false_when_policy_none() {
+        let mut db = make_db_with_eviction(100, 0.0, EvictionPolicy::None);
+        assert!(!db.evict_for_write("ns", 5));
+    }
+
+    #[test]
+    fn evict_for_write_returns_false_below_threshold() {
+        // threshold=1.0 → threshold_bytes=100; used_bytes=6 < 100 → no eviction
+        let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lru);
+        // "ns"(2) + "a"(1) + "vvv"(3) = 6
+        db.put("ns".to_string(), "a".to_string(), Entry::new(b"vvv".to_vec(), None));
+        assert_eq!(db.used_bytes, 6);
+        // net_delta=100: 6+100=106 > 100, but used_bytes=6 < threshold_bytes=100
+        assert!(!db.evict_for_write("ns", 100));
+    }
+
+    #[test]
+    fn evict_lru_evicts_lowest_hit_key_first() {
+        // memory_limit=30, threshold=0.0 → always triggers
+        let mut db = make_db_with_eviction(30, 0.0, EvictionPolicy::Lru);
+        // Each entry: "ns"(2)+"x"(1)+"vvv"(3) = 6 bytes; 3 entries = 18 used
+        let entry_size = populate_ns(&mut db, "ns", &[("a", 3), ("b", 1), ("c", 5)], b"vvv");
+        assert_eq!(db.used_bytes, entry_size * 3);
+        // net_delta=15: would use 33 > 30; overflow=3; b (hits=1) evicted first
+        assert!(db.evict_for_write("ns", 15));
+        assert!(db.entries.get("ns").unwrap().get("b").is_none(), "b should be evicted");
+        assert!(db.entries.get("ns").unwrap().get("a").is_some());
+        assert!(db.entries.get("ns").unwrap().get("c").is_some());
+    }
+
+    #[test]
+    fn evict_mru_evicts_highest_hit_key_first() {
+        let mut db = make_db_with_eviction(30, 0.0, EvictionPolicy::Mru);
+        populate_ns(&mut db, "ns", &[("a", 3), ("b", 1), ("c", 5)], b"vvv");
+        // net_delta=15: overflow=3; c (hits=5) evicted first
+        assert!(db.evict_for_write("ns", 15));
+        assert!(db.entries.get("ns").unwrap().get("c").is_none(), "c should be evicted");
+        assert!(db.entries.get("ns").unwrap().get("a").is_some());
+        assert!(db.entries.get("ns").unwrap().get("b").is_some());
+    }
+
+    #[test]
+    fn evict_for_write_returns_false_when_not_enough_keys_to_evict() {
+        let mut db = make_db_with_eviction(10, 0.0, EvictionPolicy::Lru);
+        // "ns"(2)+"a"(1)+"vvv"(3) = 6 bytes; net_delta=10 → need 6+10=16, overflow=6
+        // Only 6 bytes available to free (evict "a"), but 6 < overflow=6 → freed=6 >= overflow=6 → fits
+        // Actually 6-6+10 = 10 <= 10 → true. Let's use a bigger delta.
+        // net_delta=15: 6+15=21 > 10, overflow=11; only "a"(6) can be evicted → freed=6 < 11
+        db.put("ns".to_string(), "a".to_string(), Entry::new(b"vvv".to_vec(), None));
+        assert!(!db.evict_for_write("ns", 15));
+    }
+
+    #[test]
+    fn evict_for_write_returns_true_when_exact_fit_after_eviction() {
+        // memory_limit=12, threshold=0.0, LRU
+        // "ns"(2)+"a"(1)+"vvv"(3)=6, "ns"(2)+"b"(1)+"vvv"(3)=6 → used=12
+        // net_delta=6: 12+6=18, overflow=6; evict "a"(6) → used=6, 6+6=12 <= 12 → true
+        let mut db = make_db_with_eviction(12, 0.0, EvictionPolicy::Lru);
+        populate_ns(&mut db, "ns", &[("a", 0), ("b", 1)], b"vvv");
+        assert_eq!(db.used_bytes, 12);
+        assert!(db.evict_for_write("ns", 6));
+        assert!(db.entries.get("ns").unwrap().get("a").is_none());
+    }
+
+    #[test]
+    fn per_namespace_policy_overrides_global() {
+        let mut ns_policies = HashMap::new();
+        ns_policies.insert("special".to_string(), EvictionPolicy::Mru);
+        let db = Db::new(100).with_eviction(1.0, EvictionPolicy::Lru, ns_policies);
+        assert_eq!(db.policy_for_namespace("special"), EvictionPolicy::Mru);
+        assert_eq!(db.policy_for_namespace("other"), EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn net_delta_new_key() {
+        let db = Db::new(1000);
+        // "ns"(2)+"k"(1)+"val"(3) = 6, old=0
+        assert_eq!(db.net_delta("ns", "k", 3), 6);
+    }
+
+    #[test]
+    fn net_delta_existing_key_grows() {
+        let mut db = Db::new(1000);
+        db.put("ns".to_string(), "k".to_string(), Entry::new(b"hi".to_vec(), None));
+        // old: "ns"(2)+"k"(1)+"hi"(2)=5; new: "ns"(2)+"k"(1)+"hello"(5)=8; delta=3
+        assert_eq!(db.net_delta("ns", "k", 5), 3);
+    }
+
+    #[test]
+    fn net_delta_existing_key_shrinks_returns_zero() {
+        let mut db = Db::new(1000);
+        db.put("ns".to_string(), "k".to_string(), Entry::new(b"hello".to_vec(), None));
+        // old=8, new=5: saturating_sub → 0
+        assert_eq!(db.net_delta("ns", "k", 2), 0);
     }
 }

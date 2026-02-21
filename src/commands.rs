@@ -57,8 +57,11 @@ async fn cmd_set_inner(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let mut db = store.write().await;
     if db.would_exceed(&ns, &key, value.len()) {
-        warn!(namespace = %ns, key = %key, "SET rejected: memory limit exceeded");
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        let net_delta = db.net_delta(&ns, &key, value.len());
+        if !db.evict_for_write(&ns, net_delta) {
+            warn!(namespace = %ns, key = %key, "SET rejected: memory limit exceeded");
+            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        }
     }
     let entry = Entry::new(value, ttl);
     let expiry = entry.expiry;
@@ -206,7 +209,10 @@ pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let new_value = next.to_string().into_bytes();
     if db.would_exceed(&ns, &key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        let net_delta = db.net_delta(&ns, &key, new_value.len());
+        if !db.evict_for_write(&ns, net_delta) {
+            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        }
     }
     debug!(namespace = %ns, key = %key, value = next, "INCR");
     db.put(ns, key, Entry::new(new_value, None));
@@ -240,7 +246,9 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let new_size = Db::entry_size(&ns, &key, existing_byte_len + added_byte_len);
     let net_delta = new_size.saturating_sub(old_size);
     if db.used_bytes.saturating_add(net_delta) > db.memory_limit {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        if !db.evict_for_write(&ns, net_delta) {
+            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        }
     }
 
     // Mutate the list in place — no clone of the existing contents.
