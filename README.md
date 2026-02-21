@@ -13,6 +13,7 @@ This project is an experiment and in part, uses code generated with models from 
 - Configurable memory limit with OOM rejection
 - Key expiry via `SET … EX` / `SET … PX`
 - Optional disk persistence with configurable flush interval
+- Configurable eviction (LRU / MRU) with per-namespace policy overrides
 - Prometheus metrics endpoint with per-namespace labels
 - Structured logging via `tracing`
 
@@ -93,6 +94,9 @@ All settings are read from environment variables at startup.
 | `KVNS_METRICS_PORT` | `9090` | Prometheus metrics port |
 | `KVNS_PERSIST_PATH` | *(unset)* | Path to the persistence file; persistence is disabled if unset |
 | `KVNS_PERSIST_INTERVAL` | `300` | Seconds between automatic flushes to disk |
+| `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `lru`, `mru`, or `none` |
+| `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0–1.0) at which eviction triggers |
+| `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides: `ns1:lru,ns2:mru` |
 
 Example:
 
@@ -101,7 +105,42 @@ KVNS_PORT=6379 KVNS_MEMORY_LIMIT=536870912 cargo run
 
 # With persistence enabled
 KVNS_PERSIST_PATH=/var/lib/kvns/db.bin KVNS_PERSIST_INTERVAL=60 cargo run
+
+# With LRU eviction, triggering at 80% capacity
+KVNS_EVICTION_POLICY=lru KVNS_EVICTION_THRESHOLD=0.8 cargo run
+
+# Per-namespace overrides: cache namespace uses MRU, sessions namespace uses LRU
+KVNS_EVICTION_POLICY=lru KVNS_NS_EVICTION=cache:mru cargo run
 ```
+
+## Eviction
+
+When the store reaches capacity, writes that would exceed `KVNS_MEMORY_LIMIT` are normally rejected with an OOM error. Configuring an eviction policy tells kvns to automatically remove existing keys instead of rejecting the write.
+
+### Policies
+
+| Policy | Description |
+|--------|-------------|
+| `none` | No eviction (default). Writes beyond the limit return an error. |
+| `lru` | Evict the least-recently-used keys first (lowest hit count). |
+| `mru` | Evict the most-recently-used keys first (highest hit count). |
+
+Hit counts are updated by `GET` and can be reset to zero with `TOUCH`.
+
+### Threshold
+
+`KVNS_EVICTION_THRESHOLD` (default `1.0`) sets the fraction of `KVNS_MEMORY_LIMIT` at which eviction begins. At the default of `1.0` eviction only triggers once the limit is fully reached. Setting it lower (e.g. `0.8`) starts evicting at 80% capacity, keeping headroom for bursty writes.
+
+### Per-namespace overrides
+
+`KVNS_NS_EVICTION` accepts a comma-separated list of `namespace:policy` pairs. A namespace listed here uses that policy regardless of the global setting:
+
+```sh
+# Global policy is LRU, but the "cache" namespace uses MRU
+KVNS_EVICTION_POLICY=lru KVNS_NS_EVICTION=cache:mru cargo run
+```
+
+Eviction is always scoped to the namespace of the incoming write — keys from other namespaces are never evicted to make room.
 
 ## Persistence
 
@@ -124,6 +163,7 @@ kvns exposes a Prometheus scrape endpoint at `http://<KVNS_METRICS_HOST>:<KVNS_M
 | `kvns_memory_used_bytes_total` | Gauge | — | Total memory used across all namespaces |
 | `kvns_memory_limit_bytes` | Gauge | — | Configured memory limit |
 | `kvns_command_duration_seconds` | Histogram | `command`, `namespace` | Command latency (`set` / `get`) |
+| `kvns_evictions_total` | Counter | `namespace` | Cumulative number of keys evicted per namespace |
 
 Per-namespace gauges are created on first write and set to `0` when the last key in a namespace is removed.
 
