@@ -52,8 +52,6 @@ jobs:
             zig_target: x86_64-linux-gnu
           - target: aarch64-unknown-linux-gnu
             zig_target: aarch64-linux-gnu
-          - target: x86_64-unknown-freebsd
-            zig_target: x86_64-freebsd
 
     steps:
       - name: Checkout
