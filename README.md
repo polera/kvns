@@ -2,6 +2,10 @@
 
 A Redis-compatible in-memory key-value store written in Rust. Speaks the [RESP protocol](https://redis.io/docs/latest/develop/reference/protocol-spec/) so any Redis client works out of the box.
 
+
+## LLM Disclosure
+This project is an experiment and in part, uses code generated with models from Anthropic.
+
 ## Features
 
 - RESP protocol — compatible with `redis-cli` and Redis client libraries
