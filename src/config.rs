@@ -73,6 +73,7 @@ impl Config {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_vars(
         port: Option<&str>,
         host: Option<&str>,
