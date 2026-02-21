@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -77,13 +78,56 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     info!(addr = %addr, "kvns listening");
 
+    #[cfg(unix)]
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                debug!(%peer, "accepted connection");
-                tokio::spawn(server::handle_connection(stream, Arc::clone(&store)));
+        #[cfg(unix)]
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, peer)) => {
+                        debug!(%peer, "accepted connection");
+                        tokio::spawn(server::handle_connection(stream, Arc::clone(&store)));
+                    }
+                    Err(e) => error!(?e, "accept error"),
+                }
             }
-            Err(e) => error!(?e, "accept error"),
+            _ = signal::ctrl_c() => {
+                info!("received SIGINT, shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
+                break;
+            }
+        }
+
+        #[cfg(not(unix))]
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, peer)) => {
+                        debug!(%peer, "accepted connection");
+                        tokio::spawn(server::handle_connection(stream, Arc::clone(&store)));
+                    }
+                    Err(e) => error!(?e, "accept error"),
+                }
+            }
+            _ = signal::ctrl_c() => {
+                info!("received SIGINT, shutting down");
+                break;
+            }
+        }
+    }
+
+    if let Some(ref path) = config.persist_path {
+        info!(path = %path, "flushing store to disk on shutdown");
+        let db = store.read().await;
+        match persist::save(&db, &PathBuf::from(path)) {
+            Ok(()) => info!(path = %path, "store flushed to disk"),
+            Err(e) => error!(error = %e, path = %path, "failed to flush store to disk on shutdown"),
         }
     }
 }
