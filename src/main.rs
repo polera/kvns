@@ -1,6 +1,6 @@
 mod config;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,12 +9,33 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 // ─── Store ────────────────────────────────────────────────────────────────────
 
+enum Value {
+    String(Vec<u8>),
+    List(VecDeque<Vec<u8>>),
+}
+
+impl Value {
+    fn byte_len(&self) -> usize {
+        match self {
+            Value::String(b) => b.len(),
+            Value::List(items) => items.iter().map(|b| b.len()).sum(),
+        }
+    }
+
+    fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Value::String(b) => Some(b),
+            Value::List(_) => None,
+        }
+    }
+}
+
 struct Entry {
-    value: Vec<u8>,
+    value: Value,
     hits: u64,
     expiry: Option<Instant>,
 }
@@ -22,7 +43,7 @@ struct Entry {
 impl Entry {
     fn new(value: Vec<u8>, ttl: Option<Duration>) -> Self {
         Self {
-            value,
+            value: Value::String(value),
             hits: 0,
             expiry: ttl.map(|d| Instant::now() + d),
         }
@@ -61,27 +82,27 @@ impl Db {
         }
     }
 
-    fn entry_size(key: &str, value: &[u8]) -> usize {
-        key.len() + value.len()
+    fn entry_size(key: &str, value_byte_len: usize) -> usize {
+        key.len() + value_byte_len
     }
 
-    fn would_exceed(&self, key: &str, value: &[u8]) -> bool {
-        let new_size = Self::entry_size(key, value);
+    fn would_exceed(&self, key: &str, new_value_byte_len: usize) -> bool {
+        let new_size = Self::entry_size(key, new_value_byte_len);
         let old_size = self
             .entries
             .get(key)
-            .map(|e| Self::entry_size(key, &e.value))
+            .map(|e| Self::entry_size(key, e.value.byte_len()))
             .unwrap_or(0);
         let net_delta = new_size.saturating_sub(old_size);
         self.used_bytes.saturating_add(net_delta) > self.memory_limit
     }
 
     fn put(&mut self, key: String, entry: Entry) {
-        let new_size = Self::entry_size(&key, &entry.value);
+        let new_size = Self::entry_size(&key, entry.value.byte_len());
         let old_size = self
             .entries
             .get(&key)
-            .map(|e| Self::entry_size(&key, &e.value))
+            .map(|e| Self::entry_size(&key, e.value.byte_len()))
             .unwrap_or(0);
         self.used_bytes = self
             .used_bytes
@@ -95,7 +116,7 @@ impl Db {
     fn delete(&mut self, key: &str) -> Option<Entry> {
         let removed = self.entries.remove(key);
         if let Some(ref e) = removed {
-            let size = Self::entry_size(key, &e.value);
+            let size = Self::entry_size(key, e.value.byte_len());
             self.used_bytes = self.used_bytes.saturating_sub(size);
         }
         metrics::gauge!("kvns_keys_total").set(self.entries.len() as f64);
@@ -163,6 +184,7 @@ fn resp_pong() -> Vec<u8>         { b"+PONG\r\n".to_vec() }
 fn resp_null() -> Vec<u8>         { b"$-1\r\n".to_vec() }
 fn resp_int(n: i64) -> Vec<u8>    { format!(":{n}\r\n").into_bytes() }
 fn resp_err(msg: &str) -> Vec<u8> { format!("-ERR {msg}\r\n").into_bytes() }
+fn resp_wrongtype() -> Vec<u8>    { b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec() }
 
 fn resp_bulk(data: &[u8]) -> Vec<u8> {
     let mut out = format!("${}\r\n", data.len()).into_bytes();
@@ -181,6 +203,14 @@ fn wrong_args(cmd: &[u8]) -> Vec<u8> {
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+    let start = Instant::now();
+    let resp = cmd_set_inner(args, store).await;
+    metrics::histogram!("kvns_command_duration_seconds", "command" => "set")
+        .record(start.elapsed().as_secs_f64());
+    resp
+}
+
+async fn cmd_set_inner(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if args.len() != 3 && args.len() != 5 {
         return wrong_args(&args[0]);
     }
@@ -203,11 +233,13 @@ async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
 
     let mut db = store.write().await;
-    if db.would_exceed(&key, &value) {
+    if db.would_exceed(&key, value.len()) {
+        warn!(key = %key, "SET rejected: memory limit exceeded");
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
     let entry = Entry::new(value, ttl);
     let expiry = entry.expiry;
+    debug!(key = %key, ttl = ?ttl, "SET");
     db.put(key.clone(), entry);
     drop(db);
 
@@ -233,6 +265,14 @@ async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 }
 
 async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+    let start = Instant::now();
+    let resp = cmd_get_inner(args, store).await;
+    metrics::histogram!("kvns_command_duration_seconds", "command" => "get")
+        .record(start.elapsed().as_secs_f64());
+    resp
+}
+
+async fn cmd_get_inner(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -248,10 +288,15 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     match db.entries.get_mut(&key) {
         None => resp_null(),
         Some(entry) => {
-            entry.hits += 1;
-            let value = entry.value.clone();
-            debug!(key = %key, hits = entry.hits, "GET");
-            resp_bulk(&value)
+            match entry.value.as_string() {
+                None => resp_wrongtype(),
+                Some(bytes) => {
+                    entry.hits += 1;
+                    let value = bytes.to_vec();
+                    debug!(key = %key, hits = entry.hits, "GET");
+                    resp_bulk(&value)
+                }
+            }
         }
     }
 }
@@ -262,6 +307,7 @@ async fn cmd_del(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let key = String::from_utf8_lossy(&args[1]);
     let removed = store.write().await.delete(key.as_ref()).is_some();
+    debug!(key = %key, removed, "DEL");
     resp_int(if removed { 1 } else { 0 })
 }
 
@@ -301,9 +347,12 @@ async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let current: i64 = match db.entries.get(&key) {
         None => 0,
-        Some(entry) => match std::str::from_utf8(&entry.value).ok().and_then(|s| s.parse().ok()) {
-            Some(n) => n,
-            None => return resp_err("value is not an integer or out of range"),
+        Some(entry) => match entry.value.as_string() {
+            None => return resp_wrongtype(),
+            Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return resp_err("value is not an integer or out of range"),
+            },
         },
     };
 
@@ -313,11 +362,43 @@ async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
 
     let new_value = next.to_string().into_bytes();
-    if db.would_exceed(&key, &new_value) {
+    if db.would_exceed(&key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
+    debug!(key = %key, value = next, "INCR");
     db.put(key, Entry::new(new_value, None));
     resp_int(next)
+}
+
+async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+    if args.len() < 3 {
+        return wrong_args(&args[0]);
+    }
+    let key = String::from_utf8_lossy(&args[1]).into_owned();
+    let new_items = &args[2..];
+    let mut db = store.write().await;
+
+    let (mut list, expiry, hits) = match db.entries.get(&key) {
+        None => (VecDeque::new(), None, 0u64),
+        Some(e) => match &e.value {
+            Value::List(l) => (l.clone(), e.expiry, e.hits),
+            Value::String(_) => return resp_wrongtype(),
+        },
+    };
+
+    let new_value_byte_len = list.iter().map(|v| v.len()).sum::<usize>()
+        + new_items.iter().map(|v| v.len()).sum::<usize>();
+    if db.would_exceed(&key, new_value_byte_len) {
+        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+    }
+
+    for item in new_items.iter() {
+        list.push_front(item.clone());
+    }
+    let len = list.len();
+    debug!(key = %key, len, "LPUSH");
+    db.put(key, Entry { value: Value::List(list), hits, expiry });
+    resp_int(len as i64)
 }
 
 async fn dispatch(args: &[Vec<u8>], store: &Store) -> (Vec<u8>, bool) {
@@ -331,6 +412,7 @@ async fn dispatch(args: &[Vec<u8>], store: &Store) -> (Vec<u8>, bool) {
         "ttl"   => cmd_ttl(args, store).await,
         "touch" => cmd_touch(args, store).await,
         "incr"  => cmd_incr(args, store).await,
+        "lpush" => cmd_lpush(args, store).await,
         _ => format!(
             "-ERR unknown command {}\r\n",
             String::from_utf8_lossy(&args[0])
@@ -355,7 +437,10 @@ async fn handle_connection(stream: TcpStream, store: Store) {
                     break;
                 }
             }
-            Err(_) => break,
+            Err(e) => {
+                debug!(error = %e, "parse error, closing connection");
+                break;
+            }
         }
     }
 }
@@ -399,7 +484,7 @@ mod tests {
     #[test]
     fn entry_elapsed_ttl_is_expired() {
         let e = Entry {
-            value: b"v".to_vec(),
+            value: Value::String(b"v".to_vec()),
             hits: 0,
             expiry: Some(Instant::now() - Duration::from_secs(1)),
         };
@@ -816,6 +901,92 @@ mod tests {
         cmd_incr(&args(&["INCR", "n"]), &store).await;
         assert_eq!(cmd_get(&args(&["GET", "n"]), &store).await, b"$1\r\n1\r\n");
     }
+
+    #[tokio::test]
+    async fn incr_on_list_key_returns_wrongtype() {
+        let store = make_store();
+        cmd_lpush(&args(&["LPUSH", "l", "a"]), &store).await;
+        let resp = cmd_incr(&args(&["INCR", "l"]), &store).await;
+        assert!(resp.starts_with(b"-WRONGTYPE"));
+    }
+
+    // ── LPUSH ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lpush_missing_key_creates_list_and_returns_1() {
+        let store = make_store();
+        assert_eq!(cmd_lpush(&args(&["LPUSH", "l", "a"]), &store).await, b":1\r\n");
+    }
+
+    #[tokio::test]
+    async fn lpush_prepends_to_existing_list() {
+        let store = make_store();
+        cmd_lpush(&args(&["LPUSH", "l", "a"]), &store).await;
+        assert_eq!(cmd_lpush(&args(&["LPUSH", "l", "b"]), &store).await, b":2\r\n");
+    }
+
+    #[tokio::test]
+    async fn lpush_multiple_values_prepended_in_order() {
+        // LPUSH l a b c → list becomes [c, b, a]
+        let store = make_store();
+        cmd_lpush(&args(&["LPUSH", "l", "a", "b", "c"]), &store).await;
+        let db = store.read().await;
+        let list = match &db.entries.get("l").unwrap().value {
+            Value::List(l) => l.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+            _ => panic!("expected list"),
+        };
+        assert_eq!(list, vec![b"c" as &[u8], b"b", b"a"]);
+    }
+
+    #[tokio::test]
+    async fn lpush_returns_length_after_each_push() {
+        let store = make_store();
+        assert_eq!(cmd_lpush(&args(&["LPUSH", "l", "x"]), &store).await, b":1\r\n");
+        assert_eq!(cmd_lpush(&args(&["LPUSH", "l", "y"]), &store).await, b":2\r\n");
+        assert_eq!(cmd_lpush(&args(&["LPUSH", "l", "z"]), &store).await, b":3\r\n");
+    }
+
+    #[tokio::test]
+    async fn lpush_wrong_args_returns_error() {
+        let store = make_store();
+        let resp = cmd_lpush(&args(&["LPUSH", "l"]), &store).await;
+        assert!(resp.starts_with(b"-ERR"));
+    }
+
+    #[tokio::test]
+    async fn lpush_on_string_key_returns_wrongtype() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        let resp = cmd_lpush(&args(&["LPUSH", "k", "a"]), &store).await;
+        assert!(resp.starts_with(b"-WRONGTYPE"));
+    }
+
+    #[tokio::test]
+    async fn get_on_list_key_returns_wrongtype() {
+        let store = make_store();
+        cmd_lpush(&args(&["LPUSH", "l", "a"]), &store).await;
+        let resp = cmd_get(&args(&["GET", "l"]), &store).await;
+        assert!(resp.starts_with(b"-WRONGTYPE"));
+    }
+
+    #[tokio::test]
+    async fn lpush_updates_used_bytes() {
+        let store = make_store();
+        // key "l" (1) + value "ab" (2) = 3
+        cmd_lpush(&args(&["LPUSH", "l", "ab"]), &store).await;
+        assert_eq!(store.read().await.used_bytes, 3);
+        // add "cd" (2 more value bytes) → key "l" (1) + "ab"+"cd" (4) = 5
+        cmd_lpush(&args(&["LPUSH", "l", "cd"]), &store).await;
+        assert_eq!(store.read().await.used_bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn del_removes_list_key() {
+        let store = make_store();
+        cmd_lpush(&args(&["LPUSH", "l", "a"]), &store).await;
+        assert_eq!(cmd_del(&args(&["DEL", "l"]), &store).await, b":1\r\n");
+        assert_eq!(store.read().await.used_bytes, 0);
+    }
 }
 
 #[tokio::main]
@@ -836,6 +1007,7 @@ async fn main() {
     metrics::describe_gauge!("kvns_keys_total", "Number of keys in the store");
     metrics::describe_gauge!("kvns_memory_used_bytes", "Memory currently used by the store in bytes");
     metrics::describe_gauge!("kvns_memory_limit_bytes", "Configured memory limit in bytes");
+    metrics::describe_histogram!("kvns_command_duration_seconds", "Command processing latency in seconds");
 
     let store: Store = Arc::new(RwLock::new(Db::new(config.memory_limit)));
     let addr = config.listen_addr();
