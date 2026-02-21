@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::resp::{
-    resp_bulk, resp_err, resp_int, resp_null, resp_ok, resp_pong, resp_wrongtype, wrong_args,
+    resp_array, resp_bulk, resp_err, resp_int, resp_null, resp_ok, resp_pong, resp_wrongtype,
+    wrong_args,
 };
 use crate::store::{Db, Entry, Store, Value};
 
@@ -274,6 +275,88 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(len as i64)
 }
 
+// ── Glob matching ─────────────────────────────────────────────────────────────
+
+/// Returns true if `ch` is within the bracket-expression `class` (the content
+/// between `[` and `]`, without the enclosing brackets).
+/// Supports negation (`^` or `!`), literal characters, and ranges (`a-z`).
+fn class_match(class: &[u8], ch: u8) -> bool {
+    let (negate, class) = match class.first() {
+        Some(b'^') | Some(b'!') => (true, &class[1..]),
+        _ => (false, class),
+    };
+    let mut i = 0;
+    let mut found = false;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == b'-' {
+            if ch >= class[i] && ch <= class[i + 2] {
+                found = true;
+            }
+            i += 3;
+        } else {
+            if ch == class[i] {
+                found = true;
+            }
+            i += 1;
+        }
+    }
+    if negate { !found } else { found }
+}
+
+/// Redis-compatible glob match supporting `*`, `?`, and `[...]` / `[^...]`.
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    match (pattern, text) {
+        ([], []) => true,
+        ([], _) => false,
+        ([b'*', rest @ ..], _) => {
+            // `*` matches zero or more characters.
+            glob_match(rest, text)
+                || (!text.is_empty() && glob_match(pattern, &text[1..]))
+        }
+        (_, []) => false,
+        ([b'?', p_rest @ ..], [_, t_rest @ ..]) => glob_match(p_rest, t_rest),
+        ([b'[', p_rest @ ..], [ch, t_rest @ ..]) => {
+            match p_rest.iter().position(|&b| b == b']') {
+                // No closing `]` — treat `[` as a literal character.
+                None => *ch == b'[' && glob_match(p_rest, t_rest),
+                Some(end) => {
+                    class_match(&p_rest[..end], *ch)
+                        && glob_match(&p_rest[end + 1..], t_rest)
+                }
+            }
+        }
+        ([p, p_rest @ ..], [t, t_rest @ ..]) => *p == *t && glob_match(p_rest, t_rest),
+    }
+}
+
+pub(crate) async fn cmd_keys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+    if args.len() != 2 {
+        return wrong_args(&args[0]);
+    }
+    let pattern = &args[1];
+    let db = store.read().await;
+
+    let mut matched: Vec<Vec<u8>> = Vec::new();
+    for (ns, ns_map) in &db.entries {
+        for (key, entry) in ns_map {
+            if entry.is_expired() {
+                continue;
+            }
+            // Reconstruct the client-visible key: bare for "default", prefixed for others.
+            let display: Vec<u8> = if ns == "default" {
+                key.as_bytes().to_vec()
+            } else {
+                format!("{ns}/{key}").into_bytes()
+            };
+            if glob_match(pattern, &display) {
+                matched.push(display);
+            }
+        }
+    }
+    matched.sort();
+    resp_array(&matched)
+}
+
 pub(crate) async fn dispatch(args: &[Vec<u8>], store: &Store) -> (Vec<u8>, bool) {
     let cmd = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
     let resp = match cmd.as_str() {
@@ -286,6 +369,7 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &Store) -> (Vec<u8>, bool)
         "touch" => cmd_touch(args, store).await,
         "incr"  => cmd_incr(args, store).await,
         "lpush" => cmd_lpush(args, store).await,
+        "keys"  => cmd_keys(args, store).await,
         _ => format!(
             "-ERR unknown command {}\r\n",
             String::from_utf8_lossy(&args[0])
@@ -878,5 +962,151 @@ mod tests {
         // "ns" (2) + "k" (1) + "v" (1) = 4
         cmd_set(&args(&["SET", "ns/k", "v"]), &store).await;
         assert_eq!(store.read().await.used_bytes, 4);
+    }
+
+    // ── glob_match unit tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn glob_star_matches_anything() {
+        assert!(glob_match(b"*", b"hello"));
+        assert!(glob_match(b"*", b""));
+        assert!(glob_match(b"h*", b"hello"));
+        assert!(glob_match(b"*o", b"hello"));
+        assert!(glob_match(b"h*o", b"hello"));
+        assert!(!glob_match(b"h*x", b"hello"));
+    }
+
+    #[test]
+    fn glob_question_mark_matches_one_char() {
+        assert!(glob_match(b"h?llo", b"hello"));
+        assert!(glob_match(b"h?llo", b"hallo"));
+        assert!(!glob_match(b"h?llo", b"hllo"));
+        assert!(!glob_match(b"h?llo", b"heello"));
+    }
+
+    #[test]
+    fn glob_bracket_class() {
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hallo"));
+        assert!(!glob_match(b"h[ae]llo", b"hillo"));
+    }
+
+    #[test]
+    fn glob_bracket_negate() {
+        assert!(glob_match(b"h[^e]llo", b"hallo"));
+        assert!(!glob_match(b"h[^e]llo", b"hello"));
+        assert!(glob_match(b"h[!e]llo", b"hbllo"));
+    }
+
+    #[test]
+    fn glob_bracket_range() {
+        assert!(glob_match(b"h[a-b]llo", b"hallo"));
+        assert!(glob_match(b"h[a-b]llo", b"hbllo"));
+        assert!(!glob_match(b"h[a-b]llo", b"hcllo"));
+    }
+
+    // ── KEYS command tests ────────────────────────────────────────────────────
+
+    fn parse_keys_resp(resp: &[u8]) -> Vec<String> {
+        // Decode a RESP array of bulk strings into a sorted Vec<String>.
+        let s = std::str::from_utf8(resp).unwrap();
+        let mut lines = s.split("\r\n");
+        let header = lines.next().unwrap();
+        assert!(header.starts_with('*'));
+        let count: usize = header[1..].parse().unwrap();
+        let mut keys = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len_line = lines.next().unwrap();
+            assert!(len_line.starts_with('$'));
+            keys.push(lines.next().unwrap().to_string());
+        }
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn keys_wildcard_returns_all_keys() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "foo", "1"]), &store).await;
+        cmd_set(&args(&["SET", "bar", "2"]), &store).await;
+        let resp = cmd_keys(&args(&["KEYS", "*"]), &store).await;
+        let keys = parse_keys_resp(&resp);
+        assert_eq!(keys, vec!["bar", "foo"]);
+    }
+
+    #[tokio::test]
+    async fn keys_empty_store_returns_empty_array() {
+        let store = make_store();
+        assert_eq!(cmd_keys(&args(&["KEYS", "*"]), &store).await, b"*0\r\n");
+    }
+
+    #[tokio::test]
+    async fn keys_prefix_pattern() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "foo", "1"]), &store).await;
+        cmd_set(&args(&["SET", "foobar", "2"]), &store).await;
+        cmd_set(&args(&["SET", "baz", "3"]), &store).await;
+        let keys = parse_keys_resp(&cmd_keys(&args(&["KEYS", "foo*"]), &store).await);
+        assert_eq!(keys, vec!["foo", "foobar"]);
+    }
+
+    #[tokio::test]
+    async fn keys_question_mark_pattern() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "hello", "1"]), &store).await;
+        cmd_set(&args(&["SET", "hallo", "2"]), &store).await;
+        cmd_set(&args(&["SET", "hillo", "3"]), &store).await;
+        cmd_set(&args(&["SET", "world", "4"]), &store).await;
+        let keys = parse_keys_resp(&cmd_keys(&args(&["KEYS", "h?llo"]), &store).await);
+        assert_eq!(keys, vec!["hallo", "hello", "hillo"]);
+    }
+
+    #[tokio::test]
+    async fn keys_bracket_pattern() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "hello", "1"]), &store).await;
+        cmd_set(&args(&["SET", "hallo", "2"]), &store).await;
+        cmd_set(&args(&["SET", "hillo", "3"]), &store).await;
+        let keys = parse_keys_resp(&cmd_keys(&args(&["KEYS", "h[ae]llo"]), &store).await);
+        assert_eq!(keys, vec!["hallo", "hello"]);
+    }
+
+    #[tokio::test]
+    async fn keys_no_match_returns_empty_array() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "foo", "1"]), &store).await;
+        assert_eq!(cmd_keys(&args(&["KEYS", "z*"]), &store).await, b"*0\r\n");
+    }
+
+    #[tokio::test]
+    async fn keys_skips_expired_entries() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "live", "1"]), &store).await;
+        cmd_set(&args(&["SET", "dying", "2", "PX", "1"]), &store).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let keys = parse_keys_resp(&cmd_keys(&args(&["KEYS", "*"]), &store).await);
+        assert_eq!(keys, vec!["live"]);
+    }
+
+    #[tokio::test]
+    async fn keys_namespaced_wildcard() {
+        let store = make_store();
+        cmd_set(&args(&["SET", "ns1/a", "1"]), &store).await;
+        cmd_set(&args(&["SET", "ns1/b", "2"]), &store).await;
+        cmd_set(&args(&["SET", "ns2/c", "3"]), &store).await;
+        cmd_set(&args(&["SET", "plain", "4"]), &store).await;
+        let all = parse_keys_resp(&cmd_keys(&args(&["KEYS", "*"]), &store).await);
+        assert!(all.contains(&"ns1/a".to_string()));
+        assert!(all.contains(&"ns1/b".to_string()));
+        assert!(all.contains(&"ns2/c".to_string()));
+        assert!(all.contains(&"plain".to_string()));
+        let ns1 = parse_keys_resp(&cmd_keys(&args(&["KEYS", "ns1/*"]), &store).await);
+        assert_eq!(ns1, vec!["ns1/a", "ns1/b"]);
+    }
+
+    #[tokio::test]
+    async fn keys_wrong_args_returns_error() {
+        let store = make_store();
+        assert!(cmd_keys(&args(&["KEYS"]), &store).await.starts_with(b"-ERR"));
     }
 }

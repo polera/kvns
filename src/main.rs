@@ -1,16 +1,18 @@
 mod commands;
 mod config;
+mod persist;
 mod resp;
 mod server;
 mod store;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -33,7 +35,44 @@ async fn main() {
     metrics::describe_gauge!("kvns_memory_limit_bytes", "Configured memory limit in bytes");
     metrics::describe_histogram!("kvns_command_duration_seconds", "Command processing latency in seconds");
 
-    let store = Arc::new(RwLock::new(store::Db::new(config.memory_limit)));
+    // Load persisted state from disk, or start fresh.
+    let initial_db = match &config.persist_path {
+        None => store::Db::new(config.memory_limit),
+        Some(path) => {
+            let p = PathBuf::from(path);
+            match persist::load(&p, config.memory_limit) {
+                Ok(db) => {
+                    let key_count: usize = db.entries.values().map(|ns| ns.len()).sum();
+                    info!(
+                        path = %path,
+                        keys = key_count,
+                        "loaded store from disk"
+                    );
+                    db
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    info!(path = %path, "no existing store file, starting fresh");
+                    store::Db::new(config.memory_limit)
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %path, "failed to load store from disk, starting fresh");
+                    store::Db::new(config.memory_limit)
+                }
+            }
+        }
+    };
+
+    let store = Arc::new(RwLock::new(initial_db));
+
+    // Spawn background flush task if persistence is configured.
+    if let Some(ref path) = config.persist_path {
+        tokio::spawn(persist::run_periodic_flush(
+            Arc::clone(&store),
+            PathBuf::from(path),
+            config.persist_interval_secs,
+        ));
+    }
+
     let addr = config.listen_addr();
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     info!(addr = %addr, "kvns listening");

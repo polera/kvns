@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Value {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),

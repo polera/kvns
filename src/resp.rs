@@ -64,6 +64,14 @@ pub(crate) fn resp_bulk(data: &[u8]) -> Vec<u8> {
     out
 }
 
+pub(crate) fn resp_array(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", items.len()).into_bytes();
+    for item in items {
+        out.extend_from_slice(&resp_bulk(item));
+    }
+    out
+}
+
 pub(crate) fn wrong_args(cmd: &[u8]) -> Vec<u8> {
     resp_err(&format!(
         "wrong number of arguments for {}",
