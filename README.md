@@ -106,6 +106,8 @@ When `KVNS_PERSIST_PATH` is set, kvns periodically serializes the entire store t
 - Persistence is **opt-in** — omitting `KVNS_PERSIST_PATH` keeps the store fully in-memory
 - Writes are atomic: a crash mid-flush will never corrupt the existing file
 - The flush interval (default 5 minutes) is configurable via `KVNS_PERSIST_INTERVAL`
+- On clean shutdown (SIGINT / SIGTERM) the store is flushed to disk immediately
+- Parent directories of `KVNS_PERSIST_PATH` are created automatically if they do not exist
 
 ## Metrics
 
