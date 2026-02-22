@@ -145,10 +145,21 @@ async fn main() {
 
     if let Some(ref path) = config.persist_path {
         info!(path = %path, "flushing store to disk on shutdown");
-        let db = store.read().await;
-        match persist::save(&db, &PathBuf::from(path)) {
-            Ok(()) => info!(path = %path, "store flushed to disk"),
-            Err(e) => error!(error = %e, path = %path, "failed to flush store to disk on shutdown"),
+        let snapshot = {
+            let db = store.read().await;
+            db.entries.clone()
+        };
+        let shutdown_path = PathBuf::from(path);
+        match tokio::task::spawn_blocking(move || persist::save_entries(&snapshot, &shutdown_path))
+            .await
+        {
+            Ok(Ok(())) => info!(path = %path, "store flushed to disk"),
+            Ok(Err(e)) => {
+                error!(error = %e, path = %path, "failed to flush store to disk on shutdown")
+            }
+            Err(e) => {
+                error!(error = %e, path = %path, "shutdown flush task join error")
+            }
         }
     }
 }

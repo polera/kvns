@@ -263,13 +263,22 @@ mod tests {
 
     #[test]
     fn clamp_memory_limit_caps_values_above_cap() {
-        assert_eq!(Config::clamp_memory_limit_to_system(71, 100), DEFAULT_MEMORY_CLAMP_LIMIT);
-        assert_eq!(Config::clamp_memory_limit_to_system(200, 100), DEFAULT_MEMORY_CLAMP_LIMIT);
+        assert_eq!(
+            Config::clamp_memory_limit_to_system(71, 100),
+            DEFAULT_MEMORY_CLAMP_LIMIT
+        );
+        assert_eq!(
+            Config::clamp_memory_limit_to_system(200, 100),
+            DEFAULT_MEMORY_CLAMP_LIMIT
+        );
     }
 
     #[test]
     fn clamp_memory_limit_zero_uses_cap() {
-        assert_eq!(Config::clamp_memory_limit_to_system(0, 100), DEFAULT_MEMORY_CLAMP_LIMIT);
+        assert_eq!(
+            Config::clamp_memory_limit_to_system(0, 100),
+            DEFAULT_MEMORY_CLAMP_LIMIT
+        );
     }
 
     #[test]
@@ -557,7 +566,7 @@ mod tests {
     fn parse_ns_eviction_invalid_policy_skipped() {
         let map = Config::parse_ns_eviction("ns1:lru,ns2:fifo,ns3:mru");
         assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lru));
-        assert!(map.get("ns2").is_none());
+        assert!(!map.contains_key("ns2"));
         assert_eq!(map.get("ns3"), Some(&EvictionPolicy::Mru));
     }
 

@@ -1,47 +1,95 @@
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-pub(crate) async fn parse_resp<R: AsyncBufReadExt + Unpin>(
+fn invalid_data(msg: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+fn parse_i64(bytes: &[u8], err_msg: &'static str) -> std::io::Result<i64> {
+    let s = std::str::from_utf8(bytes).map_err(|_| invalid_data(err_msg))?;
+    s.parse::<i64>().map_err(|_| invalid_data(err_msg))
+}
+
+fn parse_bulk_len(hdr: &[u8]) -> std::io::Result<i64> {
+    let body = hdr
+        .strip_prefix(b"$")
+        .ok_or_else(|| invalid_data("expected $"))?;
+    parse_i64(body, "bad len")
+}
+
+async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
     reader: &mut R,
-) -> std::io::Result<Option<Vec<Vec<u8>>>> {
-    let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
+    buf: &'a mut Vec<u8>,
+) -> std::io::Result<Option<&'a [u8]>> {
+    buf.clear();
+    if reader.read_until(b'\n', buf).await? == 0 {
         return Ok(None);
     }
-    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if buf.ends_with(b"\n") {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+    }
+    Ok(Some(buf.as_slice()))
+}
+
+fn split_inline_command(line: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0usize;
+    while i < line.len() {
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= line.len() {
+            break;
+        }
+        let start = i;
+        while i < line.len() && !line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push(line[start..i].to_vec());
+    }
+    out
+}
+
+pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+    let mut line = Vec::new();
+    let Some(trimmed) = read_resp_line(reader, &mut line).await? else {
+        return Ok(None);
+    };
     if trimmed.is_empty() {
         return Ok(Some(vec![]));
     }
 
-    let first = trimmed.as_bytes().first().copied().unwrap_or(0);
+    let first = trimmed.first().copied().unwrap_or(0);
     let rest = &trimmed[1..];
 
     match first {
         // ── RESP2 / RESP3 array ─────────────────────────────────────────────
         b'*' => {
-            let count: i64 = rest
-                .parse()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad count"))?;
+            let count = parse_i64(rest, "bad count")?;
             if count < 0 {
                 return Ok(Some(vec![])); // null array
             }
             let mut args = Vec::with_capacity(count as usize);
+            let mut hdr = Vec::new();
             for _ in 0..count {
-                let mut hdr = String::new();
-                reader.read_line(&mut hdr).await?;
-                let hdr = hdr.trim_end_matches(['\r', '\n']);
-                let len: i64 = hdr
-                    .strip_prefix('$')
-                    .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, "expected $")
-                    })?
-                    .parse()
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad len"))?;
+                let Some(hdr_line) = read_resp_line(reader, &mut hdr).await? else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF",
+                    ));
+                };
+                let len = parse_bulk_len(hdr_line)?;
                 if len < 0 {
                     args.push(vec![]);
                 } else {
-                    let mut buf = vec![0u8; len as usize + 2]; // +2 for \r\n
+                    let len = len as usize;
+                    let mut buf = vec![0u8; len + 2]; // +2 for \r\n
                     reader.read_exact(&mut buf).await?;
-                    buf.truncate(len as usize);
+                    buf.truncate(len);
                     args.push(buf);
                 }
             }
@@ -53,7 +101,7 @@ pub(crate) async fn parse_resp<R: AsyncBufReadExt + Unpin>(
 
         // ── RESP3 boolean ───────────────────────────────────────────────────
         b'#' => {
-            let val = if rest == "t" {
+            let val = if rest == b"t" {
                 b"1".to_vec()
             } else {
                 b"0".to_vec()
@@ -62,58 +110,61 @@ pub(crate) async fn parse_resp<R: AsyncBufReadExt + Unpin>(
         }
 
         // ── RESP3 double ────────────────────────────────────────────────────
-        b',' => Ok(Some(vec![rest.as_bytes().to_vec()])),
+        b',' => Ok(Some(vec![rest.to_vec()])),
 
         // ── RESP3 big number ────────────────────────────────────────────────
-        b'(' => Ok(Some(vec![rest.as_bytes().to_vec()])),
+        b'(' => Ok(Some(vec![rest.to_vec()])),
 
         // ── RESP3 set type (~N) — treat like array ──────────────────────────
         b'~' => {
-            let count: usize = rest
-                .parse()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad count"))?;
+            let count = parse_i64(rest, "bad count")?;
+            if count < 0 {
+                return Err(invalid_data("bad count"));
+            }
+            let count = usize::try_from(count).map_err(|_| invalid_data("bad count"))?;
             read_bulk_strings(reader, count).await.map(Some)
         }
 
         // ── RESP3 map type (%N) — read 2N bulk strings ──────────────────────
         b'%' => {
-            let count: usize = rest
-                .parse()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad count"))?;
-            read_bulk_strings(reader, count * 2).await.map(Some)
+            let count = parse_i64(rest, "bad count")?;
+            if count < 0 {
+                return Err(invalid_data("bad count"));
+            }
+            let count = usize::try_from(count).map_err(|_| invalid_data("bad count"))?;
+            let count = count
+                .checked_mul(2)
+                .ok_or_else(|| invalid_data("bad count"))?;
+            read_bulk_strings(reader, count).await.map(Some)
         }
 
         // ── Inline command ──────────────────────────────────────────────────
-        _ => Ok(Some(
-            trimmed
-                .split_whitespace()
-                .map(|s| s.as_bytes().to_vec())
-                .collect(),
-        )),
+        _ => Ok(Some(split_inline_command(trimmed))),
     }
 }
 
 /// Read exactly `n` RESP bulk strings from `reader`.
-async fn read_bulk_strings<R: AsyncBufReadExt + Unpin>(
+async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     n: usize,
 ) -> std::io::Result<Vec<Vec<u8>>> {
     let mut args = Vec::with_capacity(n);
+    let mut hdr = Vec::new();
     for _ in 0..n {
-        let mut hdr = String::new();
-        reader.read_line(&mut hdr).await?;
-        let hdr = hdr.trim_end_matches(['\r', '\n']);
-        let len: i64 = hdr
-            .strip_prefix('$')
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "expected $"))?
-            .parse()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad len"))?;
+        let Some(hdr_line) = read_resp_line(reader, &mut hdr).await? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF",
+            ));
+        };
+        let len = parse_bulk_len(hdr_line)?;
         if len < 0 {
             args.push(vec![]);
         } else {
-            let mut buf = vec![0u8; len as usize + 2];
+            let len = len as usize;
+            let mut buf = vec![0u8; len + 2];
             reader.read_exact(&mut buf).await?;
-            buf.truncate(len as usize);
+            buf.truncate(len);
             args.push(buf);
         }
     }
@@ -141,17 +192,24 @@ pub(crate) fn resp_wrongtype() -> Vec<u8> {
     b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
 }
 
-pub(crate) fn resp_bulk(data: &[u8]) -> Vec<u8> {
-    let mut out = format!("${}\r\n", data.len()).into_bytes();
+fn append_bulk(out: &mut Vec<u8>, data: &[u8]) {
+    out.push(b'$');
+    out.extend_from_slice(data.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
+}
+
+pub(crate) fn resp_bulk(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 32);
+    append_bulk(&mut out, data);
     out
 }
 
 pub(crate) fn resp_array(items: &[Vec<u8>]) -> Vec<u8> {
     let mut out = format!("*{}\r\n", items.len()).into_bytes();
     for item in items {
-        out.extend_from_slice(&resp_bulk(item));
+        append_bulk(&mut out, item);
     }
     out
 }
@@ -227,8 +285,8 @@ pub(crate) fn resp_verbatim(enc: &[u8; 3], data: &[u8]) -> Vec<u8> {
 pub(crate) fn resp_map(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let mut out = format!("%{}\r\n", pairs.len()).into_bytes();
     for (k, v) in pairs {
-        out.extend_from_slice(&resp_bulk(k));
-        out.extend_from_slice(&resp_bulk(v));
+        append_bulk(&mut out, k);
+        append_bulk(&mut out, v);
     }
     out
 }
@@ -238,7 +296,7 @@ pub(crate) fn resp_map(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 pub(crate) fn resp_set_type(items: &[Vec<u8>]) -> Vec<u8> {
     let mut out = format!("~{}\r\n", items.len()).into_bytes();
     for item in items {
-        out.extend_from_slice(&resp_bulk(item));
+        append_bulk(&mut out, item);
     }
     out
 }
@@ -248,7 +306,7 @@ pub(crate) fn resp_set_type(items: &[Vec<u8>]) -> Vec<u8> {
 pub(crate) fn resp_push(items: &[Vec<u8>]) -> Vec<u8> {
     let mut out = format!(">{}\r\n", items.len()).into_bytes();
     for item in items {
-        out.extend_from_slice(&resp_bulk(item));
+        append_bulk(&mut out, item);
     }
     out
 }

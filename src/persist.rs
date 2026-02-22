@@ -147,11 +147,9 @@ fn persisted_to_entry(p: PersistedEntry) -> Option<Entry> {
 
 // ── Public I/O functions ──────────────────────────────────────────────────────
 
-/// Atomically serialise `db` to `path` (write to `<path>.tmp`, then rename).
-pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
-    let persisted = PersistedDb {
-        entries: db
-            .entries
+fn persisted_db_from_entries(entries: &HashMap<String, HashMap<String, Entry>>) -> PersistedDb {
+    PersistedDb {
+        entries: entries
             .iter()
             .map(|(ns, ns_map)| {
                 let persisted_ns = ns_map
@@ -161,7 +159,15 @@ pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
                 (ns.clone(), persisted_ns)
             })
             .collect(),
-    };
+    }
+}
+
+/// Atomically serialise `entries` to `path` (write to `<path>.tmp`, then rename).
+pub(crate) fn save_entries(
+    entries: &HashMap<String, HashMap<String, Entry>>,
+    path: &Path,
+) -> io::Result<()> {
+    let persisted = persisted_db_from_entries(entries);
 
     // Ensure the parent directory exists.
     if let Some(parent) = path.parent() {
@@ -178,6 +184,11 @@ pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
     drop(file);
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Atomically serialise `db` to `path` (write to `<path>.tmp`, then rename).
+pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
+    save_entries(&db.entries, path)
 }
 
 /// Deserialise a `Db` from `path`.  Expired entries are silently dropped.
@@ -212,10 +223,19 @@ pub(crate) async fn run_periodic_flush(store: Store, path: PathBuf, interval_sec
     ticker.tick().await; // skip the immediate first tick
     loop {
         ticker.tick().await;
-        let db = store.read().await;
-        match save(&db, &path) {
-            Ok(()) => debug!(path = %path.display(), "flushed store to disk"),
-            Err(e) => error!(error = %e, path = %path.display(), "failed to flush store to disk"),
+        let snapshot = {
+            let db = store.read().await;
+            db.entries.clone()
+        };
+        let flush_path = path.clone();
+        match tokio::task::spawn_blocking(move || save_entries(&snapshot, &flush_path)).await {
+            Ok(Ok(())) => debug!(path = %path.display(), "flushed store to disk"),
+            Ok(Err(e)) => {
+                error!(error = %e, path = %path.display(), "failed to flush store to disk")
+            }
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "flush task join error")
+            }
         }
     }
 }
