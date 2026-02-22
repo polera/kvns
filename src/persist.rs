@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -6,9 +6,23 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, error, info};
 
-use crate::store::{Db, Entry, Store, Value};
+use crate::store::{Db, Entry, Store, Value, ZEntry};
 
 // ── Serializable mirror types ─────────────────────────────────────────────────
+
+/// rkyv mirror of a hash field/value pair.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct PersistedHashEntry {
+    field: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// rkyv mirror of a sorted-set entry.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct PersistedZEntry {
+    score: f64,
+    member: Vec<u8>,
+}
 
 /// rkyv mirror of `Value`. Uses `Vec` instead of `VecDeque` (not yet supported
 /// by rkyv) and is converted to/from the store type at persist boundaries.
@@ -16,6 +30,9 @@ use crate::store::{Db, Entry, Store, Value};
 enum PersistedValue {
     String(Vec<u8>),
     List(Vec<Vec<u8>>),
+    Hash(Vec<PersistedHashEntry>),
+    Set(Vec<Vec<u8>>),
+    ZSet(Vec<PersistedZEntry>),
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -39,6 +56,24 @@ impl From<&Value> for PersistedValue {
         match v {
             Value::String(b) => PersistedValue::String(b.clone()),
             Value::List(items) => PersistedValue::List(items.iter().cloned().collect()),
+            Value::Hash(m) => PersistedValue::Hash(
+                m.iter()
+                    .map(|(k, v)| PersistedHashEntry {
+                        field: k.clone(),
+                        value: v.clone(),
+                    })
+                    .collect(),
+            ),
+            Value::Set(s) => PersistedValue::Set(s.iter().cloned().collect()),
+            Value::ZSet(entries) => PersistedValue::ZSet(
+                entries
+                    .iter()
+                    .map(|e| PersistedZEntry {
+                        score: e.score,
+                        member: e.member.clone(),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -48,6 +83,29 @@ impl From<PersistedValue> for Value {
         match p {
             PersistedValue::String(b) => Value::String(b),
             PersistedValue::List(items) => Value::List(items.into_iter().collect()),
+            PersistedValue::Hash(entries) => {
+                let mut map = HashMap::new();
+                for e in entries {
+                    map.insert(e.field, e.value);
+                }
+                Value::Hash(map)
+            }
+            PersistedValue::Set(items) => {
+                let mut set = HashSet::new();
+                for item in items {
+                    set.insert(item);
+                }
+                Value::Set(set)
+            }
+            PersistedValue::ZSet(entries) => Value::ZSet(
+                entries
+                    .into_iter()
+                    .map(|e| ZEntry {
+                        score: e.score,
+                        member: e.member,
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -80,7 +138,11 @@ fn persisted_to_entry(p: PersistedEntry) -> Option<Entry> {
             Some(Instant::now() + remaining)
         }
     };
-    Some(Entry { value: Value::from(p.value), hits: p.hits, expiry })
+    Some(Entry {
+        value: Value::from(p.value),
+        hits: p.hits,
+        expiry,
+    })
 }
 
 // ── Public I/O functions ──────────────────────────────────────────────────────
@@ -201,7 +263,11 @@ mod tests {
             .expiry
             .unwrap()
             .saturating_duration_since(Instant::now());
-        assert!(remaining.as_secs() > 3590, "TTL should be ~3600s, got {:?}", remaining);
+        assert!(
+            remaining.as_secs() > 3590,
+            "TTL should be ~3600s, got {:?}",
+            remaining
+        );
     }
 
     #[test]
@@ -228,12 +294,18 @@ mod tests {
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
 
         assert_eq!(
-            loaded.entries.get("default").and_then(|ns| ns.get("foo"))
+            loaded
+                .entries
+                .get("default")
+                .and_then(|ns| ns.get("foo"))
                 .and_then(|e| e.value.as_string()),
             Some(b"bar".as_slice())
         );
         assert_eq!(
-            loaded.entries.get("ns1").and_then(|ns| ns.get("x"))
+            loaded
+                .entries
+                .get("ns1")
+                .and_then(|ns| ns.get("x"))
                 .and_then(|e| e.value.as_string()),
             Some(b"42".as_slice())
         );
@@ -248,20 +320,32 @@ mod tests {
         let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
         db.put("default".into(), "live".into(), string_entry("v"));
         // Inject an already-expired entry directly (bypassing put's normal path)
-        db.entries
-            .entry("default".into())
-            .or_default()
-            .insert("dead".into(), Entry {
+        db.entries.entry("default".into()).or_default().insert(
+            "dead".into(),
+            Entry {
                 value: Value::String(b"v".to_vec()),
                 hits: 0,
                 expiry: Some(Instant::now() - Duration::from_secs(1)),
-            });
+            },
+        );
 
         save(&db, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
 
-        assert!(loaded.entries.get("default").and_then(|ns| ns.get("live")).is_some());
-        assert!(loaded.entries.get("default").and_then(|ns| ns.get("dead")).is_none());
+        assert!(
+            loaded
+                .entries
+                .get("default")
+                .and_then(|ns| ns.get("live"))
+                .is_some()
+        );
+        assert!(
+            loaded
+                .entries
+                .get("default")
+                .and_then(|ns| ns.get("dead"))
+                .is_none()
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -272,5 +356,101 @@ mod tests {
         let result = load(&path, DEFAULT_MEMORY_LIMIT);
         assert!(result.is_err());
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn hash_value_roundtrips() {
+        use std::collections::HashMap;
+        let path = temp_path();
+        let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
+        let mut hm = HashMap::new();
+        hm.insert(b"field1".to_vec(), b"val1".to_vec());
+        hm.insert(b"field2".to_vec(), b"val2".to_vec());
+        db.put(
+            "default".into(),
+            "myhash".into(),
+            Entry {
+                value: Value::Hash(hm),
+                hits: 0,
+                expiry: None,
+            },
+        );
+        save(&db, &path).expect("save failed");
+        let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
+        let entry = loaded
+            .entries
+            .get("default")
+            .and_then(|ns| ns.get("myhash"))
+            .unwrap();
+        let hash = entry.value.as_hash().unwrap();
+        assert_eq!(hash.get(b"field1".as_slice()), Some(&b"val1".to_vec()));
+        assert_eq!(hash.get(b"field2".as_slice()), Some(&b"val2".to_vec()));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_value_roundtrips() {
+        use std::collections::HashSet;
+        let path = temp_path();
+        let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
+        let mut s = HashSet::new();
+        s.insert(b"a".to_vec());
+        s.insert(b"b".to_vec());
+        db.put(
+            "default".into(),
+            "myset".into(),
+            Entry {
+                value: Value::Set(s),
+                hits: 0,
+                expiry: None,
+            },
+        );
+        save(&db, &path).expect("save failed");
+        let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
+        let entry = loaded
+            .entries
+            .get("default")
+            .and_then(|ns| ns.get("myset"))
+            .unwrap();
+        let set = entry.value.as_set().unwrap();
+        assert!(set.contains(b"a".as_slice()));
+        assert!(set.contains(b"b".as_slice()));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zset_value_roundtrips() {
+        let path = temp_path();
+        let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
+        db.put(
+            "default".into(),
+            "myzset".into(),
+            Entry {
+                value: Value::ZSet(vec![
+                    ZEntry {
+                        score: 1.5,
+                        member: b"a".to_vec(),
+                    },
+                    ZEntry {
+                        score: 2.5,
+                        member: b"b".to_vec(),
+                    },
+                ]),
+                hits: 0,
+                expiry: None,
+            },
+        );
+        save(&db, &path).expect("save failed");
+        let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
+        let entry = loaded
+            .entries
+            .get("default")
+            .and_then(|ns| ns.get("myzset"))
+            .unwrap();
+        let zset = entry.value.as_zset().unwrap();
+        assert_eq!(zset.len(), 2);
+        assert!((zset[0].score - 1.5).abs() < f64::EPSILON);
+        assert_eq!(zset[0].member, b"a");
+        let _ = fs::remove_file(&path);
     }
 }

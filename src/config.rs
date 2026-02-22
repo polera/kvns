@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 pub const DEFAULT_MEMORY_LIMIT: usize = 1_073_741_824; // 1 GiB
-pub const DEFAULT_PERSIST_INTERVAL_SECS: u64 = 300;   // 5 minutes
+pub const DEFAULT_PERSIST_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum EvictionPolicy {
@@ -88,12 +88,8 @@ impl Config {
     ) -> Self {
         let defaults = Self::default();
         Self {
-            port: port
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(defaults.port),
-            host: host
-                .map(|s| s.to_string())
-                .unwrap_or(defaults.host),
+            port: port.and_then(|s| s.parse().ok()).unwrap_or(defaults.port),
+            host: host.map(|s| s.to_string()).unwrap_or(defaults.host),
             memory_limit: memory_limit
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(defaults.memory_limit),
@@ -163,31 +159,86 @@ mod tests {
 
     #[test]
     fn from_vars_port_override() {
-        let c = Config::from_vars(Some("7000"), None, None, None, None, None, None, None, None, None);
+        let c = Config::from_vars(
+            Some("7000"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.port, 7000);
     }
 
     #[test]
     fn from_vars_host_override() {
-        let c = Config::from_vars(None, Some("127.0.0.1"), None, None, None, None, None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            Some("127.0.0.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.host, "127.0.0.1");
     }
 
     #[test]
     fn from_vars_memory_limit_override() {
-        let c = Config::from_vars(None, None, Some("2048"), None, None, None, None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            Some("2048"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.memory_limit, 2048);
     }
 
     #[test]
     fn from_vars_invalid_port_falls_back_to_default() {
-        let c = Config::from_vars(Some("not_a_port"), None, None, None, None, None, None, None, None, None);
+        let c = Config::from_vars(
+            Some("not_a_port"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.port, 6480);
     }
 
     #[test]
     fn from_vars_invalid_memory_limit_falls_back_to_default() {
-        let c = Config::from_vars(None, None, Some("not_a_number"), None, None, None, None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            Some("not_a_number"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.memory_limit, DEFAULT_MEMORY_LIMIT);
     }
 
@@ -199,7 +250,18 @@ mod tests {
 
     #[test]
     fn listen_addr_custom_host_and_port() {
-        let c = Config::from_vars(Some("9000"), Some("127.0.0.1"), None, None, None, None, None, None, None, None);
+        let c = Config::from_vars(
+            Some("9000"),
+            Some("127.0.0.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.listen_addr(), "127.0.0.1:9000");
     }
 
@@ -212,19 +274,52 @@ mod tests {
 
     #[test]
     fn from_vars_metrics_port_override() {
-        let c = Config::from_vars(None, None, None, Some("9999"), None, None, None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            Some("9999"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.metrics_port, 9999);
     }
 
     #[test]
     fn from_vars_metrics_host_override() {
-        let c = Config::from_vars(None, None, None, None, Some("127.0.0.1"), None, None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            Some("127.0.0.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.metrics_host, "127.0.0.1");
     }
 
     #[test]
     fn from_vars_invalid_metrics_port_falls_back_to_default() {
-        let c = Config::from_vars(None, None, None, Some("not_a_port"), None, None, None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            Some("not_a_port"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.metrics_port, 9090);
     }
 
@@ -243,19 +338,52 @@ mod tests {
 
     #[test]
     fn from_vars_persist_path_set() {
-        let c = Config::from_vars(None, None, None, None, None, Some("/tmp/kvns.bin"), None, None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("/tmp/kvns.bin"),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.persist_path.as_deref(), Some("/tmp/kvns.bin"));
     }
 
     #[test]
     fn from_vars_persist_interval_override() {
-        let c = Config::from_vars(None, None, None, None, None, None, Some("60"), None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("60"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.persist_interval_secs, 60);
     }
 
     #[test]
     fn from_vars_persist_interval_invalid_falls_back_to_default() {
-        let c = Config::from_vars(None, None, None, None, None, None, Some("not_a_number"), None, None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("not_a_number"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(c.persist_interval_secs, DEFAULT_PERSIST_INTERVAL_SECS);
     }
 
@@ -326,32 +454,93 @@ mod tests {
 
     #[test]
     fn from_vars_eviction_threshold_override() {
-        let c = Config::from_vars(None, None, None, None, None, None, None, Some("0.75"), None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0.75"),
+            None,
+            None,
+        );
         assert_eq!(c.eviction_threshold, 0.75);
     }
 
     #[test]
     fn from_vars_eviction_policy_override() {
-        let c = Config::from_vars(None, None, None, None, None, None, None, None, Some("lru"), None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("lru"),
+            None,
+        );
         assert_eq!(c.eviction_policy, EvictionPolicy::Lru);
     }
 
     #[test]
     fn from_vars_ns_eviction_override() {
-        let c = Config::from_vars(None, None, None, None, None, None, None, None, None, Some("ns1:lru,ns2:mru"));
-        assert_eq!(c.namespace_eviction_policies.get("ns1"), Some(&EvictionPolicy::Lru));
-        assert_eq!(c.namespace_eviction_policies.get("ns2"), Some(&EvictionPolicy::Mru));
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("ns1:lru,ns2:mru"),
+        );
+        assert_eq!(
+            c.namespace_eviction_policies.get("ns1"),
+            Some(&EvictionPolicy::Lru)
+        );
+        assert_eq!(
+            c.namespace_eviction_policies.get("ns2"),
+            Some(&EvictionPolicy::Mru)
+        );
     }
 
     #[test]
     fn from_vars_invalid_eviction_threshold_falls_back_to_default() {
-        let c = Config::from_vars(None, None, None, None, None, None, None, Some("not_a_float"), None, None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("not_a_float"),
+            None,
+            None,
+        );
         assert_eq!(c.eviction_threshold, 1.0);
     }
 
     #[test]
     fn from_vars_invalid_eviction_policy_falls_back_to_default() {
-        let c = Config::from_vars(None, None, None, None, None, None, None, None, Some("fifo"), None);
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("fifo"),
+            None,
+        );
         assert_eq!(c.eviction_policy, EvictionPolicy::None);
     }
 }

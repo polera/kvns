@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,10 +7,21 @@ use tokio::sync::RwLock;
 
 use crate::config::EvictionPolicy;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// A single entry in a sorted set.
+#[derive(Clone)]
+pub(crate) struct ZEntry {
+    pub score: f64,
+    pub member: Vec<u8>,
+}
+
+#[derive(Clone)]
 pub(crate) enum Value {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
+    Hash(HashMap<Vec<u8>, Vec<u8>>),
+    Set(HashSet<Vec<u8>>),
+    /// Kept sorted by (score ASC, member ASC).
+    ZSet(Vec<ZEntry>),
 }
 
 impl Value {
@@ -18,13 +29,83 @@ impl Value {
         match self {
             Value::String(b) => b.len(),
             Value::List(items) => items.iter().map(|b| b.len()).sum(),
+            Value::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
+            Value::Set(s) => s.iter().map(|v| v.len()).sum(),
+            Value::ZSet(v) => v.iter().map(|e| 8 + e.member.len()).sum(),
         }
     }
 
     pub(crate) fn as_string(&self) -> Option<&[u8]> {
+        if let Value::String(b) = self {
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_string_mut(&mut self) -> Option<&mut Vec<u8>> {
+        if let Value::String(b) = self {
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_hash(&self) -> Option<&HashMap<Vec<u8>, Vec<u8>>> {
+        if let Value::Hash(m) = self {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_hash_mut(&mut self) -> Option<&mut HashMap<Vec<u8>, Vec<u8>>> {
+        if let Value::Hash(m) = self {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_set(&self) -> Option<&HashSet<Vec<u8>>> {
+        if let Value::Set(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_set_mut(&mut self) -> Option<&mut HashSet<Vec<u8>>> {
+        if let Value::Set(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_zset(&self) -> Option<&Vec<ZEntry>> {
+        if let Value::ZSet(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_zset_mut(&mut self) -> Option<&mut Vec<ZEntry>> {
+        if let Value::ZSet(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
-            Value::String(b) => Some(b),
-            Value::List(_) => None,
+            Value::String(_) => "string",
+            Value::List(_) => "list",
+            Value::Hash(_) => "hash",
+            Value::Set(_) => "set",
+            Value::ZSet(_) => "zset",
         }
     }
 }
@@ -48,12 +129,35 @@ impl Entry {
         self.expiry.is_some_and(|e| Instant::now() >= e)
     }
 
+    /// Returns:
+    /// - `-1` if the key has no expiry
+    /// - `0`  if the key has already expired (should be lazily removed)
+    /// - `N`  seconds remaining until expiry
     pub(crate) fn time_to_expiry_secs(&self) -> i64 {
         match self.expiry {
-            None => 0,
+            None => -1,
             Some(e) => {
                 let now = Instant::now();
-                if e <= now { 0 } else { (e - now).as_secs() as i64 }
+                if e <= now {
+                    0
+                } else {
+                    (e - now).as_secs() as i64
+                }
+            }
+        }
+    }
+
+    /// Same as `time_to_expiry_secs` but returns milliseconds.
+    pub(crate) fn time_to_expiry_ms(&self) -> i64 {
+        match self.expiry {
+            None => -1,
+            Some(e) => {
+                let now = Instant::now();
+                if e <= now {
+                    0
+                } else {
+                    (e - now).as_millis() as i64
+                }
             }
         }
     }
@@ -138,16 +242,19 @@ impl Db {
 
         // 5. Collect (key, hits, size) snapshot — must not hold a live
         //    reference into self.entries while we call self.delete below.
-        let mut candidates: Vec<(String, u64, usize)> =
-            match self.entries.get(namespace) {
-                None => return false,
-                Some(ns_map) => ns_map
-                    .iter()
-                    .map(|(k, e)| {
-                        (k.clone(), e.hits, Self::entry_size(namespace, k, e.value.byte_len()))
-                    })
-                    .collect(),
-            };
+        let mut candidates: Vec<(String, u64, usize)> = match self.entries.get(namespace) {
+            None => return false,
+            Some(ns_map) => ns_map
+                .iter()
+                .map(|(k, e)| {
+                    (
+                        k.clone(),
+                        e.hits,
+                        Self::entry_size(namespace, k, e.value.byte_len()),
+                    )
+                })
+                .collect(),
+        };
 
         // 6. Sort by eviction order.
         match policy {
@@ -197,7 +304,12 @@ impl Db {
         namespace.len() + key.len() + value_byte_len
     }
 
-    pub(crate) fn would_exceed(&self, namespace: &str, key: &str, new_value_byte_len: usize) -> bool {
+    pub(crate) fn would_exceed(
+        &self,
+        namespace: &str,
+        key: &str,
+        new_value_byte_len: usize,
+    ) -> bool {
         let new_size = Self::entry_size(namespace, key, new_value_byte_len);
         let old_size = self
             .entries
@@ -224,7 +336,10 @@ impl Db {
         let nb = self.namespace_bytes.entry(namespace.clone()).or_insert(0);
         *nb = nb.saturating_sub(old_size).saturating_add(new_size);
         let ns_bytes = *nb;
-        self.entries.entry(namespace.clone()).or_default().insert(key, entry);
+        self.entries
+            .entry(namespace.clone())
+            .or_default()
+            .insert(key, entry);
         let ns_keys = self.entries[&namespace].len();
         metrics::gauge!("kvns_keys_total", "namespace" => namespace.clone()).set(ns_keys as f64);
         metrics::gauge!("kvns_memory_used_bytes", "namespace" => namespace).set(ns_bytes as f64);
@@ -251,9 +366,26 @@ impl Db {
         let ns_keys = self.entries.get(namespace).map(|ns| ns.len()).unwrap_or(0);
         let ns_bytes = self.namespace_bytes.get(namespace).copied().unwrap_or(0);
         metrics::gauge!("kvns_keys_total", "namespace" => namespace.to_owned()).set(ns_keys as f64);
-        metrics::gauge!("kvns_memory_used_bytes", "namespace" => namespace.to_owned()).set(ns_bytes as f64);
+        metrics::gauge!("kvns_memory_used_bytes", "namespace" => namespace.to_owned())
+            .set(ns_bytes as f64);
         metrics::gauge!("kvns_memory_used_bytes_total").set(self.used_bytes as f64);
         removed
+    }
+
+    /// Total number of non-expired keys across all namespaces.
+    pub(crate) fn total_keys(&self) -> usize {
+        self.entries
+            .values()
+            .map(|ns| ns.values().filter(|e| !e.is_expired()).count())
+            .sum()
+    }
+
+    /// Flush all entries across all namespaces.
+    pub(crate) fn flush_all(&mut self) {
+        self.entries.clear();
+        self.used_bytes = 0;
+        self.namespace_bytes.clear();
+        metrics::gauge!("kvns_memory_used_bytes_total").set(0.0);
     }
 }
 
@@ -270,7 +402,7 @@ mod tests {
     fn entry_no_ttl_never_expires() {
         let e = Entry::new(b"v".to_vec(), None);
         assert!(!e.is_expired());
-        assert_eq!(e.time_to_expiry_secs(), 0);
+        assert_eq!(e.time_to_expiry_secs(), -1);
     }
 
     #[test]
@@ -301,7 +433,11 @@ mod tests {
     // Returns the per-entry size: ns.len() + key.len() + value.len().
     fn populate_ns(db: &mut Db, ns: &str, entries: &[(&str, u64)], value: &[u8]) -> usize {
         for (key, hits) in entries {
-            db.put(ns.to_string(), key.to_string(), Entry::new(value.to_vec(), None));
+            db.put(
+                ns.to_string(),
+                key.to_string(),
+                Entry::new(value.to_vec(), None),
+            );
             db.entries.get_mut(ns).unwrap().get_mut(*key).unwrap().hits = *hits;
         }
         Db::entry_size(ns, entries[0].0, value.len())
@@ -324,7 +460,11 @@ mod tests {
         // threshold=1.0 → threshold_bytes=100; used_bytes=6 < 100 → no eviction
         let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lru);
         // "ns"(2) + "a"(1) + "vvv"(3) = 6
-        db.put("ns".to_string(), "a".to_string(), Entry::new(b"vvv".to_vec(), None));
+        db.put(
+            "ns".to_string(),
+            "a".to_string(),
+            Entry::new(b"vvv".to_vec(), None),
+        );
         assert_eq!(db.used_bytes, 6);
         // net_delta=100: 6+100=106 > 100, but used_bytes=6 < threshold_bytes=100
         assert!(!db.evict_for_write("ns", 100));
@@ -339,7 +479,10 @@ mod tests {
         assert_eq!(db.used_bytes, entry_size * 3);
         // net_delta=15: would use 33 > 30; overflow=3; b (hits=1) evicted first
         assert!(db.evict_for_write("ns", 15));
-        assert!(db.entries.get("ns").unwrap().get("b").is_none(), "b should be evicted");
+        assert!(
+            db.entries.get("ns").unwrap().get("b").is_none(),
+            "b should be evicted"
+        );
         assert!(db.entries.get("ns").unwrap().get("a").is_some());
         assert!(db.entries.get("ns").unwrap().get("c").is_some());
     }
@@ -350,7 +493,10 @@ mod tests {
         populate_ns(&mut db, "ns", &[("a", 3), ("b", 1), ("c", 5)], b"vvv");
         // net_delta=15: overflow=3; c (hits=5) evicted first
         assert!(db.evict_for_write("ns", 15));
-        assert!(db.entries.get("ns").unwrap().get("c").is_none(), "c should be evicted");
+        assert!(
+            db.entries.get("ns").unwrap().get("c").is_none(),
+            "c should be evicted"
+        );
         assert!(db.entries.get("ns").unwrap().get("a").is_some());
         assert!(db.entries.get("ns").unwrap().get("b").is_some());
     }
@@ -362,7 +508,11 @@ mod tests {
         // Only 6 bytes available to free (evict "a"), but 6 < overflow=6 → freed=6 >= overflow=6 → fits
         // Actually 6-6+10 = 10 <= 10 → true. Let's use a bigger delta.
         // net_delta=15: 6+15=21 > 10, overflow=11; only "a"(6) can be evicted → freed=6 < 11
-        db.put("ns".to_string(), "a".to_string(), Entry::new(b"vvv".to_vec(), None));
+        db.put(
+            "ns".to_string(),
+            "a".to_string(),
+            Entry::new(b"vvv".to_vec(), None),
+        );
         assert!(!db.evict_for_write("ns", 15));
     }
 
@@ -397,7 +547,11 @@ mod tests {
     #[test]
     fn net_delta_existing_key_grows() {
         let mut db = Db::new(1000);
-        db.put("ns".to_string(), "k".to_string(), Entry::new(b"hi".to_vec(), None));
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"hi".to_vec(), None),
+        );
         // old: "ns"(2)+"k"(1)+"hi"(2)=5; new: "ns"(2)+"k"(1)+"hello"(5)=8; delta=3
         assert_eq!(db.net_delta("ns", "k", 5), 3);
     }
@@ -405,7 +559,11 @@ mod tests {
     #[test]
     fn net_delta_existing_key_shrinks_returns_zero() {
         let mut db = Db::new(1000);
-        db.put("ns".to_string(), "k".to_string(), Entry::new(b"hello".to_vec(), None));
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"hello".to_vec(), None),
+        );
         // old=8, new=5: saturating_sub → 0
         assert_eq!(db.net_delta("ns", "k", 2), 0);
     }
