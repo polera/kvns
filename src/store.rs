@@ -110,6 +110,7 @@ impl Value {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Entry {
     pub(crate) value: Value,
     pub(crate) hits: u64,
@@ -211,6 +212,11 @@ impl Db {
             .get(namespace)
             .cloned()
             .unwrap_or_else(|| self.eviction_policy.clone())
+    }
+
+    /// Whether reads in `namespace` should update hit counters for eviction.
+    pub(crate) fn tracks_hits(&self, namespace: &str) -> bool {
+        !matches!(self.policy_for_namespace(namespace), EvictionPolicy::None)
     }
 
     /// Attempt to free enough memory in `namespace` so that a write of

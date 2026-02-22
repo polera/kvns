@@ -19,13 +19,13 @@ help:
 	@awk -F: '/^[a-zA-Z0-9][a-zA-Z0-9_.-]*:/{print " - " $$1}' Makefile
 
 build:
-	$(CARGO_ENV) cargo build
+	$(CARGO_ENV) cargo build --tests
 
 release:
-	$(CARGO_ENV) cargo build --release
+	$(CARGO_ENV) cargo build --tests --release
 
 check:
-	$(CARGO_ENV) cargo check
+	$(CARGO_ENV) cargo check --tests
 
 ensure-check-tools:
 	$(CARGO_ENV) if ! cargo clippy --version >/dev/null 2>&1; then \
@@ -38,14 +38,14 @@ ensure-check-tools:
 	fi
 
 checks: ensure-check-tools
-	$(CARGO_ENV) cargo clippy -- -D warnings
+	$(CARGO_ENV) cargo clippy --tests -- -D warnings
 	$(CARGO_ENV) cargo audit
 
 test:
 	$(CARGO_ENV) cargo test
 
 lint:
-	$(CARGO_ENV) cargo clippy -- -D warnings
+	$(CARGO_ENV) cargo clippy --tests -- -D warnings
 
 fmt:
 	$(CARGO_ENV) cargo fmt
