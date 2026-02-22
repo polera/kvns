@@ -31,11 +31,26 @@ async fn main() {
         .expect("failed to install Prometheus exporter");
 
     metrics::describe_gauge!("kvns_keys_total", "Number of keys in the store");
-    metrics::describe_gauge!("kvns_memory_used_bytes", "Memory currently used by the store in bytes, per namespace");
-    metrics::describe_gauge!("kvns_memory_used_bytes_total", "Total memory currently used by the store in bytes across all namespaces");
-    metrics::describe_gauge!("kvns_memory_limit_bytes", "Configured memory limit in bytes");
-    metrics::describe_histogram!("kvns_command_duration_seconds", "Command processing latency in seconds");
-    metrics::describe_counter!("kvns_evictions_total", "Number of keys evicted from the store");
+    metrics::describe_gauge!(
+        "kvns_memory_used_bytes",
+        "Memory currently used by the store in bytes, per namespace"
+    );
+    metrics::describe_gauge!(
+        "kvns_memory_used_bytes_total",
+        "Total memory currently used by the store in bytes across all namespaces"
+    );
+    metrics::describe_gauge!(
+        "kvns_memory_limit_bytes",
+        "Configured memory limit in bytes"
+    );
+    metrics::describe_histogram!(
+        "kvns_command_duration_seconds",
+        "Command processing latency in seconds"
+    );
+    metrics::describe_counter!(
+        "kvns_evictions_total",
+        "Number of keys evicted from the store"
+    );
 
     // Load persisted state from disk, or start fresh.
     let initial_db = match &config.persist_path {
