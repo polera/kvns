@@ -1,59 +1,73 @@
 # kvns
 
-A Redis-compatible in-memory key-value store written in Rust. Speaks the [RESP protocol](https://redis.io/docs/latest/develop/reference/protocol-spec/) so any Redis client works out of the box.
-
+A Redis-compatible in-memory key-value store written in Rust.
+kvns speaks [RESP](https://redis.io/docs/latest/develop/reference/protocol-spec/) and works with `redis-cli` and Redis client libraries.
 
 ## LLM Disclosure
-This project is an experiment and in part, uses code generated with models from Anthropic.
+
+This project is an experiment and in part uses code generated with models from Anthropic.
 
 ## Features
 
-- RESP protocol — compatible with `redis-cli` and Redis client libraries
+- RESP2 server with RESP3 handshake support via `HELLO 3`
+- Redis-like command surface across strings, lists, hashes, sets, and sorted sets
 - Key namespacing via `namespace/key` syntax
-- Configurable memory limit with OOM rejection
-- Key expiry via `SET … EX` / `SET … PX`
-- Optional disk persistence with configurable flush interval
-- Configurable eviction (LRU / MRU) with per-namespace policy overrides
+- TTL/expiry management (`EXPIRE*`, `PEXPIRE*`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`)
+- Configurable memory limit with OOM rejection or namespace-scoped eviction (`lru`, `mru`)
+- Memory-limit guardrails when configured (`KVNS_MEMORY_LIMIT` is capped at 70% of host RAM)
+- Optional on-disk persistence with periodic flush and shutdown flush
 - Prometheus metrics endpoint with per-namespace labels
-- Structured logging via `tracing`
+- Structured logs via `tracing`
 
 ## Key namespacing
 
-Keys may optionally include a namespace prefix separated by `/`:
+Keys may include a namespace prefix separated by `/`:
 
-```
+```text
 namespace/localkey
 ```
 
-- `SET db1/x 42` — stores key `x` in namespace `db1`
-- `GET db1/x` — retrieves `x` from namespace `db1`
-- Keys with no `/` are placed in the `default` namespace
+- `SET db1/x 42` stores key `x` in namespace `db1`
+- `GET db1/x` reads key `x` from namespace `db1`
+- Keys with no `/` are stored in the `default` namespace
 
-Only the **first** `/` is treated as the separator, so local keys may themselves contain slashes (e.g. `SET ns/a/b value` → namespace `ns`, key `a/b`).
+Only the first `/` is treated as the separator, so local keys may also contain `/` (for example `SET ns/a/b value` uses namespace `ns` and key `a/b`).
 
-Namespaces are fully isolated: `db1/x` and `db2/x` are independent keys and their memory usage is tracked separately in metrics.
+Namespaces are isolated: `db1/x` and `db2/x` are different keys with independent memory/accounting metrics.
 
 ## Supported commands
 
-| Command | Syntax | Notes |
-|---------|--------|-------|
-| `PING` | `PING` | Returns `PONG` |
-| `SET` | `SET key value [EX seconds \| PX milliseconds]` | Overwrites existing key; respects memory limit |
-| `GET` | `GET key` | Returns bulk string or nil |
-| `DEL` | `DEL key` | Returns count of removed keys |
-| `TTL` | `TTL key` | Returns remaining TTL in seconds, `0` if no expiry, nil if missing |
-| `TOUCH` | `TOUCH key` | Resets hit counter to 0; returns new count |
-| `INCR` | `INCR key` | Atomically increments an integer value; initialises to 0 if missing |
-| `LPUSH` | `LPUSH key value [value …]` | Prepends values to a list; creates list if missing |
-| `KEYS` | `KEYS pattern` | Returns all keys matching a glob pattern |
-| `QUIT` | `QUIT` | Closes the connection |
+Command names are case-insensitive.
 
-All commands accept namespaced keys: `SET ns/counter 0`, `INCR ns/counter`, `LPUSH ns/queue item`, `KEYS ns/*`, etc.
+| Family | Commands |
+| --- | --- |
+| Connection | `PING`, `QUIT`, `HELLO`, `RESET`, `SELECT` |
+| String | `SET`, `GET`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `GETSET`, `GETDEL`, `GETEX`, `APPEND`, `STRLEN`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `INCRBYFLOAT`, `SETRANGE`, `GETRANGE`, `SUBSTR` |
+| List | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LREM`, `LTRIM`, `LINSERT`, `LPOS`, `LMOVE` |
+| Hash | `HSET`, `HMSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HMGET`, `HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD` |
+| Set | `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SUNION`, `SINTER`, `SDIFF`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `SMOVE`, `SPOP`, `SRANDMEMBER` |
+| Sorted set | `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREVRANGE`, `ZRANK`, `ZREVRANK`, `ZSCORE`, `ZMSCORE`, `ZREM`, `ZCARD`, `ZCOUNT`, `ZINCRBY`, `ZRANGEBYLEX`, `ZLEXCOUNT`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER` |
+| Generic/keyspace | `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `TTL`, `PTTL`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `RENAME`, `RENAMENX`, `SCAN`, `KEYS`, `TOUCH`, `COPY`, `OBJECT` |
+| Server/introspection | `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `INFO`, `CONFIG`, `COMMAND`, `CLIENT`, `LATENCY`, `SLOWLOG`, `DEBUG`, `WAIT`, `XADD` |
 
-### KEYS pattern syntax
+Compatibility notes:
+
+- `HMSET` is accepted as an alias for `HSET`.
+- `SUBSTR` is accepted as an alias for `GETRANGE`.
+- `XADD` currently returns `ERR stream type not supported`.
+- Some server/introspection subcommands are compatibility shims and return static or empty responses.
+- `SELECT` only supports database index `0`.
+
+TTL and expiry return semantics match Redis-style integer responses:
+
+- `TTL`/`PTTL` return `-2` for missing keys
+- `TTL`/`PTTL` return `-1` for keys without expiry
+- `EXPIRE`, `EXPIREAT`, `PEXPIRE`, and `PEXPIREAT` support `NX`, `XX`, `GT`, `LT`
+
+### Pattern syntax (`KEYS`, `SCAN MATCH`)
 
 | Pattern | Matches |
-|---------|---------|
+| --- | --- |
 | `*` | Any sequence of characters (including none) |
 | `?` | Exactly one character |
 | `[ae]` | One of the listed characters (`a` or `e`) |
@@ -61,24 +75,35 @@ All commands accept namespaced keys: `SET ns/counter 0`, `INCR ns/counter`, `LPU
 | `[a-z]` | Any character in the range |
 
 Examples:
+
 ```sh
-KEYS *          # all keys in all namespaces
-KEYS ns/*       # all keys in namespace "ns"
-KEYS h?llo      # hello, hallo, hxllo, …
-KEYS h[ae]llo   # hello or hallo
+KEYS *           # all keys in all namespaces
+KEYS ns/*        # all keys in namespace "ns"
+SCAN 0 MATCH ns/* COUNT 50
+KEYS h[ae]llo    # hello or hallo
 ```
 
 ## Building and running
+
+Development run:
+
+```sh
+cargo run
+```
+
+Release build and run:
 
 ```sh
 cargo build --release
 ./target/release/kvns
 ```
 
-Or for development:
+Or use the `Makefile`:
 
 ```sh
-cargo run
+make run
+make build
+make release
 ```
 
 ## Container usage (Podman)
@@ -89,13 +114,13 @@ Build a local image:
 make podman-build IMAGE=kvns:local
 ```
 
-Run the container directly:
+Run directly:
 
 ```sh
 make podman-run IMAGE=kvns:local
 ```
 
-Use `podman compose` with the included `docker-compose.yaml`:
+Use `podman compose` with `docker-compose.yaml`:
 
 ```sh
 make podman-compose-up
@@ -103,136 +128,124 @@ make podman-compose-logs
 make podman-compose-down
 ```
 
-Push a multi-arch image to GitHub Container Registry (GHCR):
+Push a multi-arch image to GHCR:
 
 ```sh
 make podman-login-ghcr GHCR_USER="<github-user>" GHCR_TOKEN="<github-token>"
-make podman-push-ghcr GHCR_IMAGE="ghcr.io/<owner>/<repo>" TAG="v0.1.0"
+make podman-push-ghcr GHCR_IMAGE="ghcr.io/<owner>/<repo>" TAG="v0.3.0"
 ```
 
 Notes:
 
 - `podman-push-ghcr` builds and pushes `linux/amd64,linux/arm64` by default
 - Set `PLATFORMS` to override target platforms
-- Set `PUSH_LATEST=false` to skip pushing the `latest` tag
+- Set `PUSH_LATEST=false` to skip publishing `latest`
 
 ## Configuration
 
 All settings are read from environment variables at startup.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `KVNS_HOST` | `0.0.0.0` | Interface to listen on |
 | `KVNS_PORT` | `6480` | RESP listener port |
-| `KVNS_MEMORY_LIMIT` | `1073741824` | Max memory in bytes (1 GiB) |
-| `KVNS_METRICS_HOST` | `0.0.0.0` | Interface for the metrics endpoint |
-| `KVNS_METRICS_PORT` | `9090` | Prometheus metrics port |
-| `KVNS_PERSIST_PATH` | *(unset)* | Path to the persistence file; persistence is disabled if unset |
-| `KVNS_PERSIST_INTERVAL` | `300` | Seconds between automatic flushes to disk |
+| `KVNS_MEMORY_LIMIT` | `1073741824` | Max memory in bytes (1 GiB). When set, kvns caps it at 70% of detected host RAM |
+| `KVNS_METRICS_HOST` | `0.0.0.0` | Metrics listener host |
+| `KVNS_METRICS_PORT` | `9090` | Metrics listener port |
+| `KVNS_PERSIST_PATH` | *(unset)* | Persistence file path; persistence is disabled if unset |
+| `KVNS_PERSIST_INTERVAL` | `300` | Seconds between automatic flushes |
 | `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `lru`, `mru`, or `none` |
-| `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0–1.0) at which eviction triggers |
-| `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides: `ns1:lru,ns2:mru` |
+| `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0-1.0) at which eviction starts |
+| `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lru,ns2:mru` |
 
-Example:
+Examples:
 
 ```sh
+# Custom port + memory limit
 KVNS_PORT=6379 KVNS_MEMORY_LIMIT=536870912 cargo run
 
-# With persistence enabled
-KVNS_PERSIST_PATH=/var/lib/kvns/db.bin KVNS_PERSIST_INTERVAL=60 cargo run
+# Enable persistence
+KVNS_PERSIST_PATH=/var/lib/kvns/db.rkyv KVNS_PERSIST_INTERVAL=60 cargo run
 
-# With LRU eviction, triggering at 80% capacity
+# Enable LRU eviction at 80% memory usage
 KVNS_EVICTION_POLICY=lru KVNS_EVICTION_THRESHOLD=0.8 cargo run
 
-# Per-namespace overrides: cache namespace uses MRU, sessions namespace uses LRU
+# Override one namespace to MRU while global policy is LRU
 KVNS_EVICTION_POLICY=lru KVNS_NS_EVICTION=cache:mru cargo run
 ```
+
+Memory limit behavior:
+
+- If `KVNS_MEMORY_LIMIT` is unset, kvns uses the default `1073741824` bytes (1 GiB)
+- If `KVNS_MEMORY_LIMIT` is set above 70% of detected host RAM, kvns clamps it to that 70% cap
+- If `KVNS_MEMORY_LIMIT=0`, kvns uses the same 70% cap directly
+- If host memory cannot be detected, kvns keeps the configured value; `0` falls back to the 1 GiB default
 
 ## Eviction
 
-When the store reaches capacity, writes that would exceed `KVNS_MEMORY_LIMIT` are normally rejected with an OOM error. Configuring an eviction policy tells kvns to automatically remove existing keys instead of rejecting the write.
-
-### Policies
+When a write would exceed the effective `KVNS_MEMORY_LIMIT`, kvns either rejects it with OOM or evicts keys depending on policy.
 
 | Policy | Description |
-|--------|-------------|
-| `none` | No eviction (default). Writes beyond the limit return an error. |
-| `lru` | Evict the least-recently-used keys first (lowest hit count). |
-| `mru` | Evict the most-recently-used keys first (highest hit count). |
+| --- | --- |
+| `none` | No eviction (default). Writes beyond limit return an error. |
+| `lru` | Evict lowest-hit keys first. |
+| `mru` | Evict highest-hit keys first. |
 
-Hit counts are updated by `GET` and can be reset to zero with `TOUCH`.
+`KVNS_EVICTION_THRESHOLD` controls when eviction begins. With `1.0` (default), eviction starts only at full configured capacity. Lower values (for example `0.8`) start eviction earlier.
 
-### Threshold
-
-`KVNS_EVICTION_THRESHOLD` (default `1.0`) sets the fraction of `KVNS_MEMORY_LIMIT` at which eviction begins. At the default of `1.0` eviction only triggers once the limit is fully reached. Setting it lower (e.g. `0.8`) starts evicting at 80% capacity, keeping headroom for bursty writes.
-
-### Per-namespace overrides
-
-`KVNS_NS_EVICTION` accepts a comma-separated list of `namespace:policy` pairs. A namespace listed here uses that policy regardless of the global setting:
-
-```sh
-# Global policy is LRU, but the "cache" namespace uses MRU
-KVNS_EVICTION_POLICY=lru KVNS_NS_EVICTION=cache:mru cargo run
-```
-
-Eviction is always scoped to the namespace of the incoming write — keys from other namespaces are never evicted to make room.
+`KVNS_NS_EVICTION` supports comma-separated `namespace:policy` overrides. Eviction is namespace-scoped: a write in one namespace never evicts keys from another namespace.
 
 ## Persistence
 
-When `KVNS_PERSIST_PATH` is set, kvns periodically serializes the entire store to disk using [bincode](https://github.com/bincode-org/bincode) and writes it atomically via a temp-file rename. On startup, if the file exists it is loaded back into memory; expired entries are silently dropped.
+When `KVNS_PERSIST_PATH` is set, kvns periodically snapshots the full store to disk using [`rkyv`](https://github.com/rkyv/rkyv). Writes are atomic: data is written to a temporary file (`*.tmp`) and then renamed into place.
 
-- Persistence is **opt-in** — omitting `KVNS_PERSIST_PATH` keeps the store fully in-memory
-- Writes are atomic: a crash mid-flush will never corrupt the existing file
-- The flush interval (default 5 minutes) is configurable via `KVNS_PERSIST_INTERVAL`
-- On clean shutdown (SIGINT / SIGTERM) the store is flushed to disk immediately
-- Parent directories of `KVNS_PERSIST_PATH` are created automatically if they do not exist
+- Persistence is opt-in (unset `KVNS_PERSIST_PATH` for in-memory only)
+- Flush interval is controlled by `KVNS_PERSIST_INTERVAL`
+- On startup, persisted data is loaded if present
+- Expired entries are dropped during load
+- On clean shutdown (`SIGINT`/`SIGTERM`), kvns flushes immediately
+- Parent directories for `KVNS_PERSIST_PATH` are created automatically
 
 ## Metrics
 
-kvns exposes a Prometheus scrape endpoint at `http://<KVNS_METRICS_HOST>:<KVNS_METRICS_PORT>/metrics`.
+kvns exposes Prometheus metrics at `http://<KVNS_METRICS_HOST>:<KVNS_METRICS_PORT>/metrics`.
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `kvns_keys_total` | Gauge | `namespace` | Current number of live keys per namespace |
-| `kvns_memory_used_bytes` | Gauge | `namespace` | Memory currently used per namespace |
-| `kvns_memory_used_bytes_total` | Gauge | — | Total memory used across all namespaces |
-| `kvns_memory_limit_bytes` | Gauge | — | Configured memory limit |
-| `kvns_command_duration_seconds` | Histogram | `command`, `namespace` | Command latency (`set` / `get`) |
-| `kvns_evictions_total` | Counter | `namespace` | Cumulative number of keys evicted per namespace |
+| --- | --- | --- | --- |
+| `kvns_keys_total` | Gauge | `namespace` | Current live key count per namespace |
+| `kvns_memory_used_bytes` | Gauge | `namespace` | Current memory used per namespace |
+| `kvns_memory_used_bytes_total` | Gauge | - | Total memory used across all namespaces |
+| `kvns_memory_limit_bytes` | Gauge | - | Configured memory limit |
+| `kvns_command_duration_seconds` | Histogram | `command`, `namespace` | Command latency histogram (currently instrumented for `SET`) |
+| `kvns_evictions_total` | Counter | `namespace` | Total keys evicted per namespace |
 
-Per-namespace gauges are created on first write and set to `0` when the last key in a namespace is removed.
+Per-namespace gauges are created on first write and are set to `0` when the last key in a namespace is removed.
 
 ## Quick smoke test
 
 ```sh
-# Start the server with persistence enabled
+# Start kvns with persistence enabled
 KVNS_PERSIST_PATH=kvns.db cargo run &
 
-# Write keys in different namespaces
+# Write namespaced and default keys
 redis-cli -p 6480 SET db1/x 42
 redis-cli -p 6480 SET db2/x 99
 redis-cli -p 6480 SET counter 0
 redis-cli -p 6480 INCR counter
 
-# List keys
-redis-cli -p 6480 KEYS "*"      # → counter, db1/x, db2/x
-redis-cli -p 6480 KEYS "db1/*"  # → db1/x
+# Query data
+redis-cli -p 6480 GET db1/x
+redis-cli -p 6480 KEYS "db*/*"
+redis-cli -p 6480 SCAN 0 MATCH "db*/*" COUNT 100
 
-# Read values
-redis-cli -p 6480 GET db1/x   # → 42
-redis-cli -p 6480 GET counter # → 1
-
-# Check per-namespace metrics
-curl -s http://localhost:9090/metrics | grep kvns_memory
-# kvns_memory_used_bytes{namespace="db1"} 6
-# kvns_memory_used_bytes{namespace="db2"} 6
-# kvns_memory_used_bytes{namespace="default"} 16
-# kvns_memory_used_bytes_total 28
-# kvns_memory_limit_bytes 1073741824
+# Inspect metrics
+curl -s http://localhost:9090/metrics | grep -E '^kvns_(memory|keys|evictions)'
 ```
 
-## Running tests
+## Running tests and checks
 
 ```sh
 cargo test
+make lint
+make fmt-check
 ```

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 pub const DEFAULT_MEMORY_LIMIT: usize = 1_073_741_824; // 1 GiB
 pub const DEFAULT_PERSIST_INTERVAL_SECS: u64 = 300; // 5 minutes
+pub const DEFAULT_MEMORY_CLAMP_LIMIT: usize = 70; // 70%
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum EvictionPolicy {
@@ -90,9 +91,7 @@ impl Config {
         Self {
             port: port.and_then(|s| s.parse().ok()).unwrap_or(defaults.port),
             host: host.map(|s| s.to_string()).unwrap_or(defaults.host),
-            memory_limit: memory_limit
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(defaults.memory_limit),
+            memory_limit: Self::parse_memory_limit(memory_limit, defaults.memory_limit),
             metrics_port: metrics_port
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(defaults.metrics_port),
@@ -113,6 +112,54 @@ impl Config {
                 .map(Self::parse_ns_eviction)
                 .unwrap_or_default(),
         }
+    }
+
+    fn parse_memory_limit(memory_limit: Option<&str>, default_limit: usize) -> usize {
+        let Some(configured_limit) = memory_limit.and_then(|s| s.parse::<usize>().ok()) else {
+            return default_limit;
+        };
+
+        match Self::total_system_memory_bytes() {
+            Some(total_memory_bytes) => {
+                Self::clamp_memory_limit_to_system(configured_limit, total_memory_bytes)
+            }
+            // If we cannot determine total memory, preserve previous behavior.
+            None if configured_limit == 0 => default_limit,
+            None => configured_limit,
+        }
+    }
+
+    fn clamp_memory_limit_to_system(configured_limit: usize, total_memory_bytes: usize) -> usize {
+        let cap = total_memory_bytes.saturating_mul(DEFAULT_MEMORY_CLAMP_LIMIT) / 100;
+        if configured_limit == 0 || configured_limit > cap {
+            cap
+        } else {
+            configured_limit
+        }
+    }
+
+    fn total_system_memory_bytes() -> Option<usize> {
+        Self::linux_total_memory_bytes().or_else(Self::sysctl_total_memory_bytes)
+    }
+
+    fn linux_total_memory_bytes() -> Option<usize> {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+        let kilobytes = line.split_whitespace().nth(1)?.parse::<usize>().ok()?;
+        kilobytes.checked_mul(1024)
+    }
+
+    fn sysctl_total_memory_bytes() -> Option<usize> {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
     }
 
     /// Parse `"ns1:lru,ns2:mru"` into a `HashMap<String, EvictionPolicy>`.
@@ -206,6 +253,68 @@ mod tests {
             None,
         );
         assert_eq!(c.memory_limit, 2048);
+    }
+
+    #[test]
+    fn clamp_memory_limit_keeps_values_within_cap() {
+        assert_eq!(Config::clamp_memory_limit_to_system(69, 100), 69);
+        assert_eq!(Config::clamp_memory_limit_to_system(70, 100), 70);
+    }
+
+    #[test]
+    fn clamp_memory_limit_caps_values_above_cap() {
+        assert_eq!(Config::clamp_memory_limit_to_system(71, 100), DEFAULT_MEMORY_CLAMP_LIMIT);
+        assert_eq!(Config::clamp_memory_limit_to_system(200, 100), DEFAULT_MEMORY_CLAMP_LIMIT);
+    }
+
+    #[test]
+    fn clamp_memory_limit_zero_uses_cap() {
+        assert_eq!(Config::clamp_memory_limit_to_system(0, 100), DEFAULT_MEMORY_CLAMP_LIMIT);
+    }
+
+    #[test]
+    fn from_vars_zero_memory_limit_uses_detected_cap() {
+        let c = Config::from_vars(
+            None,
+            None,
+            Some("0"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let expected = Config::total_system_memory_bytes()
+            .map(|total| Config::clamp_memory_limit_to_system(0, total))
+            .unwrap_or(DEFAULT_MEMORY_LIMIT);
+        assert_eq!(c.memory_limit, expected);
+    }
+
+    #[test]
+    fn from_vars_memory_limit_above_detected_cap_is_clamped() {
+        let Some(total_memory_bytes) = Config::total_system_memory_bytes() else {
+            return;
+        };
+
+        let cap = Config::clamp_memory_limit_to_system(0, total_memory_bytes);
+        let configured = cap.saturating_add(1);
+        let configured_str = configured.to_string();
+        let c = Config::from_vars(
+            None,
+            None,
+            Some(&configured_str),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(c.memory_limit, cap);
     }
 
     #[test]
