@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -10,7 +10,7 @@ use crate::resp::{
     resp_array, resp_bulk, resp_err, resp_int, resp_map, resp_null, resp_null_array, resp_ok,
     resp_pong, resp_verbatim, resp_wrongtype, wrong_args,
 };
-use crate::store::{Db, Entry, Store, Value, ZEntry};
+use crate::store::{Db, Entry, Store, Value, ZEntry, ZSetData};
 
 // ── Connection state ──────────────────────────────────────────────────────────
 
@@ -80,8 +80,8 @@ impl Ord for ScheduledExpiry {
 }
 
 static EXPIRY_QUEUE_TX_BY_STORE: LazyLock<
-    Mutex<HashMap<usize, mpsc::UnboundedSender<ExpiryEvent>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    RwLock<HashMap<usize, mpsc::UnboundedSender<ExpiryEvent>>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 fn store_scheduler_key(store: &Store) -> usize {
     Arc::as_ptr(store) as usize
@@ -89,22 +89,30 @@ fn store_scheduler_key(store: &Store) -> usize {
 
 fn ensure_expiry_scheduler(store: &Store) -> mpsc::UnboundedSender<ExpiryEvent> {
     let key = store_scheduler_key(store);
-    let mut guard = EXPIRY_QUEUE_TX_BY_STORE
-        .lock()
-        .expect("expiry scheduler mutex poisoned");
-    let needs_init = match guard.get(&key) {
-        Some(tx) => tx.is_closed(),
-        None => true,
-    };
-    if needs_init {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_expiry_scheduler(Arc::clone(store), rx, key));
-        guard.insert(key, tx);
+    // Fast path: shared read lock.
+    {
+        let guard = EXPIRY_QUEUE_TX_BY_STORE
+            .read()
+            .expect("expiry scheduler rwlock poisoned");
+        if let Some(tx) = guard.get(&key) {
+            if !tx.is_closed() {
+                return tx.clone();
+            }
+        }
     }
-    guard
-        .get(&key)
-        .expect("expiry scheduler sender should be initialized")
-        .clone()
+    // Slow path: exclusive write lock with double-check.
+    let mut guard = EXPIRY_QUEUE_TX_BY_STORE
+        .write()
+        .expect("expiry scheduler rwlock poisoned");
+    if let Some(tx) = guard.get(&key) {
+        if !tx.is_closed() {
+            return tx.clone();
+        }
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_expiry_scheduler(Arc::clone(store), rx, key));
+    guard.insert(key, tx.clone());
+    tx
 }
 
 fn schedule_expiry(store: &Store, ns: String, key: String, deadline: Instant) {
@@ -122,8 +130,8 @@ fn schedule_expiry(store: &Store, ns: String, key: String, deadline: Instant) {
             return;
         }
         let mut guard = EXPIRY_QUEUE_TX_BY_STORE
-            .lock()
-            .expect("expiry scheduler mutex poisoned");
+            .write()
+            .expect("expiry scheduler rwlock poisoned");
         guard.remove(&key_id);
     }
 }
@@ -178,8 +186,8 @@ async fn run_expiry_scheduler(
     }
 
     let mut guard = EXPIRY_QUEUE_TX_BY_STORE
-        .lock()
-        .expect("expiry scheduler mutex poisoned");
+        .write()
+        .expect("expiry scheduler rwlock poisoned");
     guard.remove(&key_id);
 }
 
@@ -206,30 +214,28 @@ pub(crate) async fn run_ear_sweep(store: Store) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        // Snapshot pending set under a brief read lock.
-        let pending: Vec<(String, String)> = {
-            let db = store.read().await;
+        // Single write lock: drain ear_pending and delete live entries.
+        let deleted = {
+            let mut db = store.write().await;
             if db.ear_pending.is_empty() {
                 continue;
             }
-            db.ear_pending.iter().cloned().collect()
-        };
-        // Delete in a single write lock pass.
-        let mut db = store.write().await;
-        let mut deleted = 0u64;
-        for (ns, key) in &pending {
-            // Re-check: a concurrent write may have cleared the mark via put().
-            if db.ear_pending.contains(&(ns.clone(), key.clone()))
-                && db
+            let pending: Vec<(String, String)> = db.ear_pending.drain().collect();
+            let mut count = 0u64;
+            for (ns, key) in &pending {
+                // put() clears EAR marks for re-written keys; re-check not-expired.
+                if db
                     .entries
-                    .get(ns)
+                    .get(ns.as_str())
                     .and_then(|m| m.get(key.as_str()))
                     .is_some_and(|e| !e.is_expired())
-            {
-                db.delete(ns, key);
-                deleted += 1;
+                {
+                    db.delete(ns, key);
+                    count += 1;
+                }
             }
-        }
+            count
+        };
         if deleted > 0 {
             tracing::debug!(deleted, "EAR sweep deleted keys");
             metrics::counter!("kvns_ear_evictions_total").increment(deleted);
@@ -237,40 +243,6 @@ pub(crate) async fn run_ear_sweep(store: Store) {
     }
 }
 
-/// Call AFTER dropping any read lock. Acquires write lock only if needed.
-async fn mark_ear_after_read(store: &Store, ns: &str, key: &str) {
-    {
-        let db = store.read().await;
-        if !db.is_ear_namespace(ns) {
-            return;
-        }
-    }
-    let mut db = store.write().await;
-    db.mark_ear(ns, key);
-}
-
-/// Mark multiple keys for EAR. Filters to only EAR namespaces.
-async fn mark_ear_keys(store: &Store, keys: &[(String, String)]) {
-    if keys.is_empty() {
-        return;
-    }
-    let ear_ns: HashSet<String> = {
-        let db = store.read().await;
-        keys.iter()
-            .filter(|(ns, _)| db.is_ear_namespace(ns))
-            .map(|(ns, _)| ns.clone())
-            .collect()
-    };
-    if ear_ns.is_empty() {
-        return;
-    }
-    let mut db = store.write().await;
-    for (ns, key) in keys {
-        if ear_ns.contains(ns) {
-            db.mark_ear(ns, key);
-        }
-    }
-}
 
 // ── Glob matching ─────────────────────────────────────────────────────────────
 
@@ -316,28 +288,31 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 
 // ── ZSet helpers ──────────────────────────────────────────────────────────────
 
-fn zset_find_member_idx(entries: &[ZEntry], member: &[u8]) -> Option<usize> {
-    entries.iter().position(|e| e.member == member)
-}
-
-/// Insert or update a member in the sorted set. Returns true if it was NEW.
-fn zset_insert_or_update(entries: &mut Vec<ZEntry>, score: f64, member: Vec<u8>) -> bool {
-    if let Some(idx) = zset_find_member_idx(entries, &member) {
-        entries[idx].score = score;
-        // Re-sort after update
-        entries.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.member.cmp(&b.member))
+/// Insert or update a member in the dual-structure sorted set. Returns true if
+/// the member was NEW (not an update of an existing member).
+fn zset_insert_or_update(data: &mut ZSetData, score: f64, member: Vec<u8>) -> bool {
+    if let Some(&old_score) = data.index.get(&member) {
+        // O(log n): find old position by binary search, remove it.
+        let old_pos = data.sorted.partition_point(|e| {
+            e.score < old_score
+                || (e.score == old_score && e.member.as_slice() < member.as_slice())
         });
-        false
-    } else {
-        let pos = entries.partition_point(|e| {
+        data.sorted.remove(old_pos);
+        // O(log n): find new position and insert.
+        let new_pos = data.sorted.partition_point(|e| {
             e.score < score || (e.score == score && e.member.as_slice() < member.as_slice())
         });
-        entries.insert(pos, ZEntry { score, member });
-        true
+        data.sorted.insert(new_pos, ZEntry { score, member: member.clone() });
+        data.index.insert(member, score);
+        false // updated, not new
+    } else {
+        // O(log n): binary-search insertion point.
+        let pos = data.sorted.partition_point(|e| {
+            e.score < score || (e.score == score && e.member.as_slice() < member.as_slice())
+        });
+        data.sorted.insert(pos, ZEntry { score, member: member.clone() });
+        data.index.insert(member, score);
+        true // new member
     }
 }
 
@@ -458,7 +433,7 @@ enum ZsetLookup {
     Missing,
     Expired,
     WrongType,
-    Found(Vec<ZEntry>),
+    Found(ZSetData, bool), // data, is_ear
 }
 
 async fn read_zset_snapshot(store: &Store, ns: &str, key: &str) -> ZsetLookup {
@@ -467,7 +442,7 @@ async fn read_zset_snapshot(store: &Store, ns: &str, key: &str) -> ZsetLookup {
         None => ZsetLookup::Missing,
         Some(entry) if entry.is_expired() => ZsetLookup::Expired,
         Some(entry) => match entry.value.as_zset() {
-            Some(z) => ZsetLookup::Found(z.clone()),
+            Some(z) => ZsetLookup::Found(z.clone(), db.is_ear_namespace(ns)),
             None => ZsetLookup::WrongType,
         },
     }
@@ -540,7 +515,7 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Missing,
         Expired,
         WrongType,
-        ValueNoHit(Vec<u8>),
+        ValueNoHit(Vec<u8>, bool), // value, is_ear
         NeedsHitUpdate,
     }
 
@@ -555,7 +530,7 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                     if db.tracks_hits(&ns) {
                         ReadGet::NeedsHitUpdate
                     } else {
-                        ReadGet::ValueNoHit(bytes.to_vec())
+                        ReadGet::ValueNoHit(bytes.to_vec(), db.is_ear_namespace(&ns))
                     }
                 }
             },
@@ -569,8 +544,11 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_null();
         }
         ReadGet::WrongType => return resp_wrongtype(),
-        ReadGet::ValueNoHit(value) => {
-            mark_ear_after_read(store, &ns, &key).await;
+        ReadGet::ValueNoHit(value, is_ear) => {
+            if is_ear {
+                let mut db = store.write().await;
+                db.mark_ear(&ns, &key);
+            }
             return resp_bulk(&value);
         }
         ReadGet::NeedsHitUpdate => {}
@@ -603,7 +581,7 @@ async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let keys: Vec<(String, String)> = args[1..].iter().map(|a| parse_ns_key(a)).collect();
-    let (out, expired_keys, found_keys) = {
+    let (out, expired_keys, found_keys, ear_ns) = {
         let db = store.read().await;
         let mut out = format!("*{}\r\n", keys.len()).into_bytes();
         let mut expired_keys: Vec<(String, String)> = Vec::new();
@@ -624,10 +602,23 @@ async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 },
             }
         }
-        (out, expired_keys, found_keys)
+        // Capture EAR namespaces while holding the read lock.
+        let ear_ns: HashSet<String> = found_keys
+            .iter()
+            .filter(|(ns, _)| db.is_ear_namespace(ns))
+            .map(|(ns, _)| ns.clone())
+            .collect();
+        (out, expired_keys, found_keys, ear_ns)
     };
     cleanup_expired_keys(store, &expired_keys).await;
-    mark_ear_keys(store, &found_keys).await;
+    if !ear_ns.is_empty() {
+        let mut db = store.write().await;
+        for (ns, key) in &found_keys {
+            if ear_ns.contains(ns) {
+                db.mark_ear(ns, key);
+            }
+        }
+    }
     out
 }
 
@@ -920,23 +911,21 @@ async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_int(0);
+    let (resp, expired) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => (resp_int(0), false),
+            Some(entry) if entry.is_expired() => (resp_int(0), true),
+            Some(entry) => match entry.value.as_string() {
+                None => (resp_wrongtype(), false),
+                Some(bytes) => (resp_int(bytes.len() as i64), false),
+            },
+        }
+    };
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => resp_int(0),
-        Some(entry) => match entry.value.as_string() {
-            None => resp_wrongtype(),
-            Some(bytes) => resp_int(bytes.len() as i64),
-        },
-    }
+    resp
 }
 
 pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -1202,41 +1191,38 @@ async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Some(n) => n,
         None => return resp_err("value is not an integer or out of range"),
     };
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_bulk(b"");
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => (resp_bulk(b""), false),
-        Some(entry) => match entry.value.as_string() {
-            None => return resp_wrongtype(),
-            Some(bytes) => {
-                let len = bytes.len() as i64;
-                let start = if start_i < 0 {
-                    (len + start_i).max(0) as usize
-                } else {
-                    start_i.min(len) as usize
-                };
-                let end = if end_i < 0 {
-                    (len + end_i).max(0) as usize
-                } else {
-                    end_i.min(len - 1).max(0) as usize
-                };
-                if start > end || bytes.is_empty() {
-                    (resp_bulk(b""), false)
-                } else {
-                    (resp_bulk(&bytes[start..=end.min(bytes.len() - 1)]), true)
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => (resp_bulk(b""), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_bulk(b""), true, false, false),
+            Some(entry) => match entry.value.as_string() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(bytes) => {
+                    let len = bytes.len() as i64;
+                    let start = if start_i < 0 {
+                        (len + start_i).max(0) as usize
+                    } else {
+                        start_i.min(len) as usize
+                    };
+                    let end = if end_i < 0 {
+                        (len + end_i).max(0) as usize
+                    } else {
+                        end_i.min(len - 1).max(0) as usize
+                    };
+                    if start > end || bytes.is_empty() {
+                        (resp_bulk(b""), false, false, false)
+                    } else {
+                        (resp_bulk(&bytes[start..=end.min(bytes.len() - 1)]), false, true, db.is_ear_namespace(&ns))
+                    }
                 }
-            }
-        },
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -1614,47 +1600,44 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Some(n) => n,
         None => return resp_err("value is not an integer or out of range"),
     };
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_array(&[]);
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => (resp_array(&[]), false),
-        Some(entry) => match &entry.value {
-            Value::List(list) => {
-                let len = list.len() as i64;
-                let start = if start_i < 0 {
-                    (len + start_i).max(0)
-                } else {
-                    start_i.min(len)
-                } as usize;
-                let stop = if stop_i < 0 {
-                    (len + stop_i).max(0)
-                } else {
-                    stop_i.min(len - 1)
-                } as usize;
-                if start > stop || list.is_empty() {
-                    (resp_array(&[]), false)
-                } else {
-                    let items: Vec<Vec<u8>> = list
-                        .iter()
-                        .skip(start)
-                        .take(stop - start + 1)
-                        .cloned()
-                        .collect();
-                    (resp_array(&items), true)
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => (resp_array(&[]), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
+            Some(entry) => match &entry.value {
+                Value::List(list) => {
+                    let len = list.len() as i64;
+                    let start = if start_i < 0 {
+                        (len + start_i).max(0)
+                    } else {
+                        start_i.min(len)
+                    } as usize;
+                    let stop = if stop_i < 0 {
+                        (len + stop_i).max(0)
+                    } else {
+                        stop_i.min(len - 1)
+                    } as usize;
+                    if start > stop || list.is_empty() {
+                        (resp_array(&[]), false, false, false)
+                    } else {
+                        let items: Vec<Vec<u8>> = list
+                            .iter()
+                            .skip(start)
+                            .take(stop - start + 1)
+                            .cloned()
+                            .collect();
+                        (resp_array(&items), false, true, db.is_ear_namespace(&ns))
+                    }
                 }
-            }
-            _ => return resp_wrongtype(),
-        },
+                _ => (resp_wrongtype(), false, false, false),
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -1672,32 +1655,29 @@ async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Some(n) => n,
         None => return resp_err("value is not an integer or out of range"),
     };
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_null();
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => (resp_null(), false),
-        Some(entry) => match &entry.value {
-            Value::List(list) => {
-                let len = list.len() as i64;
-                let idx = if idx_i < 0 { len + idx_i } else { idx_i };
-                if idx < 0 || idx >= len {
-                    (resp_null(), false)
-                } else {
-                    (resp_bulk(&list[idx as usize]), true)
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => (resp_null(), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_null(), true, false, false),
+            Some(entry) => match &entry.value {
+                Value::List(list) => {
+                    let len = list.len() as i64;
+                    let idx = if idx_i < 0 { len + idx_i } else { idx_i };
+                    if idx < 0 || idx >= len {
+                        (resp_null(), false, false, false)
+                    } else {
+                        (resp_bulk(&list[idx as usize]), false, true, db.is_ear_namespace(&ns))
+                    }
                 }
-            }
-            _ => return resp_wrongtype(),
-        },
+                _ => (resp_wrongtype(), false, false, false),
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -2167,16 +2147,16 @@ async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let field = &args[2];
-    let (resp, expired, field_found) = {
+    let (resp, expired, field_found, is_ear) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (resp_null(), false, false),
-            Some(entry) if entry.is_expired() => (resp_null(), true, false),
+            None => (resp_null(), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_null(), true, false, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false, false),
+                None => (resp_wrongtype(), false, false, false),
                 Some(h) => match h.get(field.as_slice()) {
-                    None => (resp_null(), false, false),
-                    Some(v) => (resp_bulk(v), false, true),
+                    None => (resp_null(), false, false, false),
+                    Some(v) => (resp_bulk(v), false, true, db.is_ear_namespace(&ns)),
                 },
             },
         }
@@ -2184,8 +2164,9 @@ async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
     }
-    if field_found {
-        mark_ear_after_read(store, &ns, &key).await;
+    if field_found && is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
     }
     resp
 }
@@ -2262,25 +2243,26 @@ async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u
     } else {
         resp_array(&[])
     };
-    let (resp, expired, found) = {
+    let (resp, expired, found, is_ear) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (empty, false, false),
-            Some(entry) if entry.is_expired() => (empty, true, false),
+            None => (empty, false, false, false),
+            Some(entry) if entry.is_expired() => (empty, true, false, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false, false),
+                None => (resp_wrongtype(), false, false, false),
                 Some(h) => {
+                    let is_ear = db.is_ear_namespace(&ns);
                     if conn.resp_version >= 3 {
                         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
                             h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        (resp_map(&pairs), false, true)
+                        (resp_map(&pairs), false, true, is_ear)
                     } else {
                         let mut flat: Vec<Vec<u8>> = Vec::with_capacity(h.len() * 2);
                         for (k, v) in h {
                             flat.push(k.clone());
                             flat.push(v.clone());
                         }
-                        (resp_array(&flat), false, true)
+                        (resp_array(&flat), false, true, is_ear)
                     }
                 }
             },
@@ -2289,8 +2271,9 @@ async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
     }
-    if found {
-        mark_ear_after_read(store, &ns, &key).await;
+    if found && is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
     }
     resp
 }
@@ -2300,16 +2283,16 @@ async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let (resp, expired, found) = {
+    let (resp, expired, found, is_ear) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (resp_array(&[]), false, false),
-            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false),
+            None => (resp_array(&[]), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false, false),
+                None => (resp_wrongtype(), false, false, false),
                 Some(h) => {
                     let keys: Vec<Vec<u8>> = h.keys().cloned().collect();
-                    (resp_array(&keys), false, true)
+                    (resp_array(&keys), false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2317,8 +2300,9 @@ async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
     }
-    if found {
-        mark_ear_after_read(store, &ns, &key).await;
+    if found && is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
     }
     resp
 }
@@ -2328,16 +2312,16 @@ async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let (resp, expired, found) = {
+    let (resp, expired, found, is_ear) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (resp_array(&[]), false, false),
-            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false),
+            None => (resp_array(&[]), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false, false),
+                None => (resp_wrongtype(), false, false, false),
                 Some(h) => {
                     let vals: Vec<Vec<u8>> = h.values().cloned().collect();
-                    (resp_array(&vals), false, true)
+                    (resp_array(&vals), false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2345,8 +2329,9 @@ async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
     }
-    if found {
-        mark_ear_after_read(store, &ns, &key).await;
+    if found && is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
     }
     resp
 }
@@ -2380,13 +2365,13 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let (ns, key) = parse_ns_key(&args[1]);
     let fields = &args[2..];
     let nulls = resp_array_of_nulls(fields.len());
-    let (resp, expired, found) = {
+    let (resp, expired, found, is_ear) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (nulls, false, false),
-            Some(entry) if entry.is_expired() => (nulls, true, false),
+            None => (nulls, false, false, false),
+            Some(entry) if entry.is_expired() => (nulls, true, false, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false, false),
+                None => (resp_wrongtype(), false, false, false),
                 Some(h) => {
                     let mut out = format!("*{}\r\n", fields.len()).into_bytes();
                     for f in fields {
@@ -2395,7 +2380,7 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                             Some(v) => out.extend_from_slice(&resp_bulk(v)),
                         }
                     }
-                    (out, false, true)
+                    (out, false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2403,8 +2388,9 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
     }
-    if found {
-        mark_ear_after_read(store, &ns, &key).await;
+    if found && is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
     }
     resp
 }
@@ -2552,72 +2538,62 @@ async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let withvalues =
         args.len() >= 4 && String::from_utf8_lossy(&args[3]).to_ascii_uppercase() == "WITHVALUES";
 
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return if count_opt.is_some() {
-            resp_array(&[])
-        } else {
-            resp_null()
-        };
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => {
-            if count_opt.is_some() {
-                (resp_array(&[]), false)
-            } else {
-                (resp_null(), false)
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            Some(entry) if entry.is_expired() => {
+                let resp = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                (resp, true, false, false)
             }
-        }
-        Some(entry) => match entry.value.as_hash() {
-            None => return resp_wrongtype(),
-            Some(h) => {
-                // Clone to release borrow on db before potential mark_ear call.
-                let fields: Vec<(Vec<u8>, Vec<u8>)> =
-                    h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                if fields.is_empty() {
-                    if count_opt.is_some() {
-                        (resp_array(&[]), false)
+            None => {
+                let resp = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                (resp, false, false, false)
+            }
+            Some(entry) => match entry.value.as_hash() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(h) => {
+                    let fields: Vec<(Vec<u8>, Vec<u8>)> =
+                        h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    if fields.is_empty() {
+                        let resp = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                        (resp, false, false, false)
                     } else {
-                        (resp_null(), false)
-                    }
-                } else {
-                    match count_opt {
-                        None => (resp_bulk(&fields[0].0), true),
-                        Some(count) => {
-                            let abs_count = count.unsigned_abs() as usize;
-                            let allow_repeat = count < 0;
-                            let mut result: Vec<Vec<u8>> = Vec::new();
-                            if allow_repeat {
-                                for i in 0..abs_count {
-                                    let idx = i % fields.len();
-                                    result.push(fields[idx].0.clone());
-                                    if withvalues {
-                                        result.push(fields[idx].1.clone());
+                        let is_ear = db.is_ear_namespace(&ns);
+                        match count_opt {
+                            None => (resp_bulk(&fields[0].0), false, true, is_ear),
+                            Some(count) => {
+                                let abs_count = count.unsigned_abs() as usize;
+                                let allow_repeat = count < 0;
+                                let mut result: Vec<Vec<u8>> = Vec::new();
+                                if allow_repeat {
+                                    for i in 0..abs_count {
+                                        let idx = i % fields.len();
+                                        result.push(fields[idx].0.clone());
+                                        if withvalues {
+                                            result.push(fields[idx].1.clone());
+                                        }
+                                    }
+                                } else {
+                                    let take = abs_count.min(fields.len());
+                                    for (field, value) in fields.iter().take(take) {
+                                        result.push(field.clone());
+                                        if withvalues {
+                                            result.push(value.clone());
+                                        }
                                     }
                                 }
-                            } else {
-                                let take = abs_count.min(fields.len());
-                                for (field, value) in fields.iter().take(take) {
-                                    result.push(field.clone());
-                                    if withvalues {
-                                        result.push(value.clone());
-                                    }
-                                }
+                                (resp_array(&result), false, true, is_ear)
                             }
-                            (resp_array(&result), true)
                         }
                     }
                 }
-            }
-        },
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -2729,28 +2705,25 @@ async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_array(&[]);
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => (resp_array(&[]), false),
-        Some(entry) => match entry.value.as_set() {
-            None => return resp_wrongtype(),
-            Some(s) => {
-                let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
-                members.sort();
-                (resp_array(&members), true)
-            }
-        },
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => (resp_array(&[]), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
+            Some(entry) => match entry.value.as_set() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(s) => {
+                    let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
+                    members.sort();
+                    (resp_array(&members), false, true, db.is_ear_namespace(&ns))
+                }
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -2786,27 +2759,24 @@ async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let member = &args[2];
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_int(0);
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_set() {
-            None => return resp_wrongtype(),
-            Some(s) => {
-                let found = s.contains(member.as_slice());
-                (resp_int(if found { 1 } else { 0 }), found)
-            }
-        },
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => (resp_int(0), false, false, false),
+            Some(entry) if entry.is_expired() => (resp_int(0), true, false, false),
+            Some(entry) => match entry.value.as_set() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(s) => {
+                    let found = s.contains(member.as_slice());
+                    (resp_int(if found { 1 } else { 0 }), false, found, found && db.is_ear_namespace(&ns))
+                }
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -2818,40 +2788,39 @@ async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let members = &args[2..];
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        let mut out = format!("*{}\r\n", members.len()).into_bytes();
-        for _ in members {
-            out.extend_from_slice(&resp_int(0));
-        }
-        return out;
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => {
-            let mut out = format!("*{}\r\n", members.len()).into_bytes();
-            for _ in members {
-                out.extend_from_slice(&resp_int(0));
-            }
-            (out, false)
-        }
-        Some(entry) => match entry.value.as_set() {
-            None => return resp_wrongtype(),
-            Some(s) => {
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            None => {
                 let mut out = format!("*{}\r\n", members.len()).into_bytes();
-                for m in members {
-                    out.extend_from_slice(&resp_int(if s.contains(m.as_slice()) { 1 } else { 0 }));
+                for _ in members {
+                    out.extend_from_slice(&resp_int(0));
                 }
-                (out, true)
+                (out, false, false, false)
             }
-        },
+            Some(entry) if entry.is_expired() => {
+                let mut out = format!("*{}\r\n", members.len()).into_bytes();
+                for _ in members {
+                    out.extend_from_slice(&resp_int(0));
+                }
+                (out, true, false, false)
+            }
+            Some(entry) => match entry.value.as_set() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(s) => {
+                    let mut out = format!("*{}\r\n", members.len()).into_bytes();
+                    for m in members {
+                        out.extend_from_slice(&resp_int(if s.contains(m.as_slice()) { 1 } else { 0 }));
+                    }
+                    (out, false, true, db.is_ear_namespace(&ns))
+                }
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -3419,7 +3388,7 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             .or_default()
             .entry(key.clone())
             .or_insert_with(|| Entry {
-                value: Value::ZSet(Vec::new()),
+                value: Value::ZSet(ZSetData::default()),
                 hits: 0,
                 expiry: None,
             });
@@ -3428,8 +3397,7 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             None => return resp_wrongtype(),
         };
 
-        let existing_idx = zset_find_member_idx(zset, &member);
-        let existing_score = existing_idx.map(|i| zset[i].score);
+        let existing_score = zset.index.get(&member).copied();
 
         let should_update = match existing_score {
             None => {
@@ -3540,17 +3508,14 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         }
     }
 
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_array(&[]),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            zset
-        }
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
     let results: Vec<(Vec<u8>, f64)> = if bylex {
@@ -3568,6 +3533,7 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             None => return resp_err("invalid lex range"),
         };
         let mut items: Vec<(Vec<u8>, f64)> = zset
+            .sorted
             .iter()
             .filter(|e| member_in_lex_range(&e.member, &min, &max))
             .map(|e| (e.member.clone(), e.score))
@@ -3591,6 +3557,7 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             None => return resp_err("min or max is not a float"),
         };
         let mut items: Vec<(Vec<u8>, f64)> = zset
+            .sorted
             .iter()
             .filter(|e| {
                 let above = if min_excl {
@@ -3613,7 +3580,7 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         items
     } else {
         // By rank
-        let len = zset.len() as i64;
+        let len = zset.sorted.len() as i64;
         let start_i: i64 = std::str::from_utf8(start_raw)
             .ok()
             .and_then(|s| s.parse().ok())
@@ -3635,10 +3602,11 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         if start > stop {
             return resp_array(&[]);
         }
-        let mut items: Vec<(Vec<u8>, f64)> = zset[start..=stop.min(zset.len().saturating_sub(1))]
-            .iter()
-            .map(|e| (e.member.clone(), e.score))
-            .collect();
+        let mut items: Vec<(Vec<u8>, f64)> =
+            zset.sorted[start..=stop.min(zset.sorted.len().saturating_sub(1))]
+                .iter()
+                .map(|e| (e.member.clone(), e.score))
+                .collect();
         if rev {
             items.reverse();
         }
@@ -3663,7 +3631,12 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             out_items.push(format_score(score));
         }
     }
-    resp_array(&out_items)
+    let resp = resp_array(&out_items);
+    if is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
+    }
+    resp
 }
 
 async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -3713,20 +3686,18 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         }
     }
 
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_array(&[]),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            zset
-        }
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
     let filtered: Vec<(Vec<u8>, f64)> = zset
+        .sorted
         .iter()
         .filter(|e| {
             let above = if min_excl {
@@ -3757,7 +3728,12 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             out.push(format_score(s));
         }
     }
-    resp_array(&out)
+    let resp = resp_array(&out);
+    if is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
+    }
+    resp
 }
 
 async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -3807,20 +3783,18 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         }
     }
 
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_array(&[]),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            zset
-        }
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
     let mut filtered: Vec<(Vec<u8>, f64)> = zset
+        .sorted
         .iter()
         .filter(|e| {
             let above = if min_excl {
@@ -3852,7 +3826,12 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             out.push(format_score(s));
         }
     }
-    resp_array(&out)
+    let resp = resp_array(&out);
+    if is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
+    }
+    resp
 }
 
 async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -3873,20 +3852,17 @@ async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(-1);
 
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_array(&[]),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            zset
-        }
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
-    let len = zset.len() as i64;
+    let len = zset.sorted.len() as i64;
     let start = if start_i < 0 {
         (len + start_i).max(0)
     } else {
@@ -3900,10 +3876,11 @@ async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if start > stop || zset.is_empty() {
         return resp_array(&[]);
     }
-    let mut slice: Vec<(Vec<u8>, f64)> = zset[start..=stop.min(zset.len().saturating_sub(1))]
-        .iter()
-        .map(|e| (e.member.clone(), e.score))
-        .collect();
+    let mut slice: Vec<(Vec<u8>, f64)> =
+        zset.sorted[start..=stop.min(zset.sorted.len().saturating_sub(1))]
+            .iter()
+            .map(|e| (e.member.clone(), e.score))
+            .collect();
     slice.reverse();
 
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -3913,7 +3890,12 @@ async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             out.push(format_score(s));
         }
     }
-    resp_array(&out)
+    let resp = resp_array(&out);
+    if is_ear {
+        let mut db = store.write().await;
+        db.mark_ear(&ns, &key);
+    }
+    resp
 }
 
 async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -3925,29 +3907,36 @@ async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let withscore =
         args.len() == 4 && String::from_utf8_lossy(&args[3]).to_ascii_uppercase() == "WITHSCORE";
 
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_null(),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_null();
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
-    match zset.iter().position(|e| e.member == member.as_slice()) {
+    match zset.index.get(member.as_slice()) {
         None => resp_null(),
-        Some(rank) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            if withscore {
-                let score = zset[rank].score;
+        Some(&score) => {
+            let rank = zset.sorted.partition_point(|e| {
+                e.score < score
+                    || (e.score == score && e.member.as_slice() < member.as_slice())
+            });
+            let resp = if withscore {
                 let mut out = b"*2\r\n".to_vec();
                 out.extend_from_slice(&resp_int(rank as i64));
                 out.extend_from_slice(&resp_bulk(&format_score(score)));
                 out
             } else {
                 resp_int(rank as i64)
+            };
+            if is_ear {
+                let mut db = store.write().await;
+                db.mark_ear(&ns, &key);
             }
+            resp
         }
     }
 }
@@ -3961,30 +3950,37 @@ async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let withscore =
         args.len() == 4 && String::from_utf8_lossy(&args[3]).to_ascii_uppercase() == "WITHSCORE";
 
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_null(),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_null();
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
-    match zset.iter().position(|e| e.member == member.as_slice()) {
+    match zset.index.get(member.as_slice()) {
         None => resp_null(),
-        Some(rank) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            let rev_rank = zset.len() - 1 - rank;
-            if withscore {
-                let score = zset[rank].score;
+        Some(&score) => {
+            let rank = zset.sorted.partition_point(|e| {
+                e.score < score
+                    || (e.score == score && e.member.as_slice() < member.as_slice())
+            });
+            let rev_rank = zset.sorted.len() - 1 - rank;
+            let resp = if withscore {
                 let mut out = b"*2\r\n".to_vec();
                 out.extend_from_slice(&resp_int(rev_rank as i64));
                 out.extend_from_slice(&resp_bulk(&format_score(score)));
                 out
             } else {
                 resp_int(rev_rank as i64)
+            };
+            if is_ear {
+                let mut db = store.write().await;
+                db.mark_ear(&ns, &key);
             }
+            resp
         }
     }
 }
@@ -3995,21 +3991,24 @@ async fn cmd_zscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let member = &args[2];
-    let zset = match read_zset_snapshot(store, &ns, &key).await {
+    let (zset, is_ear) = match read_zset_snapshot(store, &ns, &key).await {
         ZsetLookup::Missing => return resp_null(),
         ZsetLookup::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
             return resp_null();
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset, is_ear) => (zset, is_ear),
     };
 
-    match zset.iter().find(|e| e.member == member.as_slice()) {
+    match zset.index.get(member.as_slice()) {
         None => resp_null(),
-        Some(e) => {
-            mark_ear_after_read(store, &ns, &key).await;
-            resp_bulk(&format_score(e.score))
+        Some(&score) => {
+            if is_ear {
+                let mut db = store.write().await;
+                db.mark_ear(&ns, &key);
+            }
+            resp_bulk(&format_score(score))
         }
     }
 }
@@ -4027,17 +4026,20 @@ async fn cmd_zmscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_array_of_nulls(members.len());
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => {
-            mark_ear_after_read(store, &ns, &key).await;
+        ZsetLookup::Found(zset, is_ear) => {
+            if is_ear {
+                let mut db = store.write().await;
+                db.mark_ear(&ns, &key);
+            }
             zset
         }
     };
 
     let mut out = format!("*{}\r\n", members.len()).into_bytes();
     for m in members {
-        match zset.iter().find(|e| e.member == m.as_slice()) {
+        match zset.index.get(m.as_slice()) {
             None => out.extend_from_slice(&resp_null()),
-            Some(e) => out.extend_from_slice(&resp_bulk(&format_score(e.score))),
+            Some(&score) => out.extend_from_slice(&resp_bulk(&format_score(score))),
         }
     }
     out
@@ -4063,14 +4065,20 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
-            Some(z) => {
-                let before = z.len();
+            Some(data) => {
+                let before = data.len();
                 for m in members {
-                    if let Some(idx) = z.iter().position(|e| e.member == m.as_slice()) {
-                        z.remove(idx);
+                    if let Some(score) = data.index.remove(m.as_slice()) {
+                        let pos = data.sorted.partition_point(|e| {
+                            e.score < score
+                                || (e.score == score && e.member.as_slice() < m.as_slice())
+                        });
+                        if pos < data.sorted.len() && data.sorted[pos].member == m.as_slice() {
+                            data.sorted.remove(pos);
+                        }
                     }
                 }
-                resp_int((before - z.len()) as i64)
+                resp_int((before - data.len()) as i64)
             }
         },
     }
@@ -4095,7 +4103,7 @@ async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
-            Some(z) => resp_int(z.len() as i64),
+            Some(data) => resp_int(data.len() as i64),
         },
     }
 }
@@ -4127,8 +4135,9 @@ async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
-            Some(z) => {
-                let count = z
+            Some(data) => {
+                let count = data
+                    .sorted
                     .iter()
                     .filter(|e| {
                         let above = if min_excl {
@@ -4177,11 +4186,7 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => 0.0,
         Some(entry) => match entry.value.as_zset() {
             None => return resp_wrongtype(),
-            Some(z) => z
-                .iter()
-                .find(|e| e.member == member.as_slice())
-                .map(|e| e.score)
-                .unwrap_or(0.0),
+            Some(data) => data.index.get(member.as_slice()).copied().unwrap_or(0.0),
         },
     };
 
@@ -4192,13 +4197,13 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .or_default()
         .entry(key.clone())
         .or_insert_with(|| Entry {
-            value: Value::ZSet(Vec::new()),
+            value: Value::ZSet(ZSetData::default()),
             hits: 0,
             expiry: None,
         });
     match entry.value.as_zset_mut() {
-        Some(z) => {
-            zset_insert_or_update(z, new_score, member);
+        Some(data) => {
+            zset_insert_or_update(data, new_score, member);
         }
         None => return resp_wrongtype(),
     }
@@ -4248,15 +4253,15 @@ async fn cmd_zrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    let zset = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let zset_sorted: Vec<ZEntry> = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
         None => return resp_array(&[]),
         Some(entry) => match entry.value.as_zset() {
             None => return resp_wrongtype(),
-            Some(z) => z.clone(),
+            Some(data) => data.sorted.clone(),
         },
     };
 
-    let filtered: Vec<Vec<u8>> = zset
+    let filtered: Vec<Vec<u8>> = zset_sorted
         .iter()
         .filter(|e| member_in_lex_range(&e.member, &min, &max))
         .map(|e| e.member.clone())
@@ -4297,8 +4302,9 @@ async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
-            Some(z) => {
-                let count = z
+            Some(data) => {
+                let count = data
+                    .sorted
                     .iter()
                     .filter(|e| member_in_lex_range(&e.member, &min, &max))
                     .count();
@@ -4341,8 +4347,8 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
-            Some(z) => {
-                let len = z.len() as i64;
+            Some(data) => {
+                let len = data.sorted.len() as i64;
                 let start = if start_i < 0 {
                     (len + start_i).max(0)
                 } else {
@@ -4357,7 +4363,14 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                     return resp_int(0);
                 }
                 let count = stop - start + 1;
-                z.drain(start..=stop.min(z.len().saturating_sub(1)));
+                let stop_capped = stop.min(data.sorted.len().saturating_sub(1));
+                if start <= stop_capped {
+                    let drained: Vec<ZEntry> =
+                        data.sorted.drain(start..=stop_capped).collect();
+                    for e in &drained {
+                        data.index.remove(e.member.as_slice());
+                    }
+                }
                 resp_int(count as i64)
             }
         },
@@ -4391,9 +4404,10 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
-            Some(z) => {
-                let before = z.len();
-                z.retain(|e| {
+            Some(data) => {
+                let before = data.len();
+                let mut to_remove: Vec<Vec<u8>> = Vec::new();
+                data.sorted.retain(|e| {
                     let above = if min_excl {
                         e.score > min_score
                     } else {
@@ -4404,9 +4418,15 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                     } else {
                         e.score <= max_score
                     };
+                    if above && below {
+                        to_remove.push(e.member.clone());
+                    }
                     !(above && below)
                 });
-                resp_int((before - z.len()) as i64)
+                for m in to_remove {
+                    data.index.remove(m.as_slice());
+                }
+                resp_int((before - data.len()) as i64)
             }
         },
     }
@@ -4439,10 +4459,21 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
-            Some(z) => {
-                let before = z.len();
-                z.retain(|e| !member_in_lex_range(&e.member, &min, &max));
-                resp_int((before - z.len()) as i64)
+            Some(data) => {
+                let before = data.len();
+                let mut to_remove: Vec<Vec<u8>> = Vec::new();
+                data.sorted.retain(|e| {
+                    if member_in_lex_range(&e.member, &min, &max) {
+                        to_remove.push(e.member.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for m in to_remove {
+                    data.index.remove(m.as_slice());
+                }
+                resp_int((before - data.len()) as i64)
             }
         },
     }
@@ -4479,13 +4510,14 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_array(&[]),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
-            Some(z) => {
+            Some(data) => {
                 let mut result: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..count {
-                    if z.is_empty() {
+                    if data.is_empty() {
                         break;
                     }
-                    let e = z.remove(0);
+                    let e = data.sorted.remove(0);
+                    data.index.remove(e.member.as_slice());
                     result.push(e.member);
                     result.push(format_score(e.score));
                 }
@@ -4526,13 +4558,14 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => resp_array(&[]),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
-            Some(z) => {
+            Some(data) => {
                 let mut result: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..count {
-                    if z.is_empty() {
+                    if data.is_empty() {
                         break;
                     }
-                    let e = z.pop().unwrap();
+                    let e = data.sorted.pop().unwrap();
+                    data.index.remove(e.member.as_slice());
                     result.push(e.member);
                     result.push(format_score(e.score));
                 }
@@ -4561,71 +4594,61 @@ async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let withscores =
         args.len() >= 4 && String::from_utf8_lossy(&args[3]).to_ascii_uppercase() == "WITHSCORES";
 
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return if count_opt.is_some() {
-            resp_array(&[])
-        } else {
-            resp_null()
-        };
-    }
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => {
-            if count_opt.is_some() {
-                (resp_array(&[]), false)
-            } else {
-                (resp_null(), false)
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            Some(entry) if entry.is_expired() => {
+                let resp = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                (resp, true, false, false)
             }
-        }
-        Some(entry) => match entry.value.as_zset() {
-            None => return resp_wrongtype(),
-            Some(z) => {
-                if z.is_empty() {
-                    if count_opt.is_some() {
-                        (resp_array(&[]), false)
+            None => {
+                let resp = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                (resp, false, false, false)
+            }
+            Some(entry) => match entry.value.as_zset() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(data) => {
+                    if data.is_empty() {
+                        let resp = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                        (resp, false, false, false)
                     } else {
-                        (resp_null(), false)
-                    }
-                } else {
-                    // Clone to release borrow before potential mark_ear call.
-                    let z: Vec<crate::store::ZEntry> = z.clone();
-                    match count_opt {
-                        None => (resp_bulk(&z[0].member), true),
-                        Some(count) => {
-                            let abs_count = count.unsigned_abs() as usize;
-                            let allow_repeat = count < 0;
-                            let mut result: Vec<Vec<u8>> = Vec::new();
-                            if allow_repeat {
-                                for i in 0..abs_count {
-                                    let idx = i % z.len();
-                                    result.push(z[idx].member.clone());
-                                    if withscores {
-                                        result.push(format_score(z[idx].score));
+                        let z: Vec<crate::store::ZEntry> = data.sorted.clone();
+                        let is_ear = db.is_ear_namespace(&ns);
+                        match count_opt {
+                            None => (resp_bulk(&z[0].member), false, true, is_ear),
+                            Some(count) => {
+                                let abs_count = count.unsigned_abs() as usize;
+                                let allow_repeat = count < 0;
+                                let mut result: Vec<Vec<u8>> = Vec::new();
+                                if allow_repeat {
+                                    for i in 0..abs_count {
+                                        let idx = i % z.len();
+                                        result.push(z[idx].member.clone());
+                                        if withscores {
+                                            result.push(format_score(z[idx].score));
+                                        }
+                                    }
+                                } else {
+                                    let take = abs_count.min(z.len());
+                                    for item in z.iter().take(take) {
+                                        result.push(item.member.clone());
+                                        if withscores {
+                                            result.push(format_score(item.score));
+                                        }
                                     }
                                 }
-                            } else {
-                                let take = abs_count.min(z.len());
-                                for item in z.iter().take(take) {
-                                    result.push(item.member.clone());
-                                    if withscores {
-                                        result.push(format_score(item.score));
-                                    }
-                                }
+                                (resp_array(&result), false, true, is_ear)
                             }
-                            (resp_array(&result), true)
                         }
                     }
                 }
-            }
-        },
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp

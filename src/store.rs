@@ -3,6 +3,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// A sorted set with O(1) member lookup and O(log n) rank queries.
+#[derive(Clone, Default)]
+pub(crate) struct ZSetData {
+    /// Entries sorted by (score ASC, member ASC).
+    pub sorted: Vec<ZEntry>,
+    /// Member → score index for O(1) lookups.
+    pub index: HashMap<Vec<u8>, f64>,
+}
+
+impl ZSetData {
+    pub fn len(&self) -> usize {
+        self.sorted.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+}
+
 use tokio::sync::RwLock;
 
 use crate::config::EvictionPolicy;
@@ -20,8 +39,8 @@ pub(crate) enum Value {
     List(VecDeque<Vec<u8>>),
     Hash(HashMap<Vec<u8>, Vec<u8>>),
     Set(HashSet<Vec<u8>>),
-    /// Kept sorted by (score ASC, member ASC).
-    ZSet(Vec<ZEntry>),
+    /// Dual-structure: sorted vec + member→score index.
+    ZSet(ZSetData),
 }
 
 impl Value {
@@ -31,7 +50,7 @@ impl Value {
             Value::List(items) => items.iter().map(|b| b.len()).sum(),
             Value::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
             Value::Set(s) => s.iter().map(|v| v.len()).sum(),
-            Value::ZSet(v) => v.iter().map(|e| 8 + e.member.len()).sum(),
+            Value::ZSet(data) => data.sorted.iter().map(|e| 8 + e.member.len()).sum(),
         }
     }
 
@@ -83,7 +102,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn as_zset(&self) -> Option<&Vec<ZEntry>> {
+    pub(crate) fn as_zset(&self) -> Option<&ZSetData> {
         if let Value::ZSet(v) = self {
             Some(v)
         } else {
@@ -91,7 +110,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn as_zset_mut(&mut self) -> Option<&mut Vec<ZEntry>> {
+    pub(crate) fn as_zset_mut(&mut self) -> Option<&mut ZSetData> {
         if let Value::ZSet(v) = self {
             Some(v)
         } else {
@@ -270,53 +289,62 @@ impl Db {
         if self.used_bytes < threshold_bytes {
             return false;
         }
-        // 4. How many bytes do we need to free?
-        let would_use = self.used_bytes.saturating_add(net_delta);
-        if would_use <= self.memory_limit {
-            return true; // already fits
-        }
-        let overflow = would_use - self.memory_limit;
-
-        // 5. Collect (key, hits, size) snapshot — must not hold a live
-        //    reference into self.entries while we call self.delete below.
-        let mut candidates: Vec<(String, u64, usize)> = match self.entries.get(namespace) {
-            None => return false,
-            Some(ns_map) => ns_map
-                .iter()
-                .map(|(k, e)| {
-                    (
-                        k.clone(),
-                        e.hits,
-                        Self::entry_size(namespace, k, e.value.byte_len()),
-                    )
-                })
-                .collect(),
-        };
-
-        // 6. Sort by eviction order.
-        match policy {
-            EvictionPolicy::Lru => candidates.sort_by_key(|(_, hits, _)| *hits),
-            EvictionPolicy::Mru => candidates.sort_by_key(|(_, hits, _)| Reverse(*hits)),
-            EvictionPolicy::None | EvictionPolicy::ExpireAfterRead => unreachable!(),
-        }
-
-        // 7. Evict until we have freed enough bytes.
-        let mut freed = 0usize;
-        let mut count = 0u64;
-        for (key, _, size) in candidates {
-            if freed >= overflow {
+        // 4. Evict in rounds using reservoir sampling to avoid O(n) clone.
+        const EVICTION_SAMPLE_SIZE: usize = 32;
+        const MAX_ROUNDS: usize = 20;
+        let mut total_count = 0u64;
+        let mut rounds = 0;
+        while self.used_bytes.saturating_add(net_delta) > self.memory_limit && rounds < MAX_ROUNDS {
+            let would_use = self.used_bytes.saturating_add(net_delta);
+            if would_use <= self.memory_limit {
                 break;
             }
-            self.delete(namespace, &key);
-            freed += size;
-            count += 1;
+            let overflow = would_use - self.memory_limit;
+
+            // 5. Sample up to EVICTION_SAMPLE_SIZE keys from the namespace.
+            let ns_map = match self.entries.get(namespace) {
+                None => return false,
+                Some(m) => m,
+            };
+            let mut candidates: Vec<(String, u64, usize)> = {
+                let it = ns_map.iter().map(|(k, e)| {
+                    (k.clone(), e.hits, Self::entry_size(namespace, k, e.value.byte_len()))
+                });
+                if ns_map.len() > EVICTION_SAMPLE_SIZE {
+                    it.take(EVICTION_SAMPLE_SIZE).collect()
+                } else {
+                    it.collect()
+                }
+            };
+            if candidates.is_empty() {
+                break;
+            }
+
+            // 6. Sort sample by eviction order.
+            match policy {
+                EvictionPolicy::Lru => candidates.sort_by_key(|(_, hits, _)| *hits),
+                EvictionPolicy::Mru => candidates.sort_by_key(|(_, hits, _)| Reverse(*hits)),
+                EvictionPolicy::None | EvictionPolicy::ExpireAfterRead => unreachable!(),
+            }
+
+            // 7. Evict from sample until round's overflow is covered.
+            let mut freed = 0usize;
+            for (key, _, size) in candidates {
+                if freed >= overflow {
+                    break;
+                }
+                self.delete(namespace, &key);
+                freed += size;
+                total_count += 1;
+            }
+            rounds += 1;
         }
 
         // 8. Trace log.
-        tracing::debug!(namespace, freed, overflow, "evicted keys");
+        tracing::debug!(namespace, rounds, "evicted keys");
         // 9. Metric.
         metrics::counter!("kvns_evictions_total", "namespace" => namespace.to_owned())
-            .increment(count);
+            .increment(total_count);
 
         // 10. Did we free enough?
         self.used_bytes.saturating_add(net_delta) <= self.memory_limit

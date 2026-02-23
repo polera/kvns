@@ -199,24 +199,6 @@ impl ShardedDb {
         Ok(())
     }
 
-    async fn key_exists_live(&self, raw_key: &[u8]) -> bool {
-        let parsed = self.parse_key(raw_key);
-        let now = Instant::now();
-
-        {
-            let shard = self.shards[parsed.shard_idx].read().await;
-            match shard.get(&parsed.canonical) {
-                None => return false,
-                Some(entry) if entry.expiry.is_some_and(|deadline| now >= deadline) => {}
-                Some(_) => return true,
-            }
-        }
-
-        let mut shard = self.shards[parsed.shard_idx].write().await;
-        self.purge_expired_locked(&mut shard, &parsed, now);
-        shard.contains_key(&parsed.canonical)
-    }
-
     async fn apply_integer_delta(
         &self,
         raw_key: &[u8],
@@ -271,6 +253,124 @@ impl ShardedDb {
         );
         self.record_total_used();
         Ok(next)
+    }
+
+    /// Insert `value` only if the key is absent (or expired). Returns `Ok(true)` on
+    /// success, `Ok(false)` if the key already exists, `Err(())` on OOM.
+    async fn put_value_if_absent(&self, raw_key: &[u8], value: Vec<u8>) -> Result<bool, ()> {
+        let parsed = self.parse_key(raw_key);
+        let now = Instant::now();
+        let mut shard = self.shards[parsed.shard_idx].write().await;
+        self.purge_expired_locked(&mut shard, &parsed, now);
+        if shard.contains_key(&parsed.canonical) {
+            return Ok(false);
+        }
+        let new_size = Self::entry_size(&parsed.ns, &parsed.key, value.len());
+        if !self.reserve_bytes(new_size) {
+            return Err(());
+        }
+        shard.insert(parsed.canonical, ShardedEntry { value, expiry: None });
+        self.record_total_used();
+        Ok(true)
+    }
+
+    /// Append `suffix` to the existing value (defaulting to empty). Returns the
+    /// new length on success, or `Err(bytes)` on OOM where `bytes` is an error response.
+    async fn append_value(&self, raw_key: &[u8], suffix: &[u8]) -> Result<i64, Vec<u8>> {
+        let parsed = self.parse_key(raw_key);
+        let now = Instant::now();
+        let mut shard = self.shards[parsed.shard_idx].write().await;
+        self.purge_expired_locked(&mut shard, &parsed, now);
+        let old_value = shard
+            .get(&parsed.canonical)
+            .map(|e| e.value.clone())
+            .unwrap_or_default();
+        let old_size = Self::entry_size(&parsed.ns, &parsed.key, old_value.len());
+        let mut new_value = old_value;
+        new_value.extend_from_slice(suffix);
+        let new_size = Self::entry_size(&parsed.ns, &parsed.key, new_value.len());
+        if new_size > old_size {
+            if !self.reserve_bytes(new_size - old_size) {
+                return Err(resp_err("OOM command not allowed when used memory > 'maxmemory'"));
+            }
+        } else {
+            self.release_bytes(old_size - new_size);
+        }
+        let len = new_value.len() as i64;
+        shard.insert(parsed.canonical, ShardedEntry { value: new_value, expiry: None });
+        self.record_total_used();
+        Ok(len)
+    }
+
+    /// Atomically replace the value, returning the old value (if any). Returns
+    /// `Err(())` on OOM.
+    async fn get_and_set(&self, raw_key: &[u8], new_value: Vec<u8>) -> Result<Option<Vec<u8>>, ()> {
+        let parsed = self.parse_key(raw_key);
+        let now = Instant::now();
+        let mut shard = self.shards[parsed.shard_idx].write().await;
+        self.purge_expired_locked(&mut shard, &parsed, now);
+        let old = shard.get(&parsed.canonical).map(|e| e.value.clone());
+        let old_size = old.as_ref()
+            .map(|v| Self::entry_size(&parsed.ns, &parsed.key, v.len()))
+            .unwrap_or(0);
+        let new_size = Self::entry_size(&parsed.ns, &parsed.key, new_value.len());
+        if new_size > old_size {
+            if !self.reserve_bytes(new_size - old_size) {
+                return Err(());
+            }
+        } else {
+            self.release_bytes(old_size - new_size);
+        }
+        shard.insert(parsed.canonical, ShardedEntry { value: new_value, expiry: None });
+        self.record_total_used();
+        Ok(old)
+    }
+
+    /// Set all key-value pairs only if none of the keys already exist. Acquires
+    /// shard write locks in index order to avoid deadlock. Returns `Ok(true)` on
+    /// success, `Ok(false)` if any key exists, `Err(())` on OOM.
+    async fn msetnx_atomic(&self, pairs: Vec<(ParsedKey, Vec<u8>)>) -> Result<bool, ()> {
+        use std::collections::BTreeMap;
+        let now = Instant::now();
+        // Group pairs by shard index (BTreeMap → sorted order prevents deadlock).
+        let mut by_shard: BTreeMap<usize, Vec<(ParsedKey, Vec<u8>)>> = BTreeMap::new();
+        for (parsed, value) in pairs {
+            by_shard.entry(parsed.shard_idx).or_default().push((parsed, value));
+        }
+        // Acquire all write locks in shard-index order.
+        let mut guards: Vec<(usize, tokio::sync::RwLockWriteGuard<'_, HashMap<String, ShardedEntry>>)> =
+            Vec::with_capacity(by_shard.len());
+        for &shard_idx in by_shard.keys() {
+            let guard = self.shards[shard_idx].write().await;
+            guards.push((shard_idx, guard));
+        }
+        // First pass: purge expired + check existence.
+        for (shard_idx, guard) in &mut guards {
+            if let Some(shard_pairs) = by_shard.get(&*shard_idx) {
+                let shard: &mut HashMap<String, ShardedEntry> = guard;
+                for (parsed, _) in shard_pairs {
+                    self.purge_expired_locked(shard, parsed, now);
+                    if shard.contains_key(&parsed.canonical) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        // Second pass: reserve bytes + insert.
+        for (shard_idx, guard) in &mut guards {
+            if let Some(shard_pairs) = by_shard.get(&*shard_idx) {
+                let shard: &mut HashMap<String, ShardedEntry> = guard;
+                for (parsed, value) in shard_pairs {
+                    let size = Self::entry_size(&parsed.ns, &parsed.key, value.len());
+                    if !self.reserve_bytes(size) {
+                        return Err(());
+                    }
+                    shard.insert(parsed.canonical.clone(), ShardedEntry { value: value.clone(), expiry: None });
+                }
+            }
+        }
+        self.record_total_used();
+        Ok(true)
     }
 }
 
@@ -381,47 +481,28 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
             return (wrong_args(&args[0]), false);
         }
+        let mut pairs: Vec<(ParsedKey, Vec<u8>)> = Vec::new();
         let mut i = 1usize;
         while i + 1 < args.len() {
-            if store.key_exists_live(&args[i]).await {
-                return (resp_int(0), false);
-            }
+            pairs.push((store.parse_key(&args[i]), args[i + 1].clone()));
             i += 2;
         }
-        i = 1;
-        while i + 1 < args.len() {
-            if store
-                .put_value(&args[i], args[i + 1].clone(), None)
-                .await
-                .is_err()
-            {
-                return (
-                    resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                    false,
-                );
-            }
-            i += 2;
-        }
-        return (resp_int(1), false);
+        return match store.msetnx_atomic(pairs).await {
+            Ok(true) => (resp_int(1), false),
+            Ok(false) => (resp_int(0), false),
+            Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+        };
     }
 
     if cmd.eq_ignore_ascii_case(b"SETNX") {
         if args.len() != 3 {
             return (wrong_args(&args[0]), false);
         }
-        if store.key_exists_live(&args[1]).await {
-            return (resp_int(0), false);
-        }
-        let response = if store
-            .put_value(&args[1], args[2].clone(), None)
-            .await
-            .is_ok()
-        {
-            resp_int(1)
-        } else {
-            resp_err("OOM command not allowed when used memory > 'maxmemory'")
+        return match store.put_value_if_absent(&args[1], args[2].clone()).await {
+            Ok(true) => (resp_int(1), false),
+            Ok(false) => (resp_int(0), false),
+            Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
         };
-        return (response, false);
     }
 
     if cmd.eq_ignore_ascii_case(b"INCR") {
@@ -515,41 +596,21 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         if args.len() != 3 {
             return (wrong_args(&args[0]), false);
         }
-        let mut existing = store.get_value(&args[1]).await.unwrap_or_default();
-        existing.extend_from_slice(&args[2]);
-        if store
-            .put_value(&args[1], existing.clone(), None)
-            .await
-            .is_err()
-        {
-            return (
-                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                false,
-            );
-        }
-        return (resp_int(existing.len() as i64), false);
+        return match store.append_value(&args[1], &args[2]).await {
+            Ok(len) => (resp_int(len), false),
+            Err(err) => (err, false),
+        };
     }
 
     if cmd.eq_ignore_ascii_case(b"GETSET") {
         if args.len() != 3 {
             return (wrong_args(&args[0]), false);
         }
-        let old = store.get_value(&args[1]).await;
-        if store
-            .put_value(&args[1], args[2].clone(), None)
-            .await
-            .is_err()
-        {
-            return (
-                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                false,
-            );
-        }
-        let response = match old {
-            Some(value) => resp_bulk(&value),
-            None => resp_null(),
+        return match store.get_and_set(&args[1], args[2].clone()).await {
+            Ok(Some(old)) => (resp_bulk(&old), false),
+            Ok(None) => (resp_null(), false),
+            Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
         };
-        return (response, false);
     }
 
     if cmd.eq_ignore_ascii_case(b"GETDEL") {
@@ -741,5 +802,62 @@ mod tests {
             dispatch(&args(&["HSET", "h", "f", "v"]), &store).await.0,
             b"-ERR command not supported in sharded mode\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn setnx_atomic_no_race() {
+        // Concurrent SETNX: only one should win.
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let s1 = Arc::clone(&store);
+        let s2 = Arc::clone(&store);
+        let r1 = tokio::spawn(async move {
+            dispatch(&args(&["SETNX", "racekey", "v1"]), &s1).await.0
+        });
+        let r2 = tokio::spawn(async move {
+            dispatch(&args(&["SETNX", "racekey", "v2"]), &s2).await.0
+        });
+        let (a, b) = tokio::join!(r1, r2);
+        let wins: i32 = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|r| r.as_slice() == b":1\r\n")
+            .count() as i32;
+        assert_eq!(wins, 1, "exactly one SETNX should succeed");
+    }
+
+    #[tokio::test]
+    async fn msetnx_atomic_all_or_nothing() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        // Pre-set key "b" so MSETNX a,b should fail atomically.
+        let _ = dispatch(&args(&["SET", "b", "existing"]), &store).await;
+        let r = dispatch(&args(&["MSETNX", "a", "1", "b", "2"]), &store).await.0;
+        assert_eq!(r, b":0\r\n", "MSETNX must fail if any key exists");
+        // "a" must not have been set.
+        let ga = dispatch(&args(&["GET", "a"]), &store).await.0;
+        assert_eq!(ga, b"$-1\r\n", "a must not be set after failed MSETNX");
+    }
+
+    #[tokio::test]
+    async fn append_atomic_accumulates() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let r1 = dispatch(&args(&["APPEND", "s", "hello"]), &store).await.0;
+        assert_eq!(r1, b":5\r\n");
+        let r2 = dispatch(&args(&["APPEND", "s", " world"]), &store).await.0;
+        assert_eq!(r2, b":11\r\n");
+        let r3 = dispatch(&args(&["GET", "s"]), &store).await.0;
+        assert_eq!(r3, b"$11\r\nhello world\r\n");
+    }
+
+    #[tokio::test]
+    async fn getset_atomic_returns_old_value() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        // GETSET on missing key returns null.
+        let r1 = dispatch(&args(&["GETSET", "k", "new"]), &store).await.0;
+        assert_eq!(r1, b"$-1\r\n");
+        // GETSET on existing key returns old value.
+        let r2 = dispatch(&args(&["GETSET", "k", "newer"]), &store).await.0;
+        assert_eq!(r2, b"$3\r\nnew\r\n");
+        // Value is updated.
+        let r3 = dispatch(&args(&["GET", "k"]), &store).await.0;
+        assert_eq!(r3, b"$5\r\nnewer\r\n");
     }
 }
