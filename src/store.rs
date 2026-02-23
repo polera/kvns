@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -129,18 +130,29 @@ impl Value {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct Entry {
     pub(crate) value: Value,
-    pub(crate) hits: u64,
+    /// Hit counter for LRU/MRU eviction.  Stored as an atomic so read commands
+    /// can increment it while holding only a read lock on the store.
+    pub(crate) hits: AtomicU64,
     pub(crate) expiry: Option<Instant>,
+}
+
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
+            expiry: self.expiry,
+        }
+    }
 }
 
 impl Entry {
     pub(crate) fn new(value: Vec<u8>, ttl: Option<Duration>) -> Self {
         Self {
             value: Value::String(value),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: ttl.map(|d| Instant::now() + d),
         }
     }
@@ -180,6 +192,25 @@ impl Entry {
                 }
             }
         }
+    }
+}
+
+/// Gauge values captured by `put_deferred`; emit them after releasing the store lock
+/// to avoid holding the write lock while Prometheus's internal DashMap is updated.
+pub(crate) struct StoreMetrics {
+    namespace: String,
+    ns_keys: usize,
+    ns_bytes: usize,
+    total_bytes: usize,
+}
+
+impl StoreMetrics {
+    pub(crate) fn emit(self) {
+        metrics::gauge!("kvns_keys_total", "namespace" => self.namespace.clone())
+            .set(self.ns_keys as f64);
+        metrics::gauge!("kvns_memory_used_bytes", "namespace" => self.namespace)
+            .set(self.ns_bytes as f64);
+        metrics::gauge!("kvns_memory_used_bytes_total").set(self.total_bytes as f64);
     }
 }
 
@@ -308,7 +339,7 @@ impl Db {
             };
             let mut candidates: Vec<(String, u64, usize)> = {
                 let it = ns_map.iter().map(|(k, e)| {
-                    (k.clone(), e.hits, Self::entry_size(namespace, k, e.value.byte_len()))
+                    (k.clone(), e.hits.load(Ordering::Relaxed), Self::entry_size(namespace, k, e.value.byte_len()))
                 });
                 if ns_map.len() > EVICTION_SAMPLE_SIZE {
                     it.take(EVICTION_SAMPLE_SIZE).collect()
@@ -386,7 +417,14 @@ impl Db {
         self.used_bytes.saturating_add(net_delta) > self.memory_limit
     }
 
-    pub(crate) fn put(&mut self, namespace: String, key: String, entry: Entry) {
+    /// Insert an entry and return the metric snapshot; caller is responsible for
+    /// calling `.emit()` at an appropriate point (ideally after releasing the lock).
+    pub(crate) fn put_deferred(
+        &mut self,
+        namespace: String,
+        key: String,
+        entry: Entry,
+    ) -> StoreMetrics {
         // A fresh write cancels any pending EAR eviction for this key.
         self.ear_pending.remove(&(namespace.clone(), key.clone()));
         let new_size = Self::entry_size(&namespace, &key, entry.value.byte_len());
@@ -408,9 +446,14 @@ impl Db {
             .or_default()
             .insert(key, entry);
         let ns_keys = self.entries[&namespace].len();
-        metrics::gauge!("kvns_keys_total", "namespace" => namespace.clone()).set(ns_keys as f64);
-        metrics::gauge!("kvns_memory_used_bytes", "namespace" => namespace).set(ns_bytes as f64);
-        metrics::gauge!("kvns_memory_used_bytes_total").set(self.used_bytes as f64);
+        StoreMetrics { namespace, ns_keys, ns_bytes, total_bytes: self.used_bytes }
+    }
+
+    /// Insert an entry and immediately emit Prometheus gauge updates.
+    /// Most callers should prefer this; use `put_deferred` only when the write
+    /// lock will already be dropped before metrics are needed.
+    pub(crate) fn put(&mut self, namespace: String, key: String, entry: Entry) {
+        self.put_deferred(namespace, key, entry).emit();
     }
 
     pub(crate) fn delete(&mut self, namespace: &str, key: &str) -> Option<Entry> {
@@ -486,7 +529,7 @@ mod tests {
     fn entry_elapsed_ttl_is_expired() {
         let e = Entry {
             value: Value::String(b"v".to_vec()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: Some(Instant::now() - Duration::from_secs(1)),
         };
         assert!(e.is_expired());
@@ -508,7 +551,7 @@ mod tests {
                 key.to_string(),
                 Entry::new(value.to_vec(), None),
             );
-            db.entries.get_mut(ns).unwrap().get_mut(*key).unwrap().hits = *hits;
+            db.entries.get_mut(ns).unwrap().get_mut(*key).unwrap().hits.store(*hits, Ordering::Relaxed);
         }
         Db::entry_size(ns, entries[0].0, value.len())
     }
@@ -703,7 +746,7 @@ mod tests {
         let mut db = Db::new(1000);
         let expired = Entry {
             value: Value::String(b"v".to_vec()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: Some(Instant::now() - Duration::from_secs(1)),
         };
         db.put("ns".to_string(), "k".to_string(), expired);

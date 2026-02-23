@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -486,18 +487,24 @@ async fn cmd_set_inner(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None
     };
 
+    // Build the entry before acquiring the lock; Entry::new calls Instant::now()
+    // and we don't want that inside the critical section.
+    let value_len = value.len();
+    let entry = Entry::new(value, ttl);
+    let expiry = entry.expiry;
+
     let mut db = store.write().await;
-    if db.would_exceed(&ns, &key, value.len()) {
-        let net_delta = db.net_delta(&ns, &key, value.len());
+    if db.would_exceed(&ns, &key, value_len) {
+        let net_delta = db.net_delta(&ns, &key, value_len);
         if !db.evict_for_write(&ns, net_delta) {
             return resp_err("OOM command not allowed when used memory > 'maxmemory'");
         }
     }
-    let entry = Entry::new(value, ttl);
-    let expiry = entry.expiry;
-    debug!(namespace = %ns, key = %key, ttl = ?ttl, "SET");
-    db.put(ns.clone(), key.clone(), entry);
+    let m = db.put_deferred(ns.clone(), key.clone(), entry);
     drop(db);
+    // Emit Prometheus gauges after releasing the write lock to reduce contention.
+    m.emit();
+    debug!(namespace = %ns, key = %key, ttl = ?ttl, "SET");
 
     if let Some(deadline) = expiry {
         schedule_expiry(store, ns, key, deadline);
@@ -515,8 +522,7 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Missing,
         Expired,
         WrongType,
-        ValueNoHit(Vec<u8>, bool), // value, is_ear
-        NeedsHitUpdate,
+        Value(Vec<u8>, bool), // value, is_ear
     }
 
     let read_state = {
@@ -527,52 +533,30 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             Some(entry) => match entry.value.as_string() {
                 None => ReadGet::WrongType,
                 Some(bytes) => {
+                    // Atomic increment: no write lock needed for hit tracking.
                     if db.tracks_hits(&ns) {
-                        ReadGet::NeedsHitUpdate
-                    } else {
-                        ReadGet::ValueNoHit(bytes.to_vec(), db.is_ear_namespace(&ns))
+                        entry.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    ReadGet::Value(bytes.to_vec(), db.is_ear_namespace(&ns))
                 }
             },
         }
     };
 
     match read_state {
-        ReadGet::Missing => return resp_null(),
+        ReadGet::Missing => resp_null(),
         ReadGet::Expired => {
             cleanup_expired_key(store, &ns, &key).await;
-            return resp_null();
+            resp_null()
         }
-        ReadGet::WrongType => return resp_wrongtype(),
-        ReadGet::ValueNoHit(value, is_ear) => {
+        ReadGet::WrongType => resp_wrongtype(),
+        ReadGet::Value(value, is_ear) => {
             if is_ear {
                 let mut db = store.write().await;
                 db.mark_ear(&ns, &key);
             }
-            return resp_bulk(&value);
+            resp_bulk(&value)
         }
-        ReadGet::NeedsHitUpdate => {}
-    }
-
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_null();
-    }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
-        None => resp_null(),
-        Some(entry) => match entry.value.as_string() {
-            None => resp_wrongtype(),
-            Some(bytes) => {
-                entry.hits += 1;
-                resp_bulk(bytes)
-            }
-        },
     }
 }
 
@@ -1269,7 +1253,7 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::List(VecDeque::new()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
     let list = match &mut entry.value {
@@ -1328,7 +1312,7 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::List(VecDeque::new()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
     let list = match &mut entry.value {
@@ -2053,7 +2037,7 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 dst_key.clone(),
                 Entry {
                     value: Value::List(new_list),
-                    hits: 0,
+                    hits: AtomicU64::new(0),
                     expiry: None,
                 },
             );
@@ -2108,7 +2092,7 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::Hash(HashMap::new()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
 
@@ -2445,7 +2429,7 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::Hash(HashMap::new()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
     match entry.value.as_hash_mut() {
@@ -2507,7 +2491,7 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::Hash(HashMap::new()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
     match entry.value.as_hash_mut() {
@@ -2638,7 +2622,7 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::Set(HashSet::new()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
     let set = match entry.value.as_set_mut() {
@@ -2967,7 +2951,7 @@ async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let count = result.len() as i64;
     let entry = Entry {
         value: Value::Set(result),
-        hits: 0,
+        hits: AtomicU64::new(0),
         expiry: None,
     };
     db.put(dst_ns, dst_key, entry);
@@ -3015,7 +2999,7 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         dst_key,
         Entry {
             value: Value::Set(result),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         },
     );
@@ -3063,7 +3047,7 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         dst_key,
         Entry {
             value: Value::Set(result),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         },
     );
@@ -3124,7 +3108,7 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 dst_key.clone(),
                 Entry {
                     value: Value::Set(s),
-                    hits: 0,
+                    hits: AtomicU64::new(0),
                     expiry: None,
                 },
             );
@@ -3389,7 +3373,7 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             .entry(key.clone())
             .or_insert_with(|| Entry {
                 value: Value::ZSet(ZSetData::default()),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: None,
             });
         let zset = match entry.value.as_zset_mut() {
@@ -4198,7 +4182,7 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         .entry(key.clone())
         .or_insert_with(|| Entry {
             value: Value::ZSet(ZSetData::default()),
-            hits: 0,
+            hits: AtomicU64::new(0),
             expiry: None,
         });
     match entry.value.as_zset_mut() {
@@ -5291,7 +5275,7 @@ pub(crate) async fn cmd_touch(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             continue;
         }
         if let Some(entry) = db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
-            entry.hits = 0;
+            entry.hits.store(0, std::sync::atomic::Ordering::Relaxed);
             count += 1;
         }
     }
@@ -5350,7 +5334,7 @@ async fn cmd_copy(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let new_entry = Entry {
         value: src_value,
-        hits: 0,
+        hits: AtomicU64::new(0),
         expiry: src_expiry,
     };
     db.put(dst_ns.clone(), dst_key.clone(), new_entry);
@@ -5397,7 +5381,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             let db = store.read().await;
             match db.entries.get(&ns).and_then(|m| m.get(&key)) {
                 None => resp_null(),
-                Some(entry) => resp_int(entry.hits as i64),
+                Some(entry) => resp_int(entry.hits.load(std::sync::atomic::Ordering::Relaxed) as i64),
             }
         }
         "HELP" => {
@@ -5666,48 +5650,6 @@ async fn cmd_xadd(_args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     resp_err("stream type not supported")
 }
 
-async fn dispatch_fast_path(
-    args: &[Vec<u8>],
-    store: &Store,
-    _conn: &mut ConnState,
-) -> Option<(Vec<u8>, bool)> {
-    let cmd = args[0].as_slice();
-    if cmd.eq_ignore_ascii_case(b"PING") {
-        return Some((resp_pong(), false));
-    }
-    if cmd.eq_ignore_ascii_case(b"QUIT") {
-        return Some((resp_ok(), true));
-    }
-    if cmd.eq_ignore_ascii_case(b"SET") {
-        return Some((cmd_set(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"GET") {
-        return Some((cmd_get(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"MGET") {
-        return Some((cmd_mget(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"INCR") {
-        return Some((cmd_incr(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"INCRBY") {
-        return Some((cmd_incrby(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"DECR") {
-        return Some((cmd_decr(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"DECRBY") {
-        return Some((cmd_decrby(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"LPUSH") {
-        return Some((cmd_lpush(args, store).await, false));
-    }
-    if cmd.eq_ignore_ascii_case(b"RPUSH") {
-        return Some((cmd_rpush(args, store).await, false));
-    }
-    None
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // DISPATCH
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -5720,149 +5662,153 @@ pub(crate) async fn dispatch(
     if args.is_empty() {
         return (resp_err("empty command"), false);
     }
-    if let Some(result) = dispatch_fast_path(args, store, conn).await {
-        return result;
+    // Normalize to ASCII uppercase in a stack buffer — zero heap allocation.
+    // The longest Redis command name is 16 bytes ("ZREMRANGEBYSCORE"); 20 is a safe ceiling.
+    let mut cmd_upper = [0u8; 20];
+    let cmd_len = args[0].len().min(cmd_upper.len());
+    for (dst, &src) in cmd_upper[..cmd_len].iter_mut().zip(&args[0][..cmd_len]) {
+        *dst = src.to_ascii_uppercase();
     }
-    let cmd = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
-    let resp = match cmd.as_str() {
+    let cmd = &cmd_upper[..cmd_len];
+
+    let resp = match cmd {
         // Connection
-        "ping" => resp_pong(),
-        "quit" => return (resp_ok(), true),
-        "hello" => cmd_hello(args, store, conn).await,
-        "reset" => cmd_reset(conn),
-        "select" => cmd_select(args, store).await,
+        b"PING" => resp_pong(),
+        b"QUIT" => return (resp_ok(), true),
+        b"HELLO" => cmd_hello(args, store, conn).await,
+        b"RESET" => cmd_reset(conn),
+        b"SELECT" => cmd_select(args, store).await,
 
         // String
-        "set" => cmd_set(args, store).await,
-        "get" => cmd_get(args, store).await,
-        "mget" => cmd_mget(args, store).await,
-        "mset" => cmd_mset(args, store).await,
-        "msetnx" => cmd_msetnx(args, store).await,
-        "setnx" => cmd_setnx(args, store).await,
-        "getset" => cmd_getset(args, store).await,
-        "getdel" => cmd_getdel(args, store).await,
-        "getex" => cmd_getex(args, store).await,
-        "append" => cmd_append(args, store).await,
-        "strlen" => cmd_strlen(args, store).await,
-        "incr" => cmd_incr(args, store).await,
-        "incrby" => cmd_incrby(args, store).await,
-        "decr" => cmd_decr(args, store).await,
-        "decrby" => cmd_decrby(args, store).await,
-        "incrbyfloat" => cmd_incrbyfloat(args, store).await,
-        "setrange" => cmd_setrange(args, store).await,
-        "getrange" => cmd_getrange(args, store).await,
-        "substr" => cmd_getrange(args, store).await, // alias
+        b"SET" => cmd_set(args, store).await,
+        b"GET" => cmd_get(args, store).await,
+        b"MGET" => cmd_mget(args, store).await,
+        b"MSET" => cmd_mset(args, store).await,
+        b"MSETNX" => cmd_msetnx(args, store).await,
+        b"SETNX" => cmd_setnx(args, store).await,
+        b"GETSET" => cmd_getset(args, store).await,
+        b"GETDEL" => cmd_getdel(args, store).await,
+        b"GETEX" => cmd_getex(args, store).await,
+        b"APPEND" => cmd_append(args, store).await,
+        b"STRLEN" => cmd_strlen(args, store).await,
+        b"INCR" => cmd_incr(args, store).await,
+        b"INCRBY" => cmd_incrby(args, store).await,
+        b"DECR" => cmd_decr(args, store).await,
+        b"DECRBY" => cmd_decrby(args, store).await,
+        b"INCRBYFLOAT" => cmd_incrbyfloat(args, store).await,
+        b"SETRANGE" => cmd_setrange(args, store).await,
+        b"GETRANGE" | b"SUBSTR" => cmd_getrange(args, store).await,
 
         // List
-        "lpush" => cmd_lpush(args, store).await,
-        "rpush" => cmd_rpush(args, store).await,
-        "lpushx" => cmd_lpushx(args, store).await,
-        "rpushx" => cmd_rpushx(args, store).await,
-        "lpop" => cmd_lpop(args, store).await,
-        "rpop" => cmd_rpop(args, store).await,
-        "llen" => cmd_llen(args, store).await,
-        "lrange" => cmd_lrange(args, store).await,
-        "lindex" => cmd_lindex(args, store).await,
-        "lset" => cmd_lset(args, store).await,
-        "lrem" => cmd_lrem(args, store).await,
-        "ltrim" => cmd_ltrim(args, store).await,
-        "linsert" => cmd_linsert(args, store).await,
-        "lpos" => cmd_lpos(args, store).await,
-        "lmove" => cmd_lmove(args, store).await,
+        b"LPUSH" => cmd_lpush(args, store).await,
+        b"RPUSH" => cmd_rpush(args, store).await,
+        b"LPUSHX" => cmd_lpushx(args, store).await,
+        b"RPUSHX" => cmd_rpushx(args, store).await,
+        b"LPOP" => cmd_lpop(args, store).await,
+        b"RPOP" => cmd_rpop(args, store).await,
+        b"LLEN" => cmd_llen(args, store).await,
+        b"LRANGE" => cmd_lrange(args, store).await,
+        b"LINDEX" => cmd_lindex(args, store).await,
+        b"LSET" => cmd_lset(args, store).await,
+        b"LREM" => cmd_lrem(args, store).await,
+        b"LTRIM" => cmd_ltrim(args, store).await,
+        b"LINSERT" => cmd_linsert(args, store).await,
+        b"LPOS" => cmd_lpos(args, store).await,
+        b"LMOVE" => cmd_lmove(args, store).await,
 
         // Hash
-        "hset" => cmd_hset(args, store).await,
-        "hmset" => {
+        b"HSET" => cmd_hset(args, store).await,
+        b"HMSET" => {
             let r = cmd_hset(args, store).await;
             if r.starts_with(b":") { resp_ok() } else { r }
         }
-        "hget" => cmd_hget(args, store).await,
-        "hdel" => cmd_hdel(args, store).await,
-        "hexists" => cmd_hexists(args, store).await,
-        "hgetall" => cmd_hgetall(args, store, conn).await,
-        "hkeys" => cmd_hkeys(args, store).await,
-        "hvals" => cmd_hvals(args, store).await,
-        "hlen" => cmd_hlen(args, store).await,
-        "hmget" => cmd_hmget(args, store).await,
-        "hincrby" => cmd_hincrby(args, store).await,
-        "hincrbyfloat" => cmd_hincrbyfloat(args, store).await,
-        "hrandfield" => cmd_hrandfield(args, store).await,
+        b"HGET" => cmd_hget(args, store).await,
+        b"HDEL" => cmd_hdel(args, store).await,
+        b"HEXISTS" => cmd_hexists(args, store).await,
+        b"HGETALL" => cmd_hgetall(args, store, conn).await,
+        b"HKEYS" => cmd_hkeys(args, store).await,
+        b"HVALS" => cmd_hvals(args, store).await,
+        b"HLEN" => cmd_hlen(args, store).await,
+        b"HMGET" => cmd_hmget(args, store).await,
+        b"HINCRBY" => cmd_hincrby(args, store).await,
+        b"HINCRBYFLOAT" => cmd_hincrbyfloat(args, store).await,
+        b"HRANDFIELD" => cmd_hrandfield(args, store).await,
 
         // Set
-        "sadd" => cmd_sadd(args, store).await,
-        "srem" => cmd_srem(args, store).await,
-        "smembers" => cmd_smembers(args, store).await,
-        "scard" => cmd_scard(args, store).await,
-        "sismember" => cmd_sismember(args, store).await,
-        "smismember" => cmd_smismember(args, store).await,
-        "sunion" => cmd_sunion(args, store).await,
-        "sinter" => cmd_sinter(args, store).await,
-        "sdiff" => cmd_sdiff(args, store).await,
-        "sunionstore" => cmd_sunionstore(args, store).await,
-        "sinterstore" => cmd_sinterstore(args, store).await,
-        "sdiffstore" => cmd_sdiffstore(args, store).await,
-        "smove" => cmd_smove(args, store).await,
-        "spop" => cmd_spop(args, store).await,
-        "srandmember" => cmd_srandmember(args, store).await,
+        b"SADD" => cmd_sadd(args, store).await,
+        b"SREM" => cmd_srem(args, store).await,
+        b"SMEMBERS" => cmd_smembers(args, store).await,
+        b"SCARD" => cmd_scard(args, store).await,
+        b"SISMEMBER" => cmd_sismember(args, store).await,
+        b"SMISMEMBER" => cmd_smismember(args, store).await,
+        b"SUNION" => cmd_sunion(args, store).await,
+        b"SINTER" => cmd_sinter(args, store).await,
+        b"SDIFF" => cmd_sdiff(args, store).await,
+        b"SUNIONSTORE" => cmd_sunionstore(args, store).await,
+        b"SINTERSTORE" => cmd_sinterstore(args, store).await,
+        b"SDIFFSTORE" => cmd_sdiffstore(args, store).await,
+        b"SMOVE" => cmd_smove(args, store).await,
+        b"SPOP" => cmd_spop(args, store).await,
+        b"SRANDMEMBER" => cmd_srandmember(args, store).await,
 
         // ZSet
-        "zadd" => cmd_zadd(args, store).await,
-        "zrange" => cmd_zrange(args, store).await,
-        "zrangebyscore" => cmd_zrangebyscore(args, store).await,
-        "zrevrangebyscore" => cmd_zrevrangebyscore(args, store).await,
-        "zrevrange" => cmd_zrevrange(args, store).await,
-        "zrank" => cmd_zrank(args, store).await,
-        "zrevrank" => cmd_zrevrank(args, store).await,
-        "zscore" => cmd_zscore(args, store).await,
-        "zmscore" => cmd_zmscore(args, store).await,
-        "zrem" => cmd_zrem(args, store).await,
-        "zcard" => cmd_zcard(args, store).await,
-        "zcount" => cmd_zcount(args, store).await,
-        "zincrby" => cmd_zincrby(args, store).await,
-        "zrangebylex" => cmd_zrangebylex(args, store).await,
-        "zlexcount" => cmd_zlexcount(args, store).await,
-        "zremrangebyrank" => cmd_zremrangebyrank(args, store).await,
-        "zremrangebyscore" => cmd_zremrangebyscore(args, store).await,
-        "zremrangebylex" => cmd_zremrangebylex(args, store).await,
-        "zpopmin" => cmd_zpopmin(args, store).await,
-        "zpopmax" => cmd_zpopmax(args, store).await,
-        "zrandmember" => cmd_zrandmember(args, store).await,
+        b"ZADD" => cmd_zadd(args, store).await,
+        b"ZRANGE" => cmd_zrange(args, store).await,
+        b"ZRANGEBYSCORE" => cmd_zrangebyscore(args, store).await,
+        b"ZREVRANGEBYSCORE" => cmd_zrevrangebyscore(args, store).await,
+        b"ZREVRANGE" => cmd_zrevrange(args, store).await,
+        b"ZRANK" => cmd_zrank(args, store).await,
+        b"ZREVRANK" => cmd_zrevrank(args, store).await,
+        b"ZSCORE" => cmd_zscore(args, store).await,
+        b"ZMSCORE" => cmd_zmscore(args, store).await,
+        b"ZREM" => cmd_zrem(args, store).await,
+        b"ZCARD" => cmd_zcard(args, store).await,
+        b"ZCOUNT" => cmd_zcount(args, store).await,
+        b"ZINCRBY" => cmd_zincrby(args, store).await,
+        b"ZRANGEBYLEX" => cmd_zrangebylex(args, store).await,
+        b"ZLEXCOUNT" => cmd_zlexcount(args, store).await,
+        b"ZREMRANGEBYRANK" => cmd_zremrangebyrank(args, store).await,
+        b"ZREMRANGEBYSCORE" => cmd_zremrangebyscore(args, store).await,
+        b"ZREMRANGEBYLEX" => cmd_zremrangebylex(args, store).await,
+        b"ZPOPMIN" => cmd_zpopmin(args, store).await,
+        b"ZPOPMAX" => cmd_zpopmax(args, store).await,
+        b"ZRANDMEMBER" => cmd_zrandmember(args, store).await,
 
         // Generic
-        "del" => cmd_del(args, store).await,
-        "unlink" => cmd_unlink(args, store).await,
-        "exists" => cmd_exists(args, store).await,
-        "type" => cmd_type(args, store).await,
-        "ttl" => cmd_ttl(args, store).await,
-        "pttl" => cmd_pttl(args, store).await,
-        "expire" => cmd_expire(args, store).await,
-        "expireat" => cmd_expireat(args, store).await,
-        "pexpire" => cmd_pexpire(args, store).await,
-        "pexpireat" => cmd_pexpireat(args, store).await,
-        "persist" => cmd_persist(args, store).await,
-        "expiretime" => cmd_expiretime(args, store).await,
-        "pexpiretime" => cmd_pexpiretime(args, store).await,
-        "rename" => cmd_rename(args, store).await,
-        "renamenx" => cmd_renamenx(args, store).await,
-        "scan" => cmd_scan(args, store).await,
-        "keys" => cmd_keys(args, store).await,
-        "touch" => cmd_touch(args, store).await,
-        "copy" => cmd_copy(args, store).await,
-        "object" => cmd_object(args, store).await,
+        b"DEL" => cmd_del(args, store).await,
+        b"UNLINK" => cmd_unlink(args, store).await,
+        b"EXISTS" => cmd_exists(args, store).await,
+        b"TYPE" => cmd_type(args, store).await,
+        b"TTL" => cmd_ttl(args, store).await,
+        b"PTTL" => cmd_pttl(args, store).await,
+        b"EXPIRE" => cmd_expire(args, store).await,
+        b"EXPIREAT" => cmd_expireat(args, store).await,
+        b"PEXPIRE" => cmd_pexpire(args, store).await,
+        b"PEXPIREAT" => cmd_pexpireat(args, store).await,
+        b"PERSIST" => cmd_persist(args, store).await,
+        b"EXPIRETIME" => cmd_expiretime(args, store).await,
+        b"PEXPIRETIME" => cmd_pexpiretime(args, store).await,
+        b"RENAME" => cmd_rename(args, store).await,
+        b"RENAMENX" => cmd_renamenx(args, store).await,
+        b"SCAN" => cmd_scan(args, store).await,
+        b"KEYS" => cmd_keys(args, store).await,
+        b"TOUCH" => cmd_touch(args, store).await,
+        b"COPY" => cmd_copy(args, store).await,
+        b"OBJECT" => cmd_object(args, store).await,
 
         // Server
-        "dbsize" => cmd_dbsize(args, store).await,
-        "flushdb" => cmd_flushdb(args, store).await,
-        "flushall" => cmd_flushall(args, store).await,
-        "info" => cmd_info(args, store, conn).await,
-        "config" => cmd_config(args, store).await,
-        "command" => cmd_command(args, store).await,
-        "client" => cmd_client(args, store, conn).await,
-        "latency" => cmd_latency(args, store).await,
-        "slowlog" => cmd_slowlog(args, store).await,
-        "debug" => cmd_debug(args, store).await,
-        "wait" => cmd_wait(args, store).await,
-        "xadd" => cmd_xadd(args, store).await,
+        b"DBSIZE" => cmd_dbsize(args, store).await,
+        b"FLUSHDB" => cmd_flushdb(args, store).await,
+        b"FLUSHALL" => cmd_flushall(args, store).await,
+        b"INFO" => cmd_info(args, store, conn).await,
+        b"CONFIG" => cmd_config(args, store).await,
+        b"COMMAND" => cmd_command(args, store).await,
+        b"CLIENT" => cmd_client(args, store, conn).await,
+        b"LATENCY" => cmd_latency(args, store).await,
+        b"SLOWLOG" => cmd_slowlog(args, store).await,
+        b"DEBUG" => cmd_debug(args, store).await,
+        b"WAIT" => cmd_wait(args, store).await,
+        b"XADD" => cmd_xadd(args, store).await,
 
         _ => format!(
             "-ERR unknown command {}\r\n",
@@ -6090,7 +6036,7 @@ mod tests {
                 .get("default")
                 .and_then(|ns| ns.get("k"))
                 .unwrap()
-                .hits,
+                .hits.load(std::sync::atomic::Ordering::Relaxed),
             3
         );
     }

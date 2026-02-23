@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, error, info};
@@ -121,7 +122,7 @@ fn entry_to_persisted(entry: &Entry) -> PersistedEntry {
     });
     PersistedEntry {
         value: PersistedValue::from(&entry.value),
-        hits: entry.hits,
+        hits: entry.hits.load(Ordering::Relaxed),
         expiry_unix_ms,
     }
 }
@@ -139,7 +140,7 @@ fn persisted_to_entry(p: PersistedEntry) -> Option<Entry> {
     };
     Some(Entry {
         value: Value::from(p.value),
-        hits: p.hits,
+        hits: AtomicU64::new(p.hits),
         expiry,
     })
 }
@@ -266,7 +267,7 @@ mod tests {
         assert!(p.expiry_unix_ms.is_none());
         let restored = persisted_to_entry(p).unwrap();
         assert_eq!(restored.value.as_string().unwrap(), b"hello");
-        assert_eq!(restored.hits, 0);
+        assert_eq!(restored.hits.load(Ordering::Relaxed), 0);
         assert!(restored.expiry.is_none());
     }
 
@@ -343,7 +344,7 @@ mod tests {
             "dead".into(),
             Entry {
                 value: Value::String(b"v".to_vec()),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: Some(Instant::now() - Duration::from_secs(1)),
             },
         );
@@ -390,7 +391,7 @@ mod tests {
             "myhash".into(),
             Entry {
                 value: Value::Hash(hm),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: None,
             },
         );
@@ -420,7 +421,7 @@ mod tests {
             "myset".into(),
             Entry {
                 value: Value::Set(s),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: None,
             },
         );
@@ -451,7 +452,7 @@ mod tests {
             "myzset".into(),
             Entry {
                 value: Value::ZSet(ZSetData { sorted, index }),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: None,
             },
         );
