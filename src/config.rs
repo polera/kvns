@@ -10,6 +10,7 @@ pub enum EvictionPolicy {
     None,
     Lru,
     Mru,
+    ExpireAfterRead,
 }
 
 impl EvictionPolicy {
@@ -18,6 +19,9 @@ impl EvictionPolicy {
             "lru" => Some(EvictionPolicy::Lru),
             "mru" => Some(EvictionPolicy::Mru),
             "none" => Some(EvictionPolicy::None),
+            "ear" | "expire_after_read" | "expireafterread" => {
+                Some(EvictionPolicy::ExpireAfterRead)
+            }
             _ => None,
         }
     }
@@ -39,10 +43,17 @@ pub struct Config {
     pub eviction_policy: EvictionPolicy,
     /// Per-namespace eviction policy overrides.
     pub namespace_eviction_policies: HashMap<String, EvictionPolicy>,
+    /// Route supported commands through the experimental sharded backend.
+    pub sharded_mode: bool,
+    /// Number of lock shards in sharded mode.
+    pub shard_count: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_mul(4))
+            .unwrap_or(16);
         Self {
             port: 6480,
             host: "0.0.0.0".to_string(),
@@ -54,13 +65,15 @@ impl Default for Config {
             eviction_threshold: 1.0,
             eviction_policy: EvictionPolicy::None,
             namespace_eviction_policies: HashMap::new(),
+            sharded_mode: false,
+            shard_count: shard_count.max(1),
         }
     }
 }
 
 impl Config {
     pub fn from_env() -> Self {
-        Self::from_vars(
+        let mut cfg = Self::from_vars(
             std::env::var("KVNS_PORT").ok().as_deref(),
             std::env::var("KVNS_HOST").ok().as_deref(),
             std::env::var("KVNS_MEMORY_LIMIT").ok().as_deref(),
@@ -71,7 +84,19 @@ impl Config {
             std::env::var("KVNS_EVICTION_THRESHOLD").ok().as_deref(),
             std::env::var("KVNS_EVICTION_POLICY").ok().as_deref(),
             std::env::var("KVNS_NS_EVICTION").ok().as_deref(),
-        )
+        );
+        cfg.sharded_mode = std::env::var("KVNS_SHARDED_MODE")
+            .ok()
+            .as_deref()
+            .and_then(Self::parse_bool)
+            .unwrap_or(cfg.sharded_mode);
+        cfg.shard_count = std::env::var("KVNS_SHARD_COUNT")
+            .ok()
+            .as_deref()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(cfg.shard_count);
+        cfg
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -111,6 +136,16 @@ impl Config {
             namespace_eviction_policies: ns_eviction
                 .map(Self::parse_ns_eviction)
                 .unwrap_or_default(),
+            sharded_mode: defaults.sharded_mode,
+            shard_count: defaults.shard_count,
+        }
+    }
+
+    fn parse_bool(s: &str) -> Option<bool> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
         }
     }
 
@@ -541,6 +576,46 @@ mod tests {
     fn eviction_policy_from_str_invalid_returns_none() {
         assert_eq!(EvictionPolicy::from_str("fifo"), None);
         assert_eq!(EvictionPolicy::from_str(""), None);
+    }
+
+    #[test]
+    fn eviction_policy_from_str_parses_ear() {
+        assert_eq!(
+            EvictionPolicy::from_str("ear"),
+            Some(EvictionPolicy::ExpireAfterRead)
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("expire_after_read"),
+            Some(EvictionPolicy::ExpireAfterRead)
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("expireafterread"),
+            Some(EvictionPolicy::ExpireAfterRead)
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("EAR"),
+            Some(EvictionPolicy::ExpireAfterRead)
+        );
+    }
+
+    #[test]
+    fn from_vars_ns_eviction_ear() {
+        let c = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("session:ear"),
+        );
+        assert_eq!(
+            c.namespace_eviction_policies.get("session"),
+            Some(&EvictionPolicy::ExpireAfterRead)
+        );
     }
 
     #[test]

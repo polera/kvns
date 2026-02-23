@@ -157,6 +157,8 @@ All settings are read from environment variables at startup.
 | `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `lru`, `mru`, or `none` |
 | `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0-1.0) at which eviction starts |
 | `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lru,ns2:mru` |
+| `KVNS_SHARDED_MODE` | `false` | Enable experimental sharded lock backend (currently supports `PING`, `QUIT`, `SET`, `GET`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `INCR`, `INCRBY`, `DECR`, `DECRBY`) |
+| `KVNS_SHARD_COUNT` | `4 * CPU cores` | Number of lock shards when `KVNS_SHARDED_MODE=true` |
 
 Examples:
 
@@ -172,7 +174,15 @@ KVNS_EVICTION_POLICY=lru KVNS_EVICTION_THRESHOLD=0.8 cargo run
 
 # Override one namespace to MRU while global policy is LRU
 KVNS_EVICTION_POLICY=lru KVNS_NS_EVICTION=cache:mru cargo run
+
+# Run the experimental sharded backend
+KVNS_SHARDED_MODE=true KVNS_SHARD_COUNT=64 cargo run
 ```
+
+Sharded mode notes:
+
+- `KVNS_SHARDED_MODE` is experimental and currently optimized for throughput-oriented string workloads.
+- Under concurrent writers, multi-key command atomicity may differ from classic mode.
 
 Memory limit behavior:
 
@@ -249,3 +259,29 @@ cargo test
 make lint
 make fmt-check
 ```
+
+## Benchmarking
+
+Run benchmark profiles aligned with Dragonfly's published benchmark patterns and print a comparison report:
+
+```sh
+make benchmark
+```
+
+Run the same benchmark suite against kvns experimental sharded backend:
+
+```sh
+make benchmark-sharded
+```
+
+Run classic and sharded back-to-back and print a direct speedup table:
+
+```sh
+make benchmark-compare
+```
+
+Notes:
+
+- Benchmark script path: `scripts/benchmark_kvns_vs_dragonfly.sh`
+- Output artifacts are written under `/tmp/kvns-bench-*` (or `BENCH_DIR` if set)
+- Dragonfly baseline numbers are sourced from `https://github.com/dragonflydb/dragonfly#benchmarks` (as of February 23, 2026)

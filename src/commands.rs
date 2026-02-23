@@ -196,6 +196,82 @@ async fn expire_if_deadline_matches(store: &Store, event: ExpiryEvent) {
     }
 }
 
+// ── EAR sweep ─────────────────────────────────────────────────────────────────
+
+const EAR_SWEEP_INTERVAL_SECS: u64 = 1;
+
+pub(crate) async fn run_ear_sweep(store: Store) {
+    let mut interval =
+        tokio::time::interval(tokio::time::Duration::from_secs(EAR_SWEEP_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        // Snapshot pending set under a brief read lock.
+        let pending: Vec<(String, String)> = {
+            let db = store.read().await;
+            if db.ear_pending.is_empty() {
+                continue;
+            }
+            db.ear_pending.iter().cloned().collect()
+        };
+        // Delete in a single write lock pass.
+        let mut db = store.write().await;
+        let mut deleted = 0u64;
+        for (ns, key) in &pending {
+            // Re-check: a concurrent write may have cleared the mark via put().
+            if db.ear_pending.contains(&(ns.clone(), key.clone()))
+                && db
+                    .entries
+                    .get(ns)
+                    .and_then(|m| m.get(key.as_str()))
+                    .is_some_and(|e| !e.is_expired())
+            {
+                db.delete(ns, key);
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            tracing::debug!(deleted, "EAR sweep deleted keys");
+            metrics::counter!("kvns_ear_evictions_total").increment(deleted);
+        }
+    }
+}
+
+/// Call AFTER dropping any read lock. Acquires write lock only if needed.
+async fn mark_ear_after_read(store: &Store, ns: &str, key: &str) {
+    {
+        let db = store.read().await;
+        if !db.is_ear_namespace(ns) {
+            return;
+        }
+    }
+    let mut db = store.write().await;
+    db.mark_ear(ns, key);
+}
+
+/// Mark multiple keys for EAR. Filters to only EAR namespaces.
+async fn mark_ear_keys(store: &Store, keys: &[(String, String)]) {
+    if keys.is_empty() {
+        return;
+    }
+    let ear_ns: HashSet<String> = {
+        let db = store.read().await;
+        keys.iter()
+            .filter(|(ns, _)| db.is_ear_namespace(ns))
+            .map(|(ns, _)| ns.clone())
+            .collect()
+    };
+    if ear_ns.is_empty() {
+        return;
+    }
+    let mut db = store.write().await;
+    for (ns, key) in keys {
+        if ear_ns.contains(ns) {
+            db.mark_ear(ns, key);
+        }
+    }
+}
+
 // ── Glob matching ─────────────────────────────────────────────────────────────
 
 fn class_match(class: &[u8], ch: u8) -> bool {
@@ -493,7 +569,10 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_null();
         }
         ReadGet::WrongType => return resp_wrongtype(),
-        ReadGet::ValueNoHit(value) => return resp_bulk(&value),
+        ReadGet::ValueNoHit(value) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            return resp_bulk(&value);
+        }
         ReadGet::NeedsHitUpdate => {}
     }
 
@@ -524,10 +603,11 @@ async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let keys: Vec<(String, String)> = args[1..].iter().map(|a| parse_ns_key(a)).collect();
-    let (out, expired_keys) = {
+    let (out, expired_keys, found_keys) = {
         let db = store.read().await;
         let mut out = format!("*{}\r\n", keys.len()).into_bytes();
         let mut expired_keys: Vec<(String, String)> = Vec::new();
+        let mut found_keys: Vec<(String, String)> = Vec::new();
         for (ns, key) in &keys {
             match db.entries.get(ns).and_then(|m| m.get(key)) {
                 None => out.extend_from_slice(&resp_null()),
@@ -537,13 +617,17 @@ async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 }
                 Some(entry) => match entry.value.as_string() {
                     None => out.extend_from_slice(&resp_null()),
-                    Some(bytes) => out.extend_from_slice(&resp_bulk(bytes)),
+                    Some(bytes) => {
+                        out.extend_from_slice(&resp_bulk(bytes));
+                        found_keys.push((ns.clone(), key.clone()));
+                    }
                 },
             }
         }
-        (out, expired_keys)
+        (out, expired_keys, found_keys)
     };
     cleanup_expired_keys(store, &expired_keys).await;
+    mark_ear_keys(store, &found_keys).await;
     out
 }
 
@@ -1128,10 +1212,10 @@ async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         db.delete(&ns, &key);
         return resp_bulk(b"");
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => resp_bulk(b""),
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        None => (resp_bulk(b""), false),
         Some(entry) => match entry.value.as_string() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(bytes) => {
                 let len = bytes.len() as i64;
                 let start = if start_i < 0 {
@@ -1145,13 +1229,17 @@ async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                     end_i.min(len - 1).max(0) as usize
                 };
                 if start > end || bytes.is_empty() {
-                    resp_bulk(b"")
+                    (resp_bulk(b""), false)
                 } else {
-                    resp_bulk(&bytes[start..=end.min(bytes.len() - 1)])
+                    (resp_bulk(&bytes[start..=end.min(bytes.len() - 1)]), true)
                 }
             }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1536,8 +1624,8 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => resp_array(&[]),
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        None => (resp_array(&[]), false),
         Some(entry) => match &entry.value {
             Value::List(list) => {
                 let len = list.len() as i64;
@@ -1552,19 +1640,24 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                     stop_i.min(len - 1)
                 } as usize;
                 if start > stop || list.is_empty() {
-                    return resp_array(&[]);
+                    (resp_array(&[]), false)
+                } else {
+                    let items: Vec<Vec<u8>> = list
+                        .iter()
+                        .skip(start)
+                        .take(stop - start + 1)
+                        .cloned()
+                        .collect();
+                    (resp_array(&items), true)
                 }
-                let items: Vec<Vec<u8>> = list
-                    .iter()
-                    .skip(start)
-                    .take(stop - start + 1)
-                    .cloned()
-                    .collect();
-                resp_array(&items)
             }
-            _ => resp_wrongtype(),
+            _ => return resp_wrongtype(),
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -1589,21 +1682,25 @@ async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         db.delete(&ns, &key);
         return resp_null();
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => resp_null(),
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        None => (resp_null(), false),
         Some(entry) => match &entry.value {
             Value::List(list) => {
                 let len = list.len() as i64;
                 let idx = if idx_i < 0 { len + idx_i } else { idx_i };
                 if idx < 0 || idx >= len {
-                    resp_null()
+                    (resp_null(), false)
                 } else {
-                    resp_bulk(&list[idx as usize])
+                    (resp_bulk(&list[idx as usize]), true)
                 }
             }
-            _ => resp_wrongtype(),
+            _ => return resp_wrongtype(),
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -2070,22 +2167,25 @@ async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let field = &args[2];
-    let (resp, expired) = {
+    let (resp, expired, field_found) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (resp_null(), false),
-            Some(entry) if entry.is_expired() => (resp_null(), true),
+            None => (resp_null(), false, false),
+            Some(entry) if entry.is_expired() => (resp_null(), true, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false),
+                None => (resp_wrongtype(), false, false),
                 Some(h) => match h.get(field.as_slice()) {
-                    None => (resp_null(), false),
-                    Some(v) => (resp_bulk(v), false),
+                    None => (resp_null(), false, false),
+                    Some(v) => (resp_bulk(v), false, true),
                 },
             },
         }
     };
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
+    }
+    if field_found {
+        mark_ear_after_read(store, &ns, &key).await;
     }
     resp
 }
@@ -2162,25 +2262,25 @@ async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u
     } else {
         resp_array(&[])
     };
-    let (resp, expired) = {
+    let (resp, expired, found) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (empty, false),
-            Some(entry) if entry.is_expired() => (empty, true),
+            None => (empty, false, false),
+            Some(entry) if entry.is_expired() => (empty, true, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false),
+                None => (resp_wrongtype(), false, false),
                 Some(h) => {
                     if conn.resp_version >= 3 {
                         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
                             h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        (resp_map(&pairs), false)
+                        (resp_map(&pairs), false, true)
                     } else {
                         let mut flat: Vec<Vec<u8>> = Vec::with_capacity(h.len() * 2);
                         for (k, v) in h {
                             flat.push(k.clone());
                             flat.push(v.clone());
                         }
-                        (resp_array(&flat), false)
+                        (resp_array(&flat), false, true)
                     }
                 }
             },
@@ -2188,6 +2288,9 @@ async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u
     };
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
+    }
+    if found {
+        mark_ear_after_read(store, &ns, &key).await;
     }
     resp
 }
@@ -2197,22 +2300,25 @@ async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let (resp, expired) = {
+    let (resp, expired, found) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (resp_array(&[]), false),
-            Some(entry) if entry.is_expired() => (resp_array(&[]), true),
+            None => (resp_array(&[]), false, false),
+            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false),
+                None => (resp_wrongtype(), false, false),
                 Some(h) => {
                     let keys: Vec<Vec<u8>> = h.keys().cloned().collect();
-                    (resp_array(&keys), false)
+                    (resp_array(&keys), false, true)
                 }
             },
         }
     };
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
+    }
+    if found {
+        mark_ear_after_read(store, &ns, &key).await;
     }
     resp
 }
@@ -2222,22 +2328,25 @@ async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let (resp, expired) = {
+    let (resp, expired, found) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (resp_array(&[]), false),
-            Some(entry) if entry.is_expired() => (resp_array(&[]), true),
+            None => (resp_array(&[]), false, false),
+            Some(entry) if entry.is_expired() => (resp_array(&[]), true, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false),
+                None => (resp_wrongtype(), false, false),
                 Some(h) => {
                     let vals: Vec<Vec<u8>> = h.values().cloned().collect();
-                    (resp_array(&vals), false)
+                    (resp_array(&vals), false, true)
                 }
             },
         }
     };
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
+    }
+    if found {
+        mark_ear_after_read(store, &ns, &key).await;
     }
     resp
 }
@@ -2271,13 +2380,13 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let (ns, key) = parse_ns_key(&args[1]);
     let fields = &args[2..];
     let nulls = resp_array_of_nulls(fields.len());
-    let (resp, expired) = {
+    let (resp, expired, found) = {
         let db = store.read().await;
         match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (nulls, false),
-            Some(entry) if entry.is_expired() => (nulls, true),
+            None => (nulls, false, false),
+            Some(entry) if entry.is_expired() => (nulls, true, false),
             Some(entry) => match entry.value.as_hash() {
-                None => (resp_wrongtype(), false),
+                None => (resp_wrongtype(), false, false),
                 Some(h) => {
                     let mut out = format!("*{}\r\n", fields.len()).into_bytes();
                     for f in fields {
@@ -2286,13 +2395,16 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                             Some(v) => out.extend_from_slice(&resp_bulk(v)),
                         }
                     }
-                    (out, false)
+                    (out, false, true)
                 }
             },
         }
     };
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
+    }
+    if found {
+        mark_ear_after_read(store, &ns, &key).await;
     }
     resp
 }
@@ -2454,57 +2566,61 @@ async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             resp_null()
         };
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
         None => {
             if count_opt.is_some() {
-                resp_array(&[])
+                (resp_array(&[]), false)
             } else {
-                resp_null()
+                (resp_null(), false)
             }
         }
         Some(entry) => match entry.value.as_hash() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(h) => {
-                let fields: Vec<(&Vec<u8>, &Vec<u8>)> = h.iter().collect();
+                // Clone to release borrow on db before potential mark_ear call.
+                let fields: Vec<(Vec<u8>, Vec<u8>)> =
+                    h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 if fields.is_empty() {
-                    return if count_opt.is_some() {
-                        resp_array(&[])
+                    if count_opt.is_some() {
+                        (resp_array(&[]), false)
                     } else {
-                        resp_null()
-                    };
-                }
-                match count_opt {
-                    None => {
-                        let idx = 0 % fields.len(); // deterministic: first
-                        resp_bulk(fields[idx].0)
+                        (resp_null(), false)
                     }
-                    Some(count) => {
-                        let abs_count = count.unsigned_abs() as usize;
-                        let allow_repeat = count < 0;
-                        let mut result: Vec<Vec<u8>> = Vec::new();
-                        if allow_repeat {
-                            for i in 0..abs_count {
-                                let idx = i % fields.len();
-                                result.push(fields[idx].0.clone());
-                                if withvalues {
-                                    result.push(fields[idx].1.clone());
+                } else {
+                    match count_opt {
+                        None => (resp_bulk(&fields[0].0), true),
+                        Some(count) => {
+                            let abs_count = count.unsigned_abs() as usize;
+                            let allow_repeat = count < 0;
+                            let mut result: Vec<Vec<u8>> = Vec::new();
+                            if allow_repeat {
+                                for i in 0..abs_count {
+                                    let idx = i % fields.len();
+                                    result.push(fields[idx].0.clone());
+                                    if withvalues {
+                                        result.push(fields[idx].1.clone());
+                                    }
+                                }
+                            } else {
+                                let take = abs_count.min(fields.len());
+                                for (field, value) in fields.iter().take(take) {
+                                    result.push(field.clone());
+                                    if withvalues {
+                                        result.push(value.clone());
+                                    }
                                 }
                             }
-                        } else {
-                            let take = abs_count.min(fields.len());
-                            for &(field, value) in fields.iter().take(take) {
-                                result.push(field.clone());
-                                if withvalues {
-                                    result.push(value.clone());
-                                }
-                            }
+                            (resp_array(&result), true)
                         }
-                        resp_array(&result)
                     }
                 }
             }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2623,17 +2739,21 @@ async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => resp_array(&[]),
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        None => (resp_array(&[]), false),
         Some(entry) => match entry.value.as_set() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(s) => {
                 let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
                 members.sort();
-                resp_array(&members)
+                (resp_array(&members), true)
             }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -2676,13 +2796,20 @@ async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-        None => resp_int(0),
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_set() {
-            None => resp_wrongtype(),
-            Some(s) => resp_int(if s.contains(member.as_slice()) { 1 } else { 0 }),
+            None => return resp_wrongtype(),
+            Some(s) => {
+                let found = s.contains(member.as_slice());
+                (resp_int(if found { 1 } else { 0 }), found)
+            }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -2705,25 +2832,29 @@ async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         }
         return out;
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
         None => {
             let mut out = format!("*{}\r\n", members.len()).into_bytes();
             for _ in members {
                 out.extend_from_slice(&resp_int(0));
             }
-            out
+            (out, false)
         }
         Some(entry) => match entry.value.as_set() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(s) => {
                 let mut out = format!("*{}\r\n", members.len()).into_bytes();
                 for m in members {
                     out.extend_from_slice(&resp_int(if s.contains(m.as_slice()) { 1 } else { 0 }));
                 }
-                out
+                (out, true)
             }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
@@ -3130,25 +3261,26 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         };
     }
 
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
         None => {
             if count_opt.is_some() {
-                resp_array(&[])
+                (resp_array(&[]), false)
             } else {
-                resp_null()
+                (resp_null(), false)
             }
         }
         Some(entry) => match entry.value.as_set() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(s) => {
-                let mut members: Vec<&Vec<u8>> = s.iter().collect();
+                // Clone members to release borrow before potential mark_ear call.
+                let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
                 members.sort();
                 match count_opt {
                     None => {
                         if members.is_empty() {
-                            resp_null()
+                            (resp_null(), false)
                         } else {
-                            resp_bulk(members[0])
+                            (resp_bulk(&members[0]), true)
                         }
                     }
                     Some(count) => {
@@ -3162,16 +3294,20 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                             }
                         } else {
                             let take = abs_count.min(members.len());
-                            for &member in members.iter().take(take) {
+                            for member in members.iter().take(take) {
                                 result.push(member.clone());
                             }
                         }
-                        resp_array(&result)
+                        (resp_array(&result), !result.is_empty())
                     }
                 }
             }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3411,7 +3547,10 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            zset
+        }
     };
 
     let results: Vec<(Vec<u8>, f64)> = if bylex {
@@ -3581,7 +3720,10 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            zset
+        }
     };
 
     let filtered: Vec<(Vec<u8>, f64)> = zset
@@ -3672,7 +3814,10 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            zset
+        }
     };
 
     let mut filtered: Vec<(Vec<u8>, f64)> = zset
@@ -3735,7 +3880,10 @@ async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_array(&[]);
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            zset
+        }
     };
 
     let len = zset.len() as i64;
@@ -3790,6 +3938,7 @@ async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     match zset.iter().position(|e| e.member == member.as_slice()) {
         None => resp_null(),
         Some(rank) => {
+            mark_ear_after_read(store, &ns, &key).await;
             if withscore {
                 let score = zset[rank].score;
                 let mut out = b"*2\r\n".to_vec();
@@ -3825,6 +3974,7 @@ async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     match zset.iter().position(|e| e.member == member.as_slice()) {
         None => resp_null(),
         Some(rank) => {
+            mark_ear_after_read(store, &ns, &key).await;
             let rev_rank = zset.len() - 1 - rank;
             if withscore {
                 let score = zset[rank].score;
@@ -3857,7 +4007,10 @@ async fn cmd_zscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     match zset.iter().find(|e| e.member == member.as_slice()) {
         None => resp_null(),
-        Some(e) => resp_bulk(&format_score(e.score)),
+        Some(e) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            resp_bulk(&format_score(e.score))
+        }
     }
 }
 
@@ -3874,7 +4027,10 @@ async fn cmd_zmscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return resp_array_of_nulls(members.len());
         }
         ZsetLookup::WrongType => return resp_wrongtype(),
-        ZsetLookup::Found(zset) => zset,
+        ZsetLookup::Found(zset) => {
+            mark_ear_after_read(store, &ns, &key).await;
+            zset
+        }
     };
 
     let mut out = format!("*{}\r\n", members.len()).into_bytes();
@@ -4419,53 +4575,60 @@ async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             resp_null()
         };
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
         None => {
             if count_opt.is_some() {
-                resp_array(&[])
+                (resp_array(&[]), false)
             } else {
-                resp_null()
+                (resp_null(), false)
             }
         }
         Some(entry) => match entry.value.as_zset() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(z) => {
                 if z.is_empty() {
-                    return if count_opt.is_some() {
-                        resp_array(&[])
+                    if count_opt.is_some() {
+                        (resp_array(&[]), false)
                     } else {
-                        resp_null()
-                    };
-                }
-                match count_opt {
-                    None => resp_bulk(&z[0].member),
-                    Some(count) => {
-                        let abs_count = count.unsigned_abs() as usize;
-                        let allow_repeat = count < 0;
-                        let mut result: Vec<Vec<u8>> = Vec::new();
-                        if allow_repeat {
-                            for i in 0..abs_count {
-                                let idx = i % z.len();
-                                result.push(z[idx].member.clone());
-                                if withscores {
-                                    result.push(format_score(z[idx].score));
+                        (resp_null(), false)
+                    }
+                } else {
+                    // Clone to release borrow before potential mark_ear call.
+                    let z: Vec<crate::store::ZEntry> = z.clone();
+                    match count_opt {
+                        None => (resp_bulk(&z[0].member), true),
+                        Some(count) => {
+                            let abs_count = count.unsigned_abs() as usize;
+                            let allow_repeat = count < 0;
+                            let mut result: Vec<Vec<u8>> = Vec::new();
+                            if allow_repeat {
+                                for i in 0..abs_count {
+                                    let idx = i % z.len();
+                                    result.push(z[idx].member.clone());
+                                    if withscores {
+                                        result.push(format_score(z[idx].score));
+                                    }
+                                }
+                            } else {
+                                let take = abs_count.min(z.len());
+                                for item in z.iter().take(take) {
+                                    result.push(item.member.clone());
+                                    if withscores {
+                                        result.push(format_score(item.score));
+                                    }
                                 }
                             }
-                        } else {
-                            let take = abs_count.min(z.len());
-                            for item in z.iter().take(take) {
-                                result.push(item.member.clone());
-                                if withscores {
-                                    result.push(format_score(item.score));
-                                }
-                            }
+                            (resp_array(&result), true)
                         }
-                        resp_array(&result)
                     }
                 }
             }
         },
+    };
+    if mark {
+        db.mark_ear(&ns, &key);
     }
+    resp
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -6534,5 +6697,174 @@ mod tests {
         let store = Arc::new(RwLock::new(Db::new(1)));
         let resp = cmd_set(&args(&["SET", "k", "toolarge"]), &store).await;
         assert!(resp.starts_with(b"-ERR OOM"));
+    }
+
+    // ── EAR tests ─────────────────────────────────────────────────────────────
+
+    fn make_ear_store() -> Store {
+        let mut ns_policies = HashMap::new();
+        ns_policies.insert(
+            "session".to_string(),
+            config::EvictionPolicy::ExpireAfterRead,
+        );
+        let db = Db::new(config::DEFAULT_MEMORY_LIMIT).with_eviction(
+            1.0,
+            config::EvictionPolicy::None,
+            ns_policies,
+        );
+        Arc::new(RwLock::new(db))
+    }
+
+    #[tokio::test]
+    async fn get_on_ear_namespace_marks_key_pending() {
+        let store = make_ear_store();
+        cmd_set(&args(&["SET", "session/token", "abc"]), &store).await;
+        cmd_get(&args(&["GET", "session/token"]), &store).await;
+        assert!(
+            store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("session".to_string(), "token".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_on_non_ear_namespace_does_not_mark() {
+        let store = make_ear_store();
+        cmd_set(&args(&["SET", "default/foo", "bar"]), &store).await;
+        cmd_get(&args(&["GET", "default/foo"]), &store).await;
+        assert!(
+            !store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("default".to_string(), "foo".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_on_missing_key_does_not_mark() {
+        let store = make_ear_store();
+        cmd_get(&args(&["GET", "session/missing"]), &store).await;
+        assert!(store.read().await.ear_pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ear_sweep_deletes_marked_keys() {
+        let store = make_ear_store();
+        cmd_set(&args(&["SET", "session/token", "abc"]), &store).await;
+        // Mark the key for EAR eviction.
+        store.write().await.mark_ear("session", "token");
+        // Simulate a single sweep cycle.
+        let pending: Vec<(String, String)> =
+            store.read().await.ear_pending.iter().cloned().collect();
+        {
+            let mut db = store.write().await;
+            for (ns, key) in &pending {
+                if db.ear_pending.contains(&(ns.clone(), key.clone()))
+                    && db
+                        .entries
+                        .get(ns)
+                        .and_then(|m| m.get(key.as_str()))
+                        .is_some_and(|e| !e.is_expired())
+                {
+                    db.delete(ns, key);
+                }
+            }
+        }
+        assert!(
+            store
+                .read()
+                .await
+                .entries
+                .get("session")
+                .and_then(|ns| ns.get("token"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ear_write_after_mark_cancels_eviction() {
+        let store = make_ear_store();
+        cmd_set(&args(&["SET", "session/token", "abc"]), &store).await;
+        // Mark for eviction.
+        store.write().await.mark_ear("session", "token");
+        assert!(
+            store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("session".to_string(), "token".to_string()))
+        );
+        // A write clears the EAR mark.
+        cmd_set(&args(&["SET", "session/token", "new"]), &store).await;
+        assert!(
+            !store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("session".to_string(), "token".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn hget_found_field_marks_hash_key() {
+        let store = make_ear_store();
+        cmd_hset(&args(&["HSET", "session/h", "f1", "v1"]), &store).await;
+        cmd_hget(&args(&["HGET", "session/h", "f1"]), &store).await;
+        assert!(
+            store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("session".to_string(), "h".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn hget_missing_field_does_not_mark_hash_key() {
+        let store = make_ear_store();
+        cmd_hset(&args(&["HSET", "session/h", "f1", "v1"]), &store).await;
+        cmd_hget(&args(&["HGET", "session/h", "missing"]), &store).await;
+        assert!(
+            !store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("session".to_string(), "h".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_ear_sweep_task_deletes_keys() {
+        let store = make_ear_store();
+        cmd_set(&args(&["SET", "session/tok", "val"]), &store).await;
+        // GET marks the key for EAR eviction.
+        cmd_get(&args(&["GET", "session/tok"]), &store).await;
+        assert!(
+            store
+                .read()
+                .await
+                .ear_pending
+                .contains(&("session".to_string(), "tok".to_string()))
+        );
+        // Spawn the sweep task.
+        tokio::spawn(run_ear_sweep(Arc::clone(&store)));
+        // Wait for the sweep to run (interval is 1 s, but give it headroom).
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if store
+                .read()
+                .await
+                .entries
+                .get("session")
+                .and_then(|ns| ns.get("tok"))
+                .is_none()
+            {
+                return;
+            }
+        }
+        panic!("EAR sweep did not delete the key within 2 seconds");
     }
 }

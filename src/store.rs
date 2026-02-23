@@ -175,6 +175,8 @@ pub(crate) struct Db {
     pub(crate) eviction_threshold: f64,
     pub(crate) eviction_policy: EvictionPolicy,
     pub(crate) namespace_eviction_policies: HashMap<String, EvictionPolicy>,
+    /// Keys pending deletion at the next EAR sweep.
+    pub(crate) ear_pending: HashSet<(String, String)>,
 }
 
 impl Db {
@@ -189,6 +191,7 @@ impl Db {
             eviction_threshold: 1.0,
             eviction_policy: EvictionPolicy::None,
             namespace_eviction_policies: HashMap::new(),
+            ear_pending: HashSet::new(),
         }
     }
 
@@ -216,7 +219,32 @@ impl Db {
 
     /// Whether reads in `namespace` should update hit counters for eviction.
     pub(crate) fn tracks_hits(&self, namespace: &str) -> bool {
-        !matches!(self.policy_for_namespace(namespace), EvictionPolicy::None)
+        matches!(
+            self.policy_for_namespace(namespace),
+            EvictionPolicy::Lru | EvictionPolicy::Mru
+        )
+    }
+
+    /// Returns `true` if `namespace` uses the `ExpireAfterRead` eviction policy.
+    pub(crate) fn is_ear_namespace(&self, namespace: &str) -> bool {
+        matches!(
+            self.policy_for_namespace(namespace),
+            EvictionPolicy::ExpireAfterRead
+        )
+    }
+
+    /// Mark `(namespace, key)` for deletion at the next EAR sweep.
+    /// Only marks if the key currently exists and is not expired.
+    pub(crate) fn mark_ear(&mut self, namespace: &str, key: &str) {
+        if self
+            .entries
+            .get(namespace)
+            .and_then(|m| m.get(key))
+            .is_some_and(|e| !e.is_expired())
+        {
+            self.ear_pending
+                .insert((namespace.to_owned(), key.to_owned()));
+        }
     }
 
     /// Attempt to free enough memory in `namespace` so that a write of
@@ -229,9 +257,12 @@ impl Db {
         if net_delta == 0 {
             return true;
         }
-        // 2. No eviction policy → cannot help.
+        // 2. No eviction policy or EAR → cannot help.
         let policy = self.policy_for_namespace(namespace);
-        if policy == EvictionPolicy::None {
+        if matches!(
+            policy,
+            EvictionPolicy::None | EvictionPolicy::ExpireAfterRead
+        ) {
             return false;
         }
         // 3. Only evict when we are at or above the threshold fraction.
@@ -266,7 +297,7 @@ impl Db {
         match policy {
             EvictionPolicy::Lru => candidates.sort_by_key(|(_, hits, _)| *hits),
             EvictionPolicy::Mru => candidates.sort_by_key(|(_, hits, _)| Reverse(*hits)),
-            EvictionPolicy::None => unreachable!(),
+            EvictionPolicy::None | EvictionPolicy::ExpireAfterRead => unreachable!(),
         }
 
         // 7. Evict until we have freed enough bytes.
@@ -328,6 +359,8 @@ impl Db {
     }
 
     pub(crate) fn put(&mut self, namespace: String, key: String, entry: Entry) {
+        // A fresh write cancels any pending EAR eviction for this key.
+        self.ear_pending.remove(&(namespace.clone(), key.clone()));
         let new_size = Self::entry_size(&namespace, &key, entry.value.byte_len());
         let old_size = self
             .entries
@@ -353,6 +386,8 @@ impl Db {
     }
 
     pub(crate) fn delete(&mut self, namespace: &str, key: &str) -> Option<Entry> {
+        self.ear_pending
+            .remove(&(namespace.to_owned(), key.to_owned()));
         let removed = self
             .entries
             .get_mut(namespace)
@@ -391,6 +426,7 @@ impl Db {
         self.entries.clear();
         self.used_bytes = 0;
         self.namespace_bytes.clear();
+        self.ear_pending.clear();
         metrics::gauge!("kvns_memory_used_bytes_total").set(0.0);
     }
 }
@@ -572,5 +608,134 @@ mod tests {
         );
         // old=8, new=5: saturating_sub → 0
         assert_eq!(db.net_delta("ns", "k", 2), 0);
+    }
+
+    // ── EAR tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tracks_hits_returns_false_for_ear() {
+        let mut ns_policies = HashMap::new();
+        ns_policies.insert("ns".to_string(), EvictionPolicy::ExpireAfterRead);
+        let db = Db::new(1000).with_eviction(1.0, EvictionPolicy::None, ns_policies);
+        assert!(!db.tracks_hits("ns"));
+    }
+
+    #[test]
+    fn tracks_hits_returns_true_for_lru_and_mru() {
+        let db_lru = Db::new(1000).with_eviction(1.0, EvictionPolicy::Lru, HashMap::new());
+        assert!(db_lru.tracks_hits("any"));
+        let db_mru = Db::new(1000).with_eviction(1.0, EvictionPolicy::Mru, HashMap::new());
+        assert!(db_mru.tracks_hits("any"));
+    }
+
+    #[test]
+    fn evict_for_write_returns_false_for_ear() {
+        let mut ns_policies = HashMap::new();
+        ns_policies.insert("ns".to_string(), EvictionPolicy::ExpireAfterRead);
+        let mut db = Db::new(100).with_eviction(0.0, EvictionPolicy::None, ns_policies);
+        assert!(!db.evict_for_write("ns", 5));
+    }
+
+    #[test]
+    fn is_ear_namespace_returns_true_for_ear() {
+        let mut ns_policies = HashMap::new();
+        ns_policies.insert("session".to_string(), EvictionPolicy::ExpireAfterRead);
+        let db = Db::new(1000).with_eviction(1.0, EvictionPolicy::None, ns_policies);
+        assert!(db.is_ear_namespace("session"));
+        assert!(!db.is_ear_namespace("other"));
+    }
+
+    #[test]
+    fn mark_ear_marks_existing_non_expired_key() {
+        let mut db = Db::new(1000);
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"v".to_vec(), None),
+        );
+        db.mark_ear("ns", "k");
+        assert!(
+            db.ear_pending
+                .contains(&("ns".to_string(), "k".to_string()))
+        );
+    }
+
+    #[test]
+    fn mark_ear_does_not_mark_missing_key() {
+        let mut db = Db::new(1000);
+        db.mark_ear("ns", "k");
+        assert!(
+            !db.ear_pending
+                .contains(&("ns".to_string(), "k".to_string()))
+        );
+    }
+
+    #[test]
+    fn mark_ear_does_not_mark_expired_key() {
+        let mut db = Db::new(1000);
+        let expired = Entry {
+            value: Value::String(b"v".to_vec()),
+            hits: 0,
+            expiry: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        db.put("ns".to_string(), "k".to_string(), expired);
+        db.mark_ear("ns", "k");
+        assert!(
+            !db.ear_pending
+                .contains(&("ns".to_string(), "k".to_string()))
+        );
+    }
+
+    #[test]
+    fn put_clears_ear_mark() {
+        let mut db = Db::new(1000);
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"v".to_vec(), None),
+        );
+        db.mark_ear("ns", "k");
+        assert!(
+            db.ear_pending
+                .contains(&("ns".to_string(), "k".to_string()))
+        );
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"v2".to_vec(), None),
+        );
+        assert!(
+            !db.ear_pending
+                .contains(&("ns".to_string(), "k".to_string()))
+        );
+    }
+
+    #[test]
+    fn delete_clears_ear_mark() {
+        let mut db = Db::new(1000);
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"v".to_vec(), None),
+        );
+        db.mark_ear("ns", "k");
+        db.delete("ns", "k");
+        assert!(
+            !db.ear_pending
+                .contains(&("ns".to_string(), "k".to_string()))
+        );
+    }
+
+    #[test]
+    fn flush_all_clears_ear_marks() {
+        let mut db = Db::new(1000);
+        db.put(
+            "ns".to_string(),
+            "k".to_string(),
+            Entry::new(b"v".to_vec(), None),
+        );
+        db.mark_ear("ns", "k");
+        db.flush_all();
+        assert!(db.ear_pending.is_empty());
     }
 }
