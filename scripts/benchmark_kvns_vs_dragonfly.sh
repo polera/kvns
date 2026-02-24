@@ -114,7 +114,7 @@ run_suite() {
   echo "[${name}] Running direct SET benchmark..."
   memtier_benchmark \
     -s 127.0.0.1 -p "$KVNS_PORT" \
-    -c 20 --test-time "$BENCH_TEST_TIME" -t 4 -d 256 \
+    -c 20 --test-time "$BENCH_TEST_TIME" -t 8 -d 256 \
     --distinct-client-seed --ratio 1:0 --hide-histogram \
     --out-file "$out_dir/direct_set.txt" \
     --json-out-file "$out_dir/direct_set.json" \
@@ -123,7 +123,7 @@ run_suite() {
   echo "[${name}] Running direct GET benchmark..."
   memtier_benchmark \
     -s 127.0.0.1 -p "$KVNS_PORT" \
-    -c 20 --test-time "$BENCH_TEST_TIME" -t 4 -d 256 \
+    -c 20 --test-time "$BENCH_TEST_TIME" -t 8 -d 256 \
     --distinct-client-seed --ratio 0:1 --hide-histogram \
     --out-file "$out_dir/direct_get.txt" \
     --json-out-file "$out_dir/direct_get.json" \
@@ -132,7 +132,7 @@ run_suite() {
   echo "[${name}] Running pipelined SET benchmark..."
   memtier_benchmark \
     -s 127.0.0.1 -p "$KVNS_PORT" \
-    --protocol redis --clients 30 --threads 2 --pipeline 30 \
+    --protocol redis --clients 30 --threads 8 --pipeline 30 \
     --requests "$BENCH_PIPE_REQUESTS" --ratio 1:0 --hide-histogram \
     --out-file "$out_dir/pipe_set.txt" \
     --json-out-file "$out_dir/pipe_set.json" \
@@ -141,7 +141,7 @@ run_suite() {
   echo "[${name}] Running pipelined GET benchmark..."
   memtier_benchmark \
     -s 127.0.0.1 -p "$KVNS_PORT" \
-    --protocol redis --clients 30 --threads 2 --pipeline 30 \
+    --protocol redis --clients 30 --threads 8 --pipeline 30 \
     --requests "$BENCH_PIPE_REQUESTS" --ratio 0:1 --hide-histogram \
     --out-file "$out_dir/pipe_get.txt" \
     --json-out-file "$out_dir/pipe_get.json" \
@@ -218,7 +218,7 @@ echo
 echo "kvns benchmark run"
 echo "  artifacts: $BENCH_DIR"
 echo "  direct profile: -c 20 -t 4 -d 256 --test-time $BENCH_TEST_TIME --ratio 1:0 / 0:1"
-echo "  pipeline profile: --clients 30 --threads 2 --pipeline 30 --requests $BENCH_PIPE_REQUESTS"
+echo "  pipeline profile: --clients 30 --threads 8 --pipeline 30 --requests $BENCH_PIPE_REQUESTS"
 
 if [[ "$BENCH_COMPARE_BOTH" == "1" ]]; then
   run_suite 0 "$BENCH_DIR/classic" "classic"
