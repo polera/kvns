@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
-use crate::resp::{resp_bulk, resp_err, resp_int, resp_null, resp_ok, resp_pong, wrong_args};
+use crate::resp::{
+    append_array_header, append_bulk, append_null, resp_bulk, resp_err, resp_int, resp_null,
+    resp_ok, resp_pong, wrong_args,
+};
 
 #[derive(Clone)]
 struct ShardedEntry {
@@ -17,19 +20,19 @@ struct ShardedEntry {
 
 #[derive(Clone)]
 struct ParsedKey {
-    ns: String,
-    key: String,
-    canonical: String,
+    canonical: Vec<u8>,
+    key_len: usize,
     shard_idx: usize,
 }
 
 pub(crate) struct ShardedDb {
-    shards: Vec<RwLock<HashMap<String, ShardedEntry>>>,
+    shards: Vec<RwLock<HashMap<Vec<u8>, ShardedEntry>>>,
     used_bytes: AtomicUsize,
     memory_limit: usize,
 }
 
 pub(crate) type ShardedStore = Arc<ShardedDb>;
+const DEFAULT_NAMESPACE: &[u8] = b"default";
 
 impl ShardedDb {
     pub(crate) fn new(memory_limit: usize, shard_count: usize) -> ShardedStore {
@@ -47,27 +50,11 @@ impl ShardedDb {
         })
     }
 
-    fn parse_ns_key(raw: &[u8]) -> (String, String) {
-        let s = String::from_utf8_lossy(raw);
-        match s.find('/') {
-            Some(pos) => (s[..pos].to_owned(), s[pos + 1..].to_owned()),
-            None => ("default".to_owned(), s.into_owned()),
-        }
+    fn entry_size(key_len: usize, value_len: usize) -> usize {
+        key_len + value_len
     }
 
-    fn canonical_key(ns: &str, key: &str) -> String {
-        let mut out = String::with_capacity(ns.len() + 1 + key.len());
-        out.push_str(ns);
-        out.push('/');
-        out.push_str(key);
-        out
-    }
-
-    fn entry_size(ns: &str, key: &str, value_len: usize) -> usize {
-        ns.len() + key.len() + value_len
-    }
-
-    fn shard_idx(&self, ns: &str, key: &str) -> usize {
+    fn shard_idx(&self, ns: &[u8], key: &[u8]) -> usize {
         let mut hasher = DefaultHasher::new();
         ns.hash(&mut hasher);
         key.hash(&mut hasher);
@@ -75,12 +62,23 @@ impl ShardedDb {
     }
 
     fn parse_key(&self, raw_key: &[u8]) -> ParsedKey {
-        let (ns, key) = Self::parse_ns_key(raw_key);
+        if let Some(pos) = raw_key.iter().position(|b| *b == b'/') {
+            let ns = &raw_key[..pos];
+            let key = &raw_key[pos + 1..];
+            return ParsedKey {
+                shard_idx: self.shard_idx(ns, key),
+                canonical: raw_key.to_vec(),
+                key_len: raw_key.len().saturating_sub(1),
+            };
+        }
+        let mut canonical = Vec::with_capacity(DEFAULT_NAMESPACE.len() + 1 + raw_key.len());
+        canonical.extend_from_slice(DEFAULT_NAMESPACE);
+        canonical.push(b'/');
+        canonical.extend_from_slice(raw_key);
         ParsedKey {
-            shard_idx: self.shard_idx(&ns, &key),
-            canonical: Self::canonical_key(&ns, &key),
-            ns,
-            key,
+            shard_idx: self.shard_idx(DEFAULT_NAMESPACE, raw_key),
+            canonical,
+            key_len: DEFAULT_NAMESPACE.len() + raw_key.len(),
         }
     }
 
@@ -131,7 +129,7 @@ impl ShardedDb {
 
     fn purge_expired_locked(
         &self,
-        shard: &mut HashMap<String, ShardedEntry>,
+        shard: &mut HashMap<Vec<u8>, ShardedEntry>,
         parsed: &ParsedKey,
         now: Instant,
     ) {
@@ -140,7 +138,7 @@ impl ShardedDb {
             .is_some_and(|entry| entry.expiry.is_some_and(|deadline| now >= deadline));
         if expired {
             if let Some(entry) = shard.remove(&parsed.canonical) {
-                let size = Self::entry_size(&parsed.ns, &parsed.key, entry.value.len());
+                let size = Self::entry_size(parsed.key_len, entry.value.len());
                 self.release_bytes(size);
             }
             self.record_total_used();
@@ -174,6 +172,7 @@ impl ShardedDb {
         ttl: Option<Duration>,
     ) -> Result<(), ()> {
         let parsed = self.parse_key(raw_key);
+        let key_len = parsed.key_len;
         let now = Instant::now();
 
         let mut shard = self.shards[parsed.shard_idx].write().await;
@@ -181,9 +180,9 @@ impl ShardedDb {
 
         let old_size = shard
             .get(&parsed.canonical)
-            .map(|entry| Self::entry_size(&parsed.ns, &parsed.key, entry.value.len()))
+            .map(|entry| Self::entry_size(key_len, entry.value.len()))
             .unwrap_or(0);
-        let new_size = Self::entry_size(&parsed.ns, &parsed.key, value.len());
+        let new_size = Self::entry_size(key_len, value.len());
 
         if new_size > old_size {
             if !self.reserve_bytes(new_size - old_size) {
@@ -206,6 +205,7 @@ impl ShardedDb {
         overflow_err: &'static str,
     ) -> Result<i64, Vec<u8>> {
         let parsed = self.parse_key(raw_key);
+        let key_len = parsed.key_len;
         let now = Instant::now();
 
         let mut shard = self.shards[parsed.shard_idx].write().await;
@@ -230,9 +230,9 @@ impl ShardedDb {
         let new_value = next.to_string().into_bytes();
         let old_size = shard
             .get(&parsed.canonical)
-            .map(|entry| Self::entry_size(&parsed.ns, &parsed.key, entry.value.len()))
+            .map(|entry| Self::entry_size(key_len, entry.value.len()))
             .unwrap_or(0);
-        let new_size = Self::entry_size(&parsed.ns, &parsed.key, new_value.len());
+        let new_size = Self::entry_size(key_len, new_value.len());
 
         if new_size > old_size {
             if !self.reserve_bytes(new_size - old_size) {
@@ -265,11 +265,17 @@ impl ShardedDb {
         if shard.contains_key(&parsed.canonical) {
             return Ok(false);
         }
-        let new_size = Self::entry_size(&parsed.ns, &parsed.key, value.len());
+        let new_size = Self::entry_size(parsed.key_len, value.len());
         if !self.reserve_bytes(new_size) {
             return Err(());
         }
-        shard.insert(parsed.canonical, ShardedEntry { value, expiry: None });
+        shard.insert(
+            parsed.canonical,
+            ShardedEntry {
+                value,
+                expiry: None,
+            },
+        );
         self.record_total_used();
         Ok(true)
     }
@@ -281,23 +287,32 @@ impl ShardedDb {
         let now = Instant::now();
         let mut shard = self.shards[parsed.shard_idx].write().await;
         self.purge_expired_locked(&mut shard, &parsed, now);
-        let old_value = shard
-            .get(&parsed.canonical)
-            .map(|e| e.value.clone())
-            .unwrap_or_default();
-        let old_size = Self::entry_size(&parsed.ns, &parsed.key, old_value.len());
-        let mut new_value = old_value;
-        new_value.extend_from_slice(suffix);
-        let new_size = Self::entry_size(&parsed.ns, &parsed.key, new_value.len());
-        if new_size > old_size {
-            if !self.reserve_bytes(new_size - old_size) {
-                return Err(resp_err("OOM command not allowed when used memory > 'maxmemory'"));
+        if let Some(entry) = shard.get_mut(&parsed.canonical) {
+            if !self.reserve_bytes(suffix.len()) {
+                return Err(resp_err(
+                    "OOM command not allowed when used memory > 'maxmemory'",
+                ));
             }
-        } else {
-            self.release_bytes(old_size - new_size);
+            entry.value.extend_from_slice(suffix);
+            entry.expiry = None;
+            let len = entry.value.len() as i64;
+            self.record_total_used();
+            return Ok(len);
         }
-        let len = new_value.len() as i64;
-        shard.insert(parsed.canonical, ShardedEntry { value: new_value, expiry: None });
+        let new_size = Self::entry_size(parsed.key_len, suffix.len());
+        if !self.reserve_bytes(new_size) {
+            return Err(resp_err(
+                "OOM command not allowed when used memory > 'maxmemory'",
+            ));
+        }
+        let len = suffix.len() as i64;
+        shard.insert(
+            parsed.canonical,
+            ShardedEntry {
+                value: suffix.to_vec(),
+                expiry: None,
+            },
+        );
         self.record_total_used();
         Ok(len)
     }
@@ -305,25 +320,43 @@ impl ShardedDb {
     /// Atomically replace the value, returning the old value (if any). Returns
     /// `Err(())` on OOM.
     async fn get_and_set(&self, raw_key: &[u8], new_value: Vec<u8>) -> Result<Option<Vec<u8>>, ()> {
+        use std::collections::hash_map::Entry;
+
         let parsed = self.parse_key(raw_key);
+        let key_len = parsed.key_len;
         let now = Instant::now();
         let mut shard = self.shards[parsed.shard_idx].write().await;
         self.purge_expired_locked(&mut shard, &parsed, now);
-        let old = shard.get(&parsed.canonical).map(|e| e.value.clone());
-        let old_size = old.as_ref()
-            .map(|v| Self::entry_size(&parsed.ns, &parsed.key, v.len()))
-            .unwrap_or(0);
-        let new_size = Self::entry_size(&parsed.ns, &parsed.key, new_value.len());
-        if new_size > old_size {
-            if !self.reserve_bytes(new_size - old_size) {
-                return Err(());
+        match shard.entry(parsed.canonical) {
+            Entry::Occupied(mut occupied) => {
+                let old_size = Self::entry_size(key_len, occupied.get().value.len());
+                let new_size = Self::entry_size(key_len, new_value.len());
+                if new_size > old_size {
+                    if !self.reserve_bytes(new_size - old_size) {
+                        return Err(());
+                    }
+                } else {
+                    self.release_bytes(old_size - new_size);
+                }
+                let entry = occupied.get_mut();
+                let old = std::mem::replace(&mut entry.value, new_value);
+                entry.expiry = None;
+                self.record_total_used();
+                Ok(Some(old))
             }
-        } else {
-            self.release_bytes(old_size - new_size);
+            Entry::Vacant(vacant) => {
+                let new_size = Self::entry_size(key_len, new_value.len());
+                if !self.reserve_bytes(new_size) {
+                    return Err(());
+                }
+                vacant.insert(ShardedEntry {
+                    value: new_value,
+                    expiry: None,
+                });
+                self.record_total_used();
+                Ok(None)
+            }
         }
-        shard.insert(parsed.canonical, ShardedEntry { value: new_value, expiry: None });
-        self.record_total_used();
-        Ok(old)
     }
 
     /// Set all key-value pairs only if none of the keys already exist. Acquires
@@ -335,11 +368,16 @@ impl ShardedDb {
         // Group pairs by shard index (BTreeMap → sorted order prevents deadlock).
         let mut by_shard: BTreeMap<usize, Vec<(ParsedKey, Vec<u8>)>> = BTreeMap::new();
         for (parsed, value) in pairs {
-            by_shard.entry(parsed.shard_idx).or_default().push((parsed, value));
+            by_shard
+                .entry(parsed.shard_idx)
+                .or_default()
+                .push((parsed, value));
         }
         // Acquire all write locks in shard-index order.
-        let mut guards: Vec<(usize, tokio::sync::RwLockWriteGuard<'_, HashMap<String, ShardedEntry>>)> =
-            Vec::with_capacity(by_shard.len());
+        let mut guards: Vec<(
+            usize,
+            tokio::sync::RwLockWriteGuard<'_, HashMap<Vec<u8>, ShardedEntry>>,
+        )> = Vec::with_capacity(by_shard.len());
         for &shard_idx in by_shard.keys() {
             let guard = self.shards[shard_idx].write().await;
             guards.push((shard_idx, guard));
@@ -347,7 +385,7 @@ impl ShardedDb {
         // First pass: purge expired + check existence.
         for (shard_idx, guard) in &mut guards {
             if let Some(shard_pairs) = by_shard.get(&*shard_idx) {
-                let shard: &mut HashMap<String, ShardedEntry> = guard;
+                let shard: &mut HashMap<Vec<u8>, ShardedEntry> = guard;
                 for (parsed, _) in shard_pairs {
                     self.purge_expired_locked(shard, parsed, now);
                     if shard.contains_key(&parsed.canonical) {
@@ -358,14 +396,20 @@ impl ShardedDb {
         }
         // Second pass: reserve bytes + insert.
         for (shard_idx, guard) in &mut guards {
-            if let Some(shard_pairs) = by_shard.get(&*shard_idx) {
-                let shard: &mut HashMap<String, ShardedEntry> = guard;
-                for (parsed, value) in shard_pairs {
-                    let size = Self::entry_size(&parsed.ns, &parsed.key, value.len());
+            if let Some(shard_pairs) = by_shard.get_mut(&*shard_idx) {
+                let shard: &mut HashMap<Vec<u8>, ShardedEntry> = guard;
+                for (parsed, value) in shard_pairs.drain(..) {
+                    let size = Self::entry_size(parsed.key_len, value.len());
                     if !self.reserve_bytes(size) {
                         return Err(());
                     }
-                    shard.insert(parsed.canonical.clone(), ShardedEntry { value: value.clone(), expiry: None });
+                    shard.insert(
+                        parsed.canonical,
+                        ShardedEntry {
+                            value,
+                            expiry: None,
+                        },
+                    );
                 }
             }
         }
@@ -446,11 +490,12 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         if args.len() < 2 {
             return (wrong_args(&args[0]), false);
         }
-        let mut out = format!("*{}\r\n", args.len() - 1).into_bytes();
+        let mut out = Vec::new();
+        append_array_header(&mut out, args.len() - 1);
         for raw_key in &args[1..] {
             match store.get_value(raw_key).await {
-                Some(value) => out.extend_from_slice(&resp_bulk(&value)),
-                None => out.extend_from_slice(&resp_null()),
+                Some(value) => append_bulk(&mut out, &value),
+                None => append_null(&mut out),
             }
         }
         return (out, false);
@@ -490,7 +535,10 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         return match store.msetnx_atomic(pairs).await {
             Ok(true) => (resp_int(1), false),
             Ok(false) => (resp_int(0), false),
-            Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+            Err(()) => (
+                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
+                false,
+            ),
         };
     }
 
@@ -501,7 +549,10 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         return match store.put_value_if_absent(&args[1], args[2].clone()).await {
             Ok(true) => (resp_int(1), false),
             Ok(false) => (resp_int(0), false),
-            Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+            Err(()) => (
+                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
+                false,
+            ),
         };
     }
 
@@ -609,7 +660,10 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         return match store.get_and_set(&args[1], args[2].clone()).await {
             Ok(Some(old)) => (resp_bulk(&old), false),
             Ok(None) => (resp_null(), false),
-            Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+            Err(()) => (
+                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
+                false,
+            ),
         };
     }
 
@@ -623,7 +677,7 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         store.purge_expired_locked(&mut shard, &parsed, now);
         let removed = shard.remove(&parsed.canonical);
         if let Some(entry) = removed {
-            let size = ShardedDb::entry_size(&parsed.ns, &parsed.key, entry.value.len());
+            let size = ShardedDb::entry_size(parsed.key_len, entry.value.len());
             store.release_bytes(size);
             store.record_total_used();
             return (resp_bulk(&entry.value), false);
@@ -653,24 +707,18 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
         let mut total = 0usize;
         for shard_lock in &store.shards {
             let mut shard = shard_lock.write().await;
-            let expired: Vec<String> = shard
-                .iter()
-                .filter_map(|(k, v)| {
-                    if v.expiry.is_some_and(|deadline| now >= deadline) {
-                        Some(k.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for key in expired {
-                if let Some(entry) = shard.remove(&key) {
-                    let mut parts = key.splitn(2, '/');
-                    let ns = parts.next().unwrap_or("default");
-                    let local_key = parts.next().unwrap_or("");
-                    let size = ShardedDb::entry_size(ns, local_key, entry.value.len());
-                    store.release_bytes(size);
+            let mut released = 0usize;
+            shard.retain(|key, entry| {
+                if entry.expiry.is_some_and(|deadline| now >= deadline) {
+                    let key_len = key.len().saturating_sub(1);
+                    released += ShardedDb::entry_size(key_len, entry.value.len());
+                    false
+                } else {
+                    true
                 }
+            });
+            if released > 0 {
+                store.release_bytes(released);
             }
             total += shard.len();
         }
@@ -810,12 +858,10 @@ mod tests {
         let store = ShardedDb::new(1024 * 1024, 8);
         let s1 = Arc::clone(&store);
         let s2 = Arc::clone(&store);
-        let r1 = tokio::spawn(async move {
-            dispatch(&args(&["SETNX", "racekey", "v1"]), &s1).await.0
-        });
-        let r2 = tokio::spawn(async move {
-            dispatch(&args(&["SETNX", "racekey", "v2"]), &s2).await.0
-        });
+        let r1 =
+            tokio::spawn(async move { dispatch(&args(&["SETNX", "racekey", "v1"]), &s1).await.0 });
+        let r2 =
+            tokio::spawn(async move { dispatch(&args(&["SETNX", "racekey", "v2"]), &s2).await.0 });
         let (a, b) = tokio::join!(r1, r2);
         let wins: i32 = [a.unwrap(), b.unwrap()]
             .iter()
@@ -829,7 +875,9 @@ mod tests {
         let store = ShardedDb::new(1024 * 1024, 8);
         // Pre-set key "b" so MSETNX a,b should fail atomically.
         let _ = dispatch(&args(&["SET", "b", "existing"]), &store).await;
-        let r = dispatch(&args(&["MSETNX", "a", "1", "b", "2"]), &store).await.0;
+        let r = dispatch(&args(&["MSETNX", "a", "1", "b", "2"]), &store)
+            .await
+            .0;
         assert_eq!(r, b":0\r\n", "MSETNX must fail if any key exists");
         // "a" must not have been set.
         let ga = dispatch(&args(&["GET", "a"]), &store).await.0;

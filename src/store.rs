@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A sorted set with O(1) member lookup and O(log n) rank queries.
@@ -339,7 +339,11 @@ impl Db {
             };
             let mut candidates: Vec<(String, u64, usize)> = {
                 let it = ns_map.iter().map(|(k, e)| {
-                    (k.clone(), e.hits.load(Ordering::Relaxed), Self::entry_size(namespace, k, e.value.byte_len()))
+                    (
+                        k.clone(),
+                        e.hits.load(Ordering::Relaxed),
+                        Self::entry_size(namespace, k, e.value.byte_len()),
+                    )
                 });
                 if ns_map.len() > EVICTION_SAMPLE_SIZE {
                     it.take(EVICTION_SAMPLE_SIZE).collect()
@@ -446,7 +450,12 @@ impl Db {
             .or_default()
             .insert(key, entry);
         let ns_keys = self.entries[&namespace].len();
-        StoreMetrics { namespace, ns_keys, ns_bytes, total_bytes: self.used_bytes }
+        StoreMetrics {
+            namespace,
+            ns_keys,
+            ns_bytes,
+            total_bytes: self.used_bytes,
+        }
     }
 
     /// Insert an entry and immediately emit Prometheus gauge updates.
@@ -551,7 +560,13 @@ mod tests {
                 key.to_string(),
                 Entry::new(value.to_vec(), None),
             );
-            db.entries.get_mut(ns).unwrap().get_mut(*key).unwrap().hits.store(*hits, Ordering::Relaxed);
+            db.entries
+                .get_mut(ns)
+                .unwrap()
+                .get_mut(*key)
+                .unwrap()
+                .hits
+                .store(*hits, Ordering::Relaxed);
         }
         Db::entry_size(ns, entries[0].0, value.len())
     }

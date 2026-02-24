@@ -13,7 +13,7 @@ use std::sync::Arc;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 #[tokio::main]
@@ -136,6 +136,15 @@ async fn main() {
 
     let addr = config.listen_addr();
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
+    let max_clients = config.max_clients.max(1);
+    let client_limiter = Arc::new(Semaphore::new(max_clients));
+    let limits = server::ServerLimits {
+        resp: resp::RespLimits {
+            max_array_len: config.max_resp_args,
+            max_bulk_len: config.max_resp_bulk_len,
+            max_inline_len: config.max_resp_inline_len,
+        },
+    };
     info!(addr = %addr, "kvns listening");
 
     #[cfg(unix)]
@@ -149,7 +158,18 @@ async fn main() {
                 match result {
                     Ok((stream, peer)) => {
                         debug!(%peer, "accepted connection");
-                        tokio::spawn(server::handle_connection(stream, backend.clone()));
+                        let permit = match Arc::clone(&client_limiter).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                debug!(
+                                    %peer,
+                                    max_clients,
+                                    "connection rejected: max clients reached"
+                                );
+                                continue;
+                            }
+                        };
+                        tokio::spawn(server::handle_connection(stream, backend.clone(), limits, permit));
                     }
                     Err(e) => error!(?e, "accept error"),
                 }
@@ -170,7 +190,18 @@ async fn main() {
                 match result {
                     Ok((stream, peer)) => {
                         debug!(%peer, "accepted connection");
-                        tokio::spawn(server::handle_connection(stream, backend.clone()));
+                        let permit = match Arc::clone(&client_limiter).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                debug!(
+                                    %peer,
+                                    max_clients,
+                                    "connection rejected: max clients reached"
+                                );
+                                continue;
+                            }
+                        };
+                        tokio::spawn(server::handle_connection(stream, backend.clone(), limits, permit));
                     }
                     Err(e) => error!(?e, "accept error"),
                 }

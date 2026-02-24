@@ -159,6 +159,10 @@ All settings are read from environment variables at startup.
 | `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lru,ns2:mru` |
 | `KVNS_SHARDED_MODE` | `false` | Enable experimental sharded lock backend (currently supports `PING`, `QUIT`, `SET`, `GET`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `INCR`, `INCRBY`, `DECR`, `DECRBY`) |
 | `KVNS_SHARD_COUNT` | `4 * CPU cores` | Number of lock shards when `KVNS_SHARDED_MODE=true` |
+| `KVNS_MAX_CLIENTS` | `10000` | Maximum concurrent client connections accepted |
+| `KVNS_MAX_RESP_ARGS` | `1024` | Maximum number of arguments/elements accepted in one RESP command |
+| `KVNS_MAX_RESP_BULK_LEN` | `16777216` | Maximum bytes allowed for a single RESP bulk string |
+| `KVNS_MAX_RESP_INLINE_LEN` | `65536` | Maximum bytes allowed for a RESP inline/header line |
 
 Examples:
 

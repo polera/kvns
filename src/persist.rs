@@ -101,7 +101,10 @@ impl From<PersistedValue> for Value {
             PersistedValue::ZSet(entries) => {
                 let sorted: Vec<ZEntry> = entries
                     .into_iter()
-                    .map(|e| ZEntry { score: e.score, member: e.member })
+                    .map(|e| ZEntry {
+                        score: e.score,
+                        member: e.member,
+                    })
                     .collect();
                 let index = sorted.iter().map(|e| (e.member.clone(), e.score)).collect();
                 Value::ZSet(ZSetData { sorted, index })
@@ -443,8 +446,14 @@ mod tests {
         let path = temp_path();
         let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
         let sorted = vec![
-            ZEntry { score: 1.5, member: b"a".to_vec() },
-            ZEntry { score: 2.5, member: b"b".to_vec() },
+            ZEntry {
+                score: 1.5,
+                member: b"a".to_vec(),
+            },
+            ZEntry {
+                score: 2.5,
+                member: b"b".to_vec(),
+            },
         ];
         let index = sorted.iter().map(|e| (e.member.clone(), e.score)).collect();
         db.put(

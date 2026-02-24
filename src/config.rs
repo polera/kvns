@@ -3,6 +3,10 @@ use std::collections::HashMap;
 pub const DEFAULT_MEMORY_LIMIT: usize = 1_073_741_824; // 1 GiB
 pub const DEFAULT_PERSIST_INTERVAL_SECS: u64 = 300; // 5 minutes
 pub const DEFAULT_MEMORY_CLAMP_LIMIT: usize = 70; // 70%
+pub const DEFAULT_MAX_CLIENTS: usize = 10_000;
+pub const DEFAULT_MAX_RESP_ARGS: usize = 1_024;
+pub const DEFAULT_MAX_RESP_BULK_LEN: usize = 16 * 1024 * 1024; // 16 MiB
+pub const DEFAULT_MAX_RESP_INLINE_LEN: usize = 64 * 1024; // 64 KiB
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum EvictionPolicy {
@@ -47,6 +51,14 @@ pub struct Config {
     pub sharded_mode: bool,
     /// Number of lock shards in sharded mode.
     pub shard_count: usize,
+    /// Maximum concurrent client connections.
+    pub max_clients: usize,
+    /// Maximum RESP array element count accepted per command.
+    pub max_resp_args: usize,
+    /// Maximum RESP bulk-string byte length accepted.
+    pub max_resp_bulk_len: usize,
+    /// Maximum RESP inline/header line byte length accepted.
+    pub max_resp_inline_len: usize,
 }
 
 impl Default for Config {
@@ -67,6 +79,10 @@ impl Default for Config {
             namespace_eviction_policies: HashMap::new(),
             sharded_mode: false,
             shard_count: shard_count.max(1),
+            max_clients: DEFAULT_MAX_CLIENTS,
+            max_resp_args: DEFAULT_MAX_RESP_ARGS,
+            max_resp_bulk_len: DEFAULT_MAX_RESP_BULK_LEN,
+            max_resp_inline_len: DEFAULT_MAX_RESP_INLINE_LEN,
         }
     }
 }
@@ -96,6 +112,30 @@ impl Config {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|count| *count > 0)
             .unwrap_or(cfg.shard_count);
+        cfg.max_clients = std::env::var("KVNS_MAX_CLIENTS")
+            .ok()
+            .as_deref()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(cfg.max_clients);
+        cfg.max_resp_args = std::env::var("KVNS_MAX_RESP_ARGS")
+            .ok()
+            .as_deref()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(cfg.max_resp_args);
+        cfg.max_resp_bulk_len = std::env::var("KVNS_MAX_RESP_BULK_LEN")
+            .ok()
+            .as_deref()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(cfg.max_resp_bulk_len);
+        cfg.max_resp_inline_len = std::env::var("KVNS_MAX_RESP_INLINE_LEN")
+            .ok()
+            .as_deref()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(cfg.max_resp_inline_len);
         cfg
     }
 
@@ -138,6 +178,10 @@ impl Config {
                 .unwrap_or_default(),
             sharded_mode: defaults.sharded_mode,
             shard_count: defaults.shard_count,
+            max_clients: defaults.max_clients,
+            max_resp_args: defaults.max_resp_args,
+            max_resp_bulk_len: defaults.max_resp_bulk_len,
+            max_resp_inline_len: defaults.max_resp_inline_len,
         }
     }
 
@@ -229,6 +273,10 @@ mod tests {
         assert_eq!(c.port, 6480);
         assert_eq!(c.host, "0.0.0.0");
         assert_eq!(c.memory_limit, DEFAULT_MEMORY_LIMIT);
+        assert_eq!(c.max_clients, DEFAULT_MAX_CLIENTS);
+        assert_eq!(c.max_resp_args, DEFAULT_MAX_RESP_ARGS);
+        assert_eq!(c.max_resp_bulk_len, DEFAULT_MAX_RESP_BULK_LEN);
+        assert_eq!(c.max_resp_inline_len, DEFAULT_MAX_RESP_INLINE_LEN);
     }
 
     #[test]
@@ -237,6 +285,10 @@ mod tests {
         assert_eq!(c.port, 6480);
         assert_eq!(c.host, "0.0.0.0");
         assert_eq!(c.memory_limit, DEFAULT_MEMORY_LIMIT);
+        assert_eq!(c.max_clients, DEFAULT_MAX_CLIENTS);
+        assert_eq!(c.max_resp_args, DEFAULT_MAX_RESP_ARGS);
+        assert_eq!(c.max_resp_bulk_len, DEFAULT_MAX_RESP_BULK_LEN);
+        assert_eq!(c.max_resp_inline_len, DEFAULT_MAX_RESP_INLINE_LEN);
     }
 
     #[test]
