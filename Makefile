@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build release check checks ensure-check-tools test lint fmt fmt-check clean run \
+.PHONY: help build release check checks ensure-check-tools test lint fmt fmt-check clean run benchmark benchmark-sharded benchmark-compare \
 	podman-build podman-run podman-compose-up podman-compose-down podman-compose-logs \
 	podman-login-ghcr podman-push-ghcr
 
@@ -58,6 +58,15 @@ clean:
 
 run:
 	$(CARGO_ENV) cargo run
+
+benchmark:
+	./scripts/benchmark_kvns_vs_dragonfly.sh
+
+benchmark-sharded:
+	BENCH_SHARDED_MODE=1 ./scripts/benchmark_kvns_vs_dragonfly.sh
+
+benchmark-compare:
+	BENCH_COMPARE_BOTH=1 ./scripts/benchmark_kvns_vs_dragonfly.sh
 
 podman-build:
 	$(PODMAN) build -f Dockerfile -t $(IMAGE) .

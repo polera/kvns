@@ -1,5 +1,26 @@
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
+use crate::config::{
+    DEFAULT_MAX_RESP_ARGS, DEFAULT_MAX_RESP_BULK_LEN, DEFAULT_MAX_RESP_INLINE_LEN,
+};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RespLimits {
+    pub max_array_len: usize,
+    pub max_bulk_len: usize,
+    pub max_inline_len: usize,
+}
+
+impl Default for RespLimits {
+    fn default() -> Self {
+        Self {
+            max_array_len: DEFAULT_MAX_RESP_ARGS,
+            max_bulk_len: DEFAULT_MAX_RESP_BULK_LEN,
+            max_inline_len: DEFAULT_MAX_RESP_INLINE_LEN,
+        }
+    }
+}
+
 fn invalid_data(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
@@ -19,16 +40,44 @@ fn parse_bulk_len(hdr: &[u8]) -> std::io::Result<i64> {
 async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &'a mut Vec<u8>,
+    max_line_len: usize,
 ) -> std::io::Result<Option<&'a [u8]>> {
     buf.clear();
-    if reader.read_until(b'\n', buf).await? == 0 {
-        return Ok(None);
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF",
+            ));
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len().saturating_add(take) > max_line_len.saturating_add(2) {
+                return Err(invalid_data("line too long"));
+            }
+            buf.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
+            break;
+        }
+        if buf.len().saturating_add(chunk.len()) > max_line_len.saturating_add(2) {
+            return Err(invalid_data("line too long"));
+        }
+        let take = chunk.len();
+        buf.extend_from_slice(chunk);
+        reader.consume(take);
     }
     if buf.ends_with(b"\n") {
         buf.pop();
         if buf.ends_with(b"\r") {
             buf.pop();
         }
+    }
+    if buf.len() > max_line_len {
+        return Err(invalid_data("line too long"));
     }
     Ok(Some(buf.as_slice()))
 }
@@ -55,8 +104,15 @@ fn split_inline_command(line: &[u8]) -> Vec<Vec<u8>> {
 pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+    parse_resp_with_limits(reader, RespLimits::default()).await
+}
+
+pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limits: RespLimits,
+) -> std::io::Result<Option<Vec<Vec<u8>>>> {
     let mut line = Vec::new();
-    let Some(trimmed) = read_resp_line(reader, &mut line).await? else {
+    let Some(trimmed) = read_resp_line(reader, &mut line, limits.max_inline_len).await? else {
         return Ok(None);
     };
     if trimmed.is_empty() {
@@ -73,10 +129,16 @@ pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
             if count < 0 {
                 return Ok(Some(vec![])); // null array
             }
+            let count = usize::try_from(count).map_err(|_| invalid_data("bad count"))?;
+            if count > limits.max_array_len {
+                return Err(invalid_data("too many bulk strings"));
+            }
             let mut args = Vec::with_capacity(count as usize);
             let mut hdr = Vec::new();
             for _ in 0..count {
-                let Some(hdr_line) = read_resp_line(reader, &mut hdr).await? else {
+                let Some(hdr_line) =
+                    read_resp_line(reader, &mut hdr, limits.max_inline_len).await?
+                else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected EOF",
@@ -86,7 +148,10 @@ pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
                 if len < 0 {
                     args.push(vec![]);
                 } else {
-                    let len = len as usize;
+                    let len = usize::try_from(len).map_err(|_| invalid_data("bad len"))?;
+                    if len > limits.max_bulk_len {
+                        return Err(invalid_data("bulk string too large"));
+                    }
                     let mut buf = vec![0u8; len + 2]; // +2 for \r\n
                     reader.read_exact(&mut buf).await?;
                     buf.truncate(len);
@@ -122,7 +187,10 @@ pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
                 return Err(invalid_data("bad count"));
             }
             let count = usize::try_from(count).map_err(|_| invalid_data("bad count"))?;
-            read_bulk_strings(reader, count).await.map(Some)
+            if count > limits.max_array_len {
+                return Err(invalid_data("too many bulk strings"));
+            }
+            read_bulk_strings(reader, count, limits).await.map(Some)
         }
 
         // ── RESP3 map type (%N) — read 2N bulk strings ──────────────────────
@@ -132,14 +200,23 @@ pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
                 return Err(invalid_data("bad count"));
             }
             let count = usize::try_from(count).map_err(|_| invalid_data("bad count"))?;
+            if count > limits.max_array_len / 2 {
+                return Err(invalid_data("too many bulk strings"));
+            }
             let count = count
                 .checked_mul(2)
                 .ok_or_else(|| invalid_data("bad count"))?;
-            read_bulk_strings(reader, count).await.map(Some)
+            read_bulk_strings(reader, count, limits).await.map(Some)
         }
 
         // ── Inline command ──────────────────────────────────────────────────
-        _ => Ok(Some(split_inline_command(trimmed))),
+        _ => {
+            let out = split_inline_command(trimmed);
+            if out.len() > limits.max_array_len {
+                return Err(invalid_data("too many inline arguments"));
+            }
+            Ok(Some(out))
+        }
     }
 }
 
@@ -147,11 +224,12 @@ pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
 async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     n: usize,
+    limits: RespLimits,
 ) -> std::io::Result<Vec<Vec<u8>>> {
     let mut args = Vec::with_capacity(n);
     let mut hdr = Vec::new();
     for _ in 0..n {
-        let Some(hdr_line) = read_resp_line(reader, &mut hdr).await? else {
+        let Some(hdr_line) = read_resp_line(reader, &mut hdr, limits.max_inline_len).await? else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "unexpected EOF",
@@ -161,7 +239,10 @@ async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
         if len < 0 {
             args.push(vec![]);
         } else {
-            let len = len as usize;
+            let len = usize::try_from(len).map_err(|_| invalid_data("bad len"))?;
+            if len > limits.max_bulk_len {
+                return Err(invalid_data("bulk string too large"));
+            }
             let mut buf = vec![0u8; len + 2];
             reader.read_exact(&mut buf).await?;
             buf.truncate(len);
@@ -192,7 +273,23 @@ pub(crate) fn resp_wrongtype() -> Vec<u8> {
     b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
 }
 
-fn append_bulk(out: &mut Vec<u8>, data: &[u8]) {
+pub(crate) fn append_array_header(out: &mut Vec<u8>, len: usize) {
+    out.push(b'*');
+    out.extend_from_slice(len.to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
+pub(crate) fn append_int(out: &mut Vec<u8>, n: i64) {
+    out.push(b':');
+    out.extend_from_slice(n.to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
+pub(crate) fn append_null(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"$-1\r\n");
+}
+
+pub(crate) fn append_bulk(out: &mut Vec<u8>, data: &[u8]) {
     out.push(b'$');
     out.extend_from_slice(data.len().to_string().as_bytes());
     out.extend_from_slice(b"\r\n");
@@ -207,7 +304,8 @@ pub(crate) fn resp_bulk(data: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn resp_array(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = format!("*{}\r\n", items.len()).into_bytes();
+    let mut out = Vec::new();
+    append_array_header(&mut out, items.len());
     for item in items {
         append_bulk(&mut out, item);
     }
@@ -395,6 +493,48 @@ mod tests {
         let mut r = BufReader::new(&data[..]);
         let result = parse_resp(&mut r).await.unwrap().unwrap();
         assert_eq!(result, vec![b"3.14"]);
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_too_many_bulk_strings() {
+        let data = b"*2\r\n$4\r\nPING\r\n$4\r\nPONG\r\n";
+        let mut r = BufReader::new(&data[..]);
+        let limits = RespLimits {
+            max_array_len: 1,
+            ..RespLimits::default()
+        };
+        let err = parse_resp_with_limits(&mut r, limits)
+            .await
+            .expect_err("should reject oversized array");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_oversized_bulk_string() {
+        let data = b"*1\r\n$4\r\nPING\r\n";
+        let mut r = BufReader::new(&data[..]);
+        let limits = RespLimits {
+            max_bulk_len: 3,
+            ..RespLimits::default()
+        };
+        let err = parse_resp_with_limits(&mut r, limits)
+            .await
+            .expect_err("should reject oversized bulk");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_oversized_inline_line() {
+        let data = b"PING PONG\r\n";
+        let mut r = BufReader::new(&data[..]);
+        let limits = RespLimits {
+            max_inline_len: 4,
+            ..RespLimits::default()
+        };
+        let err = parse_resp_with_limits(&mut r, limits)
+            .await
+            .expect_err("should reject oversized inline command");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

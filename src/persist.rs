@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, error, info};
 
-use crate::store::{Db, Entry, Store, Value, ZEntry};
+use crate::store::{Db, Entry, Store, Value, ZEntry, ZSetData};
 
 // ── Serializable mirror types ─────────────────────────────────────────────────
 
@@ -65,8 +66,8 @@ impl From<&Value> for PersistedValue {
                     .collect(),
             ),
             Value::Set(s) => PersistedValue::Set(s.iter().cloned().collect()),
-            Value::ZSet(entries) => PersistedValue::ZSet(
-                entries
+            Value::ZSet(data) => PersistedValue::ZSet(
+                data.sorted
                     .iter()
                     .map(|e| PersistedZEntry {
                         score: e.score,
@@ -97,15 +98,17 @@ impl From<PersistedValue> for Value {
                 }
                 Value::Set(set)
             }
-            PersistedValue::ZSet(entries) => Value::ZSet(
-                entries
+            PersistedValue::ZSet(entries) => {
+                let sorted: Vec<ZEntry> = entries
                     .into_iter()
                     .map(|e| ZEntry {
                         score: e.score,
                         member: e.member,
                     })
-                    .collect(),
-            ),
+                    .collect();
+                let index = sorted.iter().map(|e| (e.member.clone(), e.score)).collect();
+                Value::ZSet(ZSetData { sorted, index })
+            }
         }
     }
 }
@@ -122,7 +125,7 @@ fn entry_to_persisted(entry: &Entry) -> PersistedEntry {
     });
     PersistedEntry {
         value: PersistedValue::from(&entry.value),
-        hits: entry.hits,
+        hits: entry.hits.load(Ordering::Relaxed),
         expiry_unix_ms,
     }
 }
@@ -140,7 +143,7 @@ fn persisted_to_entry(p: PersistedEntry) -> Option<Entry> {
     };
     Some(Entry {
         value: Value::from(p.value),
-        hits: p.hits,
+        hits: AtomicU64::new(p.hits),
         expiry,
     })
 }
@@ -267,7 +270,7 @@ mod tests {
         assert!(p.expiry_unix_ms.is_none());
         let restored = persisted_to_entry(p).unwrap();
         assert_eq!(restored.value.as_string().unwrap(), b"hello");
-        assert_eq!(restored.hits, 0);
+        assert_eq!(restored.hits.load(Ordering::Relaxed), 0);
         assert!(restored.expiry.is_none());
     }
 
@@ -344,7 +347,7 @@ mod tests {
             "dead".into(),
             Entry {
                 value: Value::String(b"v".to_vec()),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: Some(Instant::now() - Duration::from_secs(1)),
             },
         );
@@ -391,7 +394,7 @@ mod tests {
             "myhash".into(),
             Entry {
                 value: Value::Hash(hm),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: None,
             },
         );
@@ -421,7 +424,7 @@ mod tests {
             "myset".into(),
             Entry {
                 value: Value::Set(s),
-                hits: 0,
+                hits: AtomicU64::new(0),
                 expiry: None,
             },
         );
@@ -442,21 +445,23 @@ mod tests {
     fn zset_value_roundtrips() {
         let path = temp_path();
         let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
+        let sorted = vec![
+            ZEntry {
+                score: 1.5,
+                member: b"a".to_vec(),
+            },
+            ZEntry {
+                score: 2.5,
+                member: b"b".to_vec(),
+            },
+        ];
+        let index = sorted.iter().map(|e| (e.member.clone(), e.score)).collect();
         db.put(
             "default".into(),
             "myzset".into(),
             Entry {
-                value: Value::ZSet(vec![
-                    ZEntry {
-                        score: 1.5,
-                        member: b"a".to_vec(),
-                    },
-                    ZEntry {
-                        score: 2.5,
-                        member: b"b".to_vec(),
-                    },
-                ]),
-                hits: 0,
+                value: Value::ZSet(ZSetData { sorted, index }),
+                hits: AtomicU64::new(0),
                 expiry: None,
             },
         );
@@ -469,8 +474,8 @@ mod tests {
             .unwrap();
         let zset = entry.value.as_zset().unwrap();
         assert_eq!(zset.len(), 2);
-        assert!((zset[0].score - 1.5).abs() < f64::EPSILON);
-        assert_eq!(zset[0].member, b"a");
+        assert!((zset.sorted[0].score - 1.5).abs() < f64::EPSILON);
+        assert_eq!(zset.sorted[0].member, b"a");
         let _ = fs::remove_file(&path);
     }
 }
