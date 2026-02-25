@@ -34,10 +34,10 @@ pub(crate) async fn handle_connection(
     // Disable Nagle: send responses immediately rather than waiting to coalesce small writes.
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::with_capacity(64 * 1024, read_half);
     // BufWriter accumulates responses; we flush only when no more pipelined commands are
     // buffered, collapsing N pipelined writes into a single syscall.
-    let mut writer = BufWriter::new(write_half);
+    let mut writer = BufWriter::with_capacity(64 * 1024, write_half);
     loop {
         match parse_resp_with_limits(&mut reader, limits.resp).await {
             Ok(None) => break,
