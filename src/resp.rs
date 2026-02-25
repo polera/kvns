@@ -152,9 +152,10 @@ pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
                     if len > limits.max_bulk_len {
                         return Err(invalid_data("bulk string too large"));
                     }
-                    let mut buf = vec![0u8; len + 2]; // +2 for \r\n
+                    let mut buf = vec![0u8; len];
                     reader.read_exact(&mut buf).await?;
-                    buf.truncate(len);
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).await?;
                     args.push(buf);
                 }
             }
@@ -243,9 +244,10 @@ async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
             if len > limits.max_bulk_len {
                 return Err(invalid_data("bulk string too large"));
             }
-            let mut buf = vec![0u8; len + 2];
+            let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).await?;
-            buf.truncate(len);
+            let mut crlf = [0u8; 2];
+            reader.read_exact(&mut crlf).await?;
             args.push(buf);
         }
     }

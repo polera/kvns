@@ -159,7 +159,6 @@ print_mode_summary() {
   local mode_name="$1"
   local metrics_file="$2"
 
-  # shellcheck disable=SC1090
   source "$metrics_file"
 
   echo
@@ -179,7 +178,6 @@ print_compare_summary() {
   local classic_metrics="$1"
   local sharded_metrics="$2"
 
-  # shellcheck disable=SC1090
   source "$classic_metrics"
   local c_direct_set_ops="$DIRECT_SET_OPS"
   local c_direct_get_ops="$DIRECT_GET_OPS"
@@ -190,7 +188,6 @@ print_compare_summary() {
   local c_pipe_set_lat="$PIPE_SET_LAT"
   local c_pipe_get_lat="$PIPE_GET_LAT"
 
-  # shellcheck disable=SC1090
   source "$sharded_metrics"
   local s_direct_set_ops="$DIRECT_SET_OPS"
   local s_direct_get_ops="$DIRECT_GET_OPS"

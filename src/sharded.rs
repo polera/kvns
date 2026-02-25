@@ -94,7 +94,7 @@ impl ShardedDb {
             match self.used_bytes.compare_exchange_weak(
                 current,
                 current + extra_bytes,
-                Ordering::SeqCst,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
@@ -113,7 +113,7 @@ impl ShardedDb {
             match self.used_bytes.compare_exchange_weak(
                 current,
                 next,
-                Ordering::SeqCst,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return,
@@ -141,7 +141,9 @@ impl ShardedDb {
                 let size = Self::entry_size(parsed.key_len, entry.value.len());
                 self.release_bytes(size);
             }
-            self.record_total_used();
+            // record_total_used intentionally omitted: metrics are updated on
+            // writes; flushing gauges on every expired-key eviction during reads
+            // adds a metrics registry lookup to the GET hot path.
         }
     }
 
@@ -158,11 +160,11 @@ impl ShardedDb {
             }
         }
 
+        // Key was expired in the read pass; upgrade to write lock to purge it.
+        // No need to re-probe: the key is gone after purge.
         let mut shard = self.shards[parsed.shard_idx].write().await;
         self.purge_expired_locked(&mut shard, &parsed, now);
-        shard
-            .get(&parsed.canonical)
-            .map(|entry| entry.value.clone())
+        None
     }
 
     async fn put_value(

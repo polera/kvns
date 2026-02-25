@@ -467,18 +467,6 @@ async fn read_zset_snapshot(store: &Store, ns: &str, key: &str) -> ZsetLookup {
 
 pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let start = Instant::now();
-    let ns = if args.len() >= 2 {
-        parse_ns_key(&args[1]).0
-    } else {
-        "default".to_owned()
-    };
-    let resp = cmd_set_inner(args, store).await;
-    metrics::histogram!("kvns_command_duration_seconds", "command" => "set", "namespace" => ns)
-        .record(start.elapsed().as_secs_f64());
-    resp
-}
-
-async fn cmd_set_inner(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if args.len() != 3 && args.len() != 5 {
         return wrong_args(&args[0]);
     }
@@ -522,6 +510,8 @@ async fn cmd_set_inner(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         schedule_expiry(store, ns, key, deadline);
     }
 
+    metrics::histogram!("kvns_command_duration_seconds", "command" => "set")
+        .record(start.elapsed().as_secs_f64());
     resp_ok()
 }
 
