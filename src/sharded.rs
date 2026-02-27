@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -205,7 +206,7 @@ impl ShardedDb {
         raw_key: &[u8],
         delta: i64,
         overflow_err: &'static str,
-    ) -> Result<i64, Vec<u8>> {
+    ) -> Result<i64, Cow<'static, [u8]>> {
         let parsed = self.parse_key(raw_key);
         let key_len = parsed.key_len;
         let now = Instant::now();
@@ -284,7 +285,7 @@ impl ShardedDb {
 
     /// Append `suffix` to the existing value (defaulting to empty). Returns the
     /// new length on success, or `Err(bytes)` on OOM where `bytes` is an error response.
-    async fn append_value(&self, raw_key: &[u8], suffix: &[u8]) -> Result<i64, Vec<u8>> {
+    async fn append_value(&self, raw_key: &[u8], suffix: &[u8]) -> Result<i64, Cow<'static, [u8]>> {
         let parsed = self.parse_key(raw_key);
         let now = Instant::now();
         let mut shard = self.shards[parsed.shard_idx].write().await;
@@ -420,7 +421,7 @@ impl ShardedDb {
     }
 }
 
-fn set_ttl_from_args(args: &[Vec<u8>]) -> Result<Option<Duration>, Vec<u8>> {
+fn set_ttl_from_args(args: &[Vec<u8>]) -> Result<Option<Duration>, Cow<'static, [u8]>> {
     if args.len() == 3 {
         return Ok(None);
     }
@@ -443,14 +444,17 @@ fn set_ttl_from_args(args: &[Vec<u8>]) -> Result<Option<Duration>, Vec<u8>> {
     }
 }
 
-fn parse_i64_arg(raw: &[u8]) -> Result<i64, Vec<u8>> {
+fn parse_i64_arg(raw: &[u8]) -> Result<i64, Cow<'static, [u8]>> {
     std::str::from_utf8(raw)
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .ok_or_else(|| resp_err("value is not an integer or out of range"))
 }
 
-pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>, bool) {
+pub(crate) async fn dispatch(
+    args: &[Vec<u8>],
+    store: &ShardedStore,
+) -> (Cow<'static, [u8]>, bool) {
     if args.is_empty() {
         return (resp_err("empty command"), false);
     }
@@ -500,7 +504,7 @@ pub(crate) async fn dispatch(args: &[Vec<u8>], store: &ShardedStore) -> (Vec<u8>
                 None => append_null(&mut out),
             }
         }
-        return (out, false);
+        return (out.into(), false);
     }
 
     if cmd.eq_ignore_ascii_case(b"MSET") {
@@ -761,11 +765,11 @@ mod tests {
     async fn set_get_roundtrip() {
         let store = ShardedDb::new(1024 * 1024, 8);
         assert_eq!(
-            dispatch(&args(&["SET", "k", "v"]), &store).await.0,
+            &*(dispatch(&args(&["SET", "k", "v"]), &store).await.0),
             b"+OK\r\n"
         );
         assert_eq!(
-            dispatch(&args(&["GET", "k"]), &store).await.0,
+            &*(dispatch(&args(&["GET", "k"]), &store).await.0),
             b"$1\r\nv\r\n"
         );
     }
@@ -774,15 +778,15 @@ mod tests {
     async fn mset_mget_roundtrip() {
         let store = ShardedDb::new(1024 * 1024, 8);
         assert_eq!(
-            dispatch(&args(&["MSET", "a", "1", "b", "2"]), &store)
+            &*(dispatch(&args(&["MSET", "a", "1", "b", "2"]), &store)
                 .await
-                .0,
+                .0),
             b"+OK\r\n"
         );
         assert_eq!(
-            dispatch(&args(&["MGET", "a", "b", "missing"]), &store)
+            &*(dispatch(&args(&["MGET", "a", "b", "missing"]), &store)
                 .await
-                .0,
+                .0),
             b"*3\r\n$1\r\n1\r\n$1\r\n2\r\n$-1\r\n"
         );
     }
@@ -791,23 +795,23 @@ mod tests {
     async fn setnx_and_msetnx() {
         let store = ShardedDb::new(1024 * 1024, 8);
         assert_eq!(
-            dispatch(&args(&["SETNX", "k", "v1"]), &store).await.0,
+            &*(dispatch(&args(&["SETNX", "k", "v1"]), &store).await.0),
             b":1\r\n"
         );
         assert_eq!(
-            dispatch(&args(&["SETNX", "k", "v2"]), &store).await.0,
+            &*(dispatch(&args(&["SETNX", "k", "v2"]), &store).await.0),
             b":0\r\n"
         );
         assert_eq!(
-            dispatch(&args(&["MSETNX", "a", "1", "b", "2"]), &store)
+            &*(dispatch(&args(&["MSETNX", "a", "1", "b", "2"]), &store)
                 .await
-                .0,
+                .0),
             b":1\r\n"
         );
         assert_eq!(
-            dispatch(&args(&["MSETNX", "b", "3", "c", "4"]), &store)
+            &*(dispatch(&args(&["MSETNX", "b", "3", "c", "4"]), &store)
                 .await
-                .0,
+                .0),
             b":0\r\n"
         );
     }
@@ -815,14 +819,14 @@ mod tests {
     #[tokio::test]
     async fn incr_family_roundtrip() {
         let store = ShardedDb::new(1024 * 1024, 8);
-        assert_eq!(dispatch(&args(&["INCR", "n"]), &store).await.0, b":1\r\n");
+        assert_eq!(&*(dispatch(&args(&["INCR", "n"]), &store).await.0), b":1\r\n");
         assert_eq!(
-            dispatch(&args(&["INCRBY", "n", "5"]), &store).await.0,
+            &*(dispatch(&args(&["INCRBY", "n", "5"]), &store).await.0),
             b":6\r\n"
         );
-        assert_eq!(dispatch(&args(&["DECR", "n"]), &store).await.0, b":5\r\n");
+        assert_eq!(&*(dispatch(&args(&["DECR", "n"]), &store).await.0), b":5\r\n");
         assert_eq!(
-            dispatch(&args(&["DECRBY", "n", "2"]), &store).await.0,
+            &*(dispatch(&args(&["DECRBY", "n", "2"]), &store).await.0),
             b":3\r\n"
         );
     }
@@ -832,7 +836,7 @@ mod tests {
         let store = ShardedDb::new(1024 * 1024, 8);
         let _ = dispatch(&args(&["SET", "k", "abc"]), &store).await;
         assert_eq!(
-            dispatch(&args(&["INCR", "k"]), &store).await.0,
+            &*(dispatch(&args(&["INCR", "k"]), &store).await.0),
             b"-ERR value is not an integer or out of range\r\n"
         );
     }
@@ -842,14 +846,14 @@ mod tests {
         let store = ShardedDb::new(1024 * 1024, 4);
         let _ = dispatch(&args(&["SET", "k", "v", "PX", "20"]), &store).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(dispatch(&args(&["GET", "k"]), &store).await.0, b"$-1\r\n");
+        assert_eq!(&*(dispatch(&args(&["GET", "k"]), &store).await.0), b"$-1\r\n");
     }
 
     #[tokio::test]
     async fn unknown_command_returns_error() {
         let store = ShardedDb::new(1024 * 1024, 4);
         assert_eq!(
-            dispatch(&args(&["HSET", "h", "f", "v"]), &store).await.0,
+            &*(dispatch(&args(&["HSET", "h", "f", "v"]), &store).await.0),
             b"-ERR command not supported in sharded mode\r\n"
         );
     }
@@ -867,7 +871,7 @@ mod tests {
         let (a, b) = tokio::join!(r1, r2);
         let wins: i32 = [a.unwrap(), b.unwrap()]
             .iter()
-            .filter(|r| r.as_slice() == b":1\r\n")
+            .filter(|r| r.as_ref() == b":1\r\n" as &[u8])
             .count() as i32;
         assert_eq!(wins, 1, "exactly one SETNX should succeed");
     }
@@ -880,21 +884,21 @@ mod tests {
         let r = dispatch(&args(&["MSETNX", "a", "1", "b", "2"]), &store)
             .await
             .0;
-        assert_eq!(r, b":0\r\n", "MSETNX must fail if any key exists");
+        assert_eq!(&*r, b":0\r\n", "MSETNX must fail if any key exists");
         // "a" must not have been set.
         let ga = dispatch(&args(&["GET", "a"]), &store).await.0;
-        assert_eq!(ga, b"$-1\r\n", "a must not be set after failed MSETNX");
+        assert_eq!(&*ga, b"$-1\r\n", "a must not be set after failed MSETNX");
     }
 
     #[tokio::test]
     async fn append_atomic_accumulates() {
         let store = ShardedDb::new(1024 * 1024, 8);
         let r1 = dispatch(&args(&["APPEND", "s", "hello"]), &store).await.0;
-        assert_eq!(r1, b":5\r\n");
+        assert_eq!(&*r1, b":5\r\n");
         let r2 = dispatch(&args(&["APPEND", "s", " world"]), &store).await.0;
-        assert_eq!(r2, b":11\r\n");
+        assert_eq!(&*r2, b":11\r\n");
         let r3 = dispatch(&args(&["GET", "s"]), &store).await.0;
-        assert_eq!(r3, b"$11\r\nhello world\r\n");
+        assert_eq!(&*r3, b"$11\r\nhello world\r\n");
     }
 
     #[tokio::test]
@@ -902,12 +906,12 @@ mod tests {
         let store = ShardedDb::new(1024 * 1024, 8);
         // GETSET on missing key returns null.
         let r1 = dispatch(&args(&["GETSET", "k", "new"]), &store).await.0;
-        assert_eq!(r1, b"$-1\r\n");
+        assert_eq!(&*r1, b"$-1\r\n");
         // GETSET on existing key returns old value.
         let r2 = dispatch(&args(&["GETSET", "k", "newer"]), &store).await.0;
-        assert_eq!(r2, b"$3\r\nnew\r\n");
+        assert_eq!(&*r2, b"$3\r\nnew\r\n");
         // Value is updated.
         let r3 = dispatch(&args(&["GET", "k"]), &store).await.0;
-        assert_eq!(r3, b"$5\r\nnewer\r\n");
+        assert_eq!(&*r3, b"$5\r\nnewer\r\n");
     }
 }

@@ -34,11 +34,25 @@ impl ConnState {
 
 // ── Namespace key parsing ─────────────────────────────────────────────────────
 
-fn parse_ns_key(raw: &[u8]) -> (String, String) {
-    let s = String::from_utf8_lossy(raw);
-    match s.find('/') {
-        Some(pos) => (s[..pos].to_owned(), s[pos + 1..].to_owned()),
-        None => ("default".to_owned(), s.into_owned()),
+fn parse_ns_key(raw: &[u8]) -> (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>) {
+    use std::borrow::Cow;
+    match std::str::from_utf8(raw) {
+        Ok(s) => match s.find('/') {
+            Some(pos) => (Cow::Borrowed(&s[..pos]), Cow::Borrowed(&s[pos + 1..])),
+            None => (Cow::Borrowed("default"), Cow::Borrowed(s)),
+        },
+        Err(_) => {
+            // Non-UTF-8 key: rare, fall back to lossy conversion.
+            let s = String::from_utf8_lossy(raw).into_owned();
+            match s.find('/') {
+                Some(pos) => {
+                    let key = s[pos + 1..].to_owned();
+                    let ns = s[..pos].to_owned();
+                    (Cow::Owned(ns), Cow::Owned(key))
+                }
+                None => (Cow::Borrowed("default"), Cow::Owned(s)),
+            }
+        }
     }
 }
 
@@ -117,14 +131,14 @@ fn ensure_expiry_scheduler(store: &Store) -> mpsc::UnboundedSender<ExpiryEvent> 
     tx
 }
 
-fn schedule_expiry(store: &Store, ns: String, key: String, deadline: Instant) {
+fn schedule_expiry(store: &Store, ns: &str, key: &str, deadline: Instant) {
     let key_id = store_scheduler_key(store);
     for _ in 0..2 {
         let tx = ensure_expiry_scheduler(store);
         if tx
             .send(ExpiryEvent {
-                ns: ns.clone(),
-                key: key.clone(),
+                ns: ns.to_owned(),
+                key: key.to_owned(),
                 deadline,
             })
             .is_ok()
@@ -228,8 +242,8 @@ pub(crate) async fn run_ear_sweep(store: Store) {
                 // put() clears EAR marks for re-written keys; re-check not-expired.
                 if db
                     .entries
-                    .get(ns.as_str())
-                    .and_then(|m| m.get(key.as_str()))
+                    .get::<str>(ns.as_ref())
+                    .and_then(|m| m.get::<str>(key.as_ref()))
                     .is_some_and(|e| !e.is_expired())
                 {
                     db.delete(ns, key);
@@ -404,21 +418,21 @@ fn check_oom(db: &mut Db, ns: &str, key: &str, new_byte_len: usize) -> bool {
     true
 }
 
-fn resp_array_of_nulls(count: usize) -> Vec<u8> {
+fn resp_array_of_nulls(count: usize) -> std::borrow::Cow<'static, [u8]> {
     let mut out = Vec::new();
     append_array_header(&mut out, count);
     for _ in 0..count {
         append_null(&mut out);
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 async fn cleanup_expired_key(store: &Store, ns: &str, key: &str) {
     let mut db = store.write().await;
     if db
         .entries
-        .get(ns)
-        .and_then(|m| m.get(key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(ns, key);
@@ -433,8 +447,8 @@ async fn cleanup_expired_keys(store: &Store, keys: &[(String, String)]) {
     for (ns, key) in keys {
         if db
             .entries
-            .get(ns)
-            .and_then(|m| m.get(key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(ns, key);
@@ -451,7 +465,7 @@ enum ZsetLookup {
 
 async fn read_zset_snapshot(store: &Store, ns: &str, key: &str) -> ZsetLookup {
     let db = store.read().await;
-    match db.entries.get(ns).and_then(|m| m.get(key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => ZsetLookup::Missing,
         Some(entry) if entry.is_expired() => ZsetLookup::Expired,
         Some(entry) => match entry.value.as_zset() {
@@ -465,7 +479,7 @@ async fn read_zset_snapshot(store: &Store, ns: &str, key: &str) -> ZsetLookup {
 // STRING COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     let start = Instant::now();
     if args.len() != 3 && args.len() != 5 {
         return wrong_args(&args[0]);
@@ -494,20 +508,20 @@ pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let expiry = entry.expiry;
 
     let mut db = store.write().await;
-    if db.would_exceed(&ns, &key, value_len) {
-        let net_delta = db.net_delta(&ns, &key, value_len);
+    let net_delta = db.net_delta(&ns, &key, value_len);
+    if db.used_bytes.saturating_add(net_delta) > db.memory_limit {
         if !db.evict_for_write(&ns, net_delta) {
             return resp_err("OOM command not allowed when used memory > 'maxmemory'");
         }
     }
-    let m = db.put_deferred(ns.clone(), key.clone(), entry);
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), entry);
     drop(db);
     // Emit Prometheus gauges after releasing the write lock to reduce contention.
     m.emit();
     debug!(namespace = %ns, key = %key, ttl = ?ttl, "SET");
 
     if let Some(deadline) = expiry {
-        schedule_expiry(store, ns, key, deadline);
+        schedule_expiry(store, ns.as_ref(), key.as_ref(), deadline);
     }
 
     metrics::histogram!("kvns_command_duration_seconds", "command" => "set")
@@ -515,7 +529,7 @@ pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_ok()
 }
 
-async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_get(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -529,7 +543,7 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let read_state = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => ReadGet::Missing,
             Some(entry) if entry.is_expired() => ReadGet::Expired,
             Some(entry) => match entry.value.as_string() {
@@ -564,11 +578,11 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    let keys: Vec<(String, String)> = args[1..].iter().map(|a| parse_ns_key(a)).collect();
+    let keys: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = args[1..].iter().map(|a| parse_ns_key(a)).collect();
     let (out, expired_keys, found_keys, ear_ns) = {
         let db = store.read().await;
         let mut out = Vec::new();
@@ -576,17 +590,17 @@ async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let mut expired_keys: Vec<(String, String)> = Vec::new();
         let mut found_keys: Vec<(String, String)> = Vec::new();
         for (ns, key) in &keys {
-            match db.entries.get(ns).and_then(|m| m.get(key)) {
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
                 None => append_null(&mut out),
                 Some(entry) if entry.is_expired() => {
-                    expired_keys.push((ns.clone(), key.clone()));
+                    expired_keys.push((ns.as_ref().to_owned(), key.as_ref().to_owned()));
                     append_null(&mut out);
                 }
                 Some(entry) => match entry.value.as_string() {
                     None => append_null(&mut out),
                     Some(bytes) => {
                         append_bulk(&mut out, bytes);
-                        found_keys.push((ns.clone(), key.clone()));
+                        found_keys.push((ns.as_ref().to_owned(), key.as_ref().to_owned()));
                     }
                 },
             }
@@ -603,15 +617,15 @@ async fn cmd_mget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !ear_ns.is_empty() {
         let mut db = store.write().await;
         for (ns, key) in &found_keys {
-            if ear_ns.contains(ns) {
+            if ear_ns.contains::<str>(ns.as_ref()) {
                 db.mark_ear(ns, key);
             }
         }
     }
-    out
+    out.into()
 }
 
-async fn cmd_mset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_mset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
         return wrong_args(&args[0]);
     }
@@ -624,7 +638,7 @@ async fn cmd_mset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         if !check_oom(&mut db, &ns, &key, value.len()) {
             return resp_err("OOM command not allowed when used memory > 'maxmemory'");
         }
-        metric_updates.push(db.put_deferred(ns, key, Entry::new(value, None)));
+        metric_updates.push(db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(value, None)));
         i += 2;
     }
     drop(db);
@@ -634,11 +648,11 @@ async fn cmd_mset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_ok()
 }
 
-async fn cmd_msetnx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_msetnx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
         return wrong_args(&args[0]);
     }
-    let pairs: Vec<(String, String, Vec<u8>)> = args[1..]
+    let pairs: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>, Vec<u8>)> = args[1..]
         .chunks(2)
         .map(|c| {
             let (ns, key) = parse_ns_key(&c[0]);
@@ -650,7 +664,7 @@ async fn cmd_msetnx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut metric_updates: Vec<StoreMetrics> = Vec::with_capacity(pairs.len());
     // Check that none of the keys exist (non-expired)
     for (ns, key, _) in &pairs {
-        if let Some(e) = db.entries.get(ns).and_then(|m| m.get(key.as_str()))
+        if let Some(e) = db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref()))
             && !e.is_expired()
         {
             return resp_int(0);
@@ -660,7 +674,7 @@ async fn cmd_msetnx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         if !check_oom(&mut db, &ns, &key, value.len()) {
             return resp_err("OOM command not allowed when used memory > 'maxmemory'");
         }
-        metric_updates.push(db.put_deferred(ns, key, Entry::new(value, None)));
+        metric_updates.push(db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(value, None)));
     }
     drop(db);
     for m in metric_updates {
@@ -669,14 +683,14 @@ async fn cmd_msetnx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(1)
 }
 
-async fn cmd_setnx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_setnx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let value = args[2].clone();
     let mut db = store.write().await;
-    if let Some(e) = db.entries.get(&ns).and_then(|m| m.get(&key))
+    if let Some(e) = db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref()))
         && !e.is_expired()
     {
         return resp_int(0);
@@ -684,13 +698,13 @@ async fn cmd_setnx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(value, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(value, None));
     drop(db);
     m.emit();
     resp_int(1)
 }
 
-async fn cmd_getset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_getset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -699,13 +713,13 @@ async fn cmd_getset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let old = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let old = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_null(),
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -715,13 +729,13 @@ async fn cmd_getset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_value, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
     drop(db);
     m.emit();
     old
 }
 
-async fn cmd_getdel(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_getdel(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -729,15 +743,15 @@ async fn cmd_getdel(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_null();
     }
     // Clone value before releasing borrow, then delete.
-    let val = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let val = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => return resp_null(),
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -748,7 +762,7 @@ async fn cmd_getdel(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     val
 }
 
-async fn cmd_getex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_getex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -756,15 +770,15 @@ async fn cmd_getex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_null();
     }
     // Get value first
-    let (val_bytes, _old_expiry) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (val_bytes, _old_expiry) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => return resp_null(),
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -846,19 +860,19 @@ async fn cmd_getex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
 
     if let Some(new_exp) = new_expiry
-        && let Some(entry) = db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key))
+        && let Some(entry) = db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref()))
     {
         entry.expiry = new_exp;
         let deadline = new_exp;
         drop(db);
         if let Some(d) = deadline {
-            schedule_expiry(store, ns, key, d);
+            schedule_expiry(store, ns.as_ref(), key.as_ref(), d);
         }
     }
     response
 }
 
-async fn cmd_append(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -867,13 +881,13 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let existing_len: usize = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let existing_len: usize = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(e) => match e.value.as_string() {
             None => return resp_wrongtype(),
@@ -886,9 +900,9 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry::new(vec![], None));
     match entry.value.as_string_mut() {
         None => return resp_wrongtype(),
@@ -901,22 +915,22 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         existing_len,
     ));
     db.used_bytes = db.used_bytes.saturating_add(delta);
-    let nb = db.namespace_bytes.entry(ns.clone()).or_insert(0);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(delta);
     let ns_bytes = *nb;
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
     resp_int(result_len as i64)
 }
 
-async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_int(0), false),
             Some(entry) if entry.is_expired() => (resp_int(0), true),
             Some(entry) => match entry.value.as_string() {
@@ -931,7 +945,7 @@ async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -939,13 +953,13 @@ pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let current: i64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -963,13 +977,13 @@ pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_value, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
     drop(db);
     m.emit();
     resp_int(next)
 }
 
-async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -984,13 +998,13 @@ async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let current: i64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -1008,13 +1022,13 @@ async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_value, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
     drop(db);
     m.emit();
     resp_int(next)
 }
 
-async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -1022,13 +1036,13 @@ async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let current: i64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -1046,13 +1060,13 @@ async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_value, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
     drop(db);
     m.emit();
     resp_int(next)
 }
 
-async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -1067,13 +1081,13 @@ async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let current: i64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -1091,13 +1105,13 @@ async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_value, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
     drop(db);
     m.emit();
     resp_int(next)
 }
 
-async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -1112,13 +1126,13 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let current: f64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: f64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0.0,
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -1136,13 +1150,13 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_value.clone(), None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value.clone(), None));
     drop(db);
     m.emit();
     resp_bulk(&new_value)
 }
 
-async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -1158,13 +1172,13 @@ async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    let existing: Vec<u8> = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let existing: Vec<u8> = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => vec![],
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -1181,13 +1195,13 @@ async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !check_oom(&mut db, &ns, &key, new_len) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns, key, Entry::new(new_val, None));
+    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_val, None));
     drop(db);
     m.emit();
     resp_int(new_len as i64)
 }
 
-async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -1208,7 +1222,7 @@ async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_bulk(b""), false, false, false),
             Some(entry) if entry.is_expired() => (resp_bulk(b""), true, false, false),
             Some(entry) => match entry.value.as_string() {
@@ -1252,7 +1266,7 @@ async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 // LIST COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -1260,7 +1274,7 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let new_items = &args[2..];
     let mut db = store.write().await;
 
-    let (existing_byte_len, is_new_key) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (existing_byte_len, is_new_key) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => (0usize, true),
         Some(e) => match &e.value {
             Value::List(l) => (l.iter().map(|v| v.len()).sum(), false),
@@ -1284,9 +1298,9 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::List(VecDeque::new()),
             hits: AtomicU64::new(0),
@@ -1301,17 +1315,17 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let len = list.len();
     db.used_bytes = db.used_bytes.saturating_add(net_delta);
-    let nb = db.namespace_bytes.entry(ns.clone()).or_insert(0);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(net_delta);
     let ns_bytes = *nb;
-    let ns_keys = db.entries.get(&ns).map(|m| m.len()).unwrap_or(0);
-    metrics::gauge!("kvns_keys_total", "namespace" => ns.clone()).set(ns_keys as f64);
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.clone()).set(ns_bytes as f64);
+    let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
+    metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
     resp_int(len as i64)
 }
 
-async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -1319,7 +1333,7 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let new_items = &args[2..];
     let mut db = store.write().await;
 
-    let (existing_byte_len, is_new_key) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (existing_byte_len, is_new_key) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => (0usize, true),
         Some(e) => match &e.value {
             Value::List(l) => (l.iter().map(|v| v.len()).sum(), false),
@@ -1343,9 +1357,9 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::List(VecDeque::new()),
             hits: AtomicU64::new(0),
@@ -1360,17 +1374,17 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     let len = list.len();
     db.used_bytes = db.used_bytes.saturating_add(net_delta);
-    let nb = db.namespace_bytes.entry(ns.clone()).or_insert(0);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(net_delta);
     let ns_bytes = *nb;
-    let ns_keys = db.entries.get(&ns).map(|m| m.len()).unwrap_or(0);
-    metrics::gauge!("kvns_keys_total", "namespace" => ns.clone()).set(ns_keys as f64);
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.clone()).set(ns_bytes as f64);
+    let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
+    metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
     resp_int(len as i64)
 }
 
-async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -1378,20 +1392,20 @@ async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    if db.entries.get(&ns).and_then(|m| m.get(&key)).is_none() {
+    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_none() {
         return resp_int(0);
     }
     drop(db);
     cmd_lpush(args, store).await
 }
 
-async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -1399,20 +1413,20 @@ async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
-    if db.entries.get(&ns).and_then(|m| m.get(&key)).is_none() {
+    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_none() {
         return resp_int(0);
     }
     drop(db);
     cmd_rpush(args, store).await
 }
 
-async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 3 {
         return wrong_args(&args[0]);
     }
@@ -1432,8 +1446,8 @@ async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
@@ -1450,7 +1464,7 @@ async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Single(Vec<u8>, bool),
         Multi(Vec<Vec<u8>>, bool),
     }
-    let outcome = match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    let outcome = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => LPopResult::Null,
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
@@ -1495,7 +1509,7 @@ async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 3 {
         return wrong_args(&args[0]);
     }
@@ -1515,8 +1529,8 @@ async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
@@ -1532,7 +1546,7 @@ async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         Single(Vec<u8>, bool),
         Multi(Vec<Vec<u8>>, bool),
     }
-    let outcome = match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    let outcome = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => RPopResult::Null,
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
@@ -1577,7 +1591,7 @@ async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -1585,14 +1599,14 @@ async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match &entry.value {
             Value::List(l) => resp_int(l.len() as i64),
@@ -1601,7 +1615,7 @@ async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -1622,7 +1636,7 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match &entry.value {
@@ -1663,7 +1677,7 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -1677,7 +1691,7 @@ async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_null(), false, false, false),
             Some(entry) if entry.is_expired() => (resp_null(), true, false, false),
             Some(entry) => match &entry.value {
@@ -1708,7 +1722,7 @@ async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -1724,14 +1738,14 @@ async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_err("ERR no such key");
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_err("ERR no such key"),
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
@@ -1749,7 +1763,7 @@ async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -1765,14 +1779,14 @@ async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
@@ -1811,7 +1825,7 @@ async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -1833,14 +1847,14 @@ async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_ok();
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_ok(),
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
@@ -1873,7 +1887,7 @@ async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 5 {
         return wrong_args(&args[0]);
     }
@@ -1884,14 +1898,14 @@ async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match &mut entry.value {
             Value::List(list) => match list.iter().position(|e| e == &pivot) {
@@ -1907,7 +1921,7 @@ async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -1944,14 +1958,14 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_null();
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_null(),
         Some(entry) => match &entry.value {
             Value::List(list) => {
@@ -2007,7 +2021,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 5 {
         return wrong_args(&args[0]);
     }
@@ -2019,8 +2033,8 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
@@ -2029,8 +2043,8 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let element = match db
         .entries
-        .get_mut(&src_ns)
-        .and_then(|m| m.get_mut(&src_key))
+        .get_mut::<str>(src_ns.as_ref())
+        .and_then(|m| m.get_mut::<str>(src_key.as_ref()))
     {
         None => return resp_null(),
         Some(entry) => match &mut entry.value {
@@ -2054,8 +2068,8 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     // Insert into dst
     match db
         .entries
-        .get_mut(&dst_ns)
-        .and_then(|m| m.get_mut(&dst_key))
+        .get_mut::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get_mut::<str>(dst_key.as_ref()))
     {
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
@@ -2074,8 +2088,9 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             } else {
                 new_list.push_back(element);
             }
-            db.entries.entry(dst_ns.clone()).or_default().insert(
-                dst_key.clone(),
+            db.entries.entry(dst_ns.clone().into_owned()).or_default().
+insert(
+                dst_key.clone().into_owned(),
                 Entry {
                     value: Value::List(new_list),
                     hits: AtomicU64::new(0),
@@ -2092,7 +2107,7 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 // HASH COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
         return wrong_args(&args[0]);
     }
@@ -2105,14 +2120,14 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
 
-    let existing_byte_len: usize = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let existing_byte_len: usize = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(e) => match e.value.as_hash() {
             None => return resp_wrongtype(),
@@ -2128,9 +2143,9 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::Hash(HashMap::new()),
             hits: AtomicU64::new(0),
@@ -2155,18 +2170,18 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let new_size = Db::entry_size(&ns, &key, new_byte_len);
     let delta = new_size.saturating_sub(old_size);
     db.used_bytes = db.used_bytes.saturating_add(delta);
-    let nb = db.namespace_bytes.entry(ns.clone()).or_insert(0);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(delta);
     let ns_bytes = *nb;
-    let ns_keys = db.entries.get(&ns).map(|m| m.len()).unwrap_or(0);
-    metrics::gauge!("kvns_keys_total", "namespace" => ns.clone()).set(ns_keys as f64);
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.clone()).set(ns_bytes as f64);
+    let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
+    metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
 
     resp_int(new_fields)
 }
 
-async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -2174,7 +2189,7 @@ async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let field = &args[2];
     let (resp, expired, field_found, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_null(), false, false, false),
             Some(entry) if entry.is_expired() => (resp_null(), true, false, false),
             Some(entry) => match entry.value.as_hash() {
@@ -2196,7 +2211,7 @@ async fn cmd_hget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -2205,14 +2220,14 @@ async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_hash_mut() {
             None => resp_wrongtype(),
@@ -2229,7 +2244,7 @@ async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_hexists(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hexists(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -2238,14 +2253,14 @@ async fn cmd_hexists(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_hash() {
             None => resp_wrongtype(),
@@ -2258,19 +2273,19 @@ async fn cmd_hexists(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u8> {
+async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let empty = if conn.resp_version >= 3 {
-        b"%0\r\n".to_vec()
+    let empty: std::borrow::Cow<'static, [u8]> = if conn.resp_version >= 3 {
+        std::borrow::Cow::Borrowed(b"%0\r\n")
     } else {
         resp_array(&[])
     };
     let (resp, expired, found, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (empty, false, false, false),
             Some(entry) if entry.is_expired() => (empty, true, false, false),
             Some(entry) => match entry.value.as_hash() {
@@ -2303,14 +2318,14 @@ async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u
     resp
 }
 
-async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired, found, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_hash() {
@@ -2332,14 +2347,14 @@ async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired, found, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_hash() {
@@ -2361,14 +2376,14 @@ async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_hlen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hlen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_int(0), false),
             Some(entry) if entry.is_expired() => (resp_int(0), true),
             Some(entry) => match entry.value.as_hash() {
@@ -2383,7 +2398,7 @@ async fn cmd_hlen(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -2392,7 +2407,7 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let nulls = resp_array_of_nulls(fields.len());
     let (resp, expired, found, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (nulls, false, false, false),
             Some(entry) if entry.is_expired() => (nulls, true, false, false),
             Some(entry) => match entry.value.as_hash() {
@@ -2406,7 +2421,7 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                             Some(v) => append_bulk(&mut out, v),
                         }
                     }
-                    (out, false, true, db.is_ear_namespace(&ns))
+                    (out.into(), false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2421,7 +2436,7 @@ async fn cmd_hmget(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -2437,14 +2452,14 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
 
-    let current: i64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(entry) => match entry.value.as_hash() {
             None => return resp_wrongtype(),
@@ -2466,9 +2481,9 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::Hash(HashMap::new()),
             hits: AtomicU64::new(0),
@@ -2483,7 +2498,7 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(next)
 }
 
-async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -2499,14 +2514,14 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
 
-    let current: f64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current: f64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0.0,
         Some(entry) => match entry.value.as_hash() {
             None => return resp_wrongtype(),
@@ -2528,9 +2543,9 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::Hash(HashMap::new()),
             hits: AtomicU64::new(0),
@@ -2545,7 +2560,7 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_bulk(&new_val)
 }
 
-async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 4 {
         return wrong_args(&args[0]);
     }
@@ -2566,7 +2581,7 @@ async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             Some(entry) if entry.is_expired() => {
                 let resp = if count_opt.is_some() {
                     resp_array(&[])
@@ -2641,7 +2656,7 @@ async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 // SET COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -2650,14 +2665,14 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
 
-    let existing_byte_len: usize = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let existing_byte_len: usize = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(e) => match e.value.as_set() {
             None => return resp_wrongtype(),
@@ -2671,9 +2686,9 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::Set(HashSet::new()),
             hits: AtomicU64::new(0),
@@ -2696,16 +2711,16 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let new_size = Db::entry_size(&ns, &key, new_byte_len);
     let delta = new_size.saturating_sub(old_size);
     db.used_bytes = db.used_bytes.saturating_add(delta);
-    let nb = db.namespace_bytes.entry(ns.clone()).or_insert(0);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(delta);
     let ns_bytes = *nb;
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.clone()).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
 
     resp_int(added)
 }
 
-async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -2714,14 +2729,14 @@ async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_set_mut() {
             None => resp_wrongtype(),
@@ -2738,14 +2753,14 @@ async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_set() {
@@ -2767,7 +2782,7 @@ async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -2775,14 +2790,14 @@ async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_set() {
             None => resp_wrongtype(),
@@ -2791,7 +2806,7 @@ async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -2799,7 +2814,7 @@ async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let member = &args[2];
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_int(0), false, false, false),
             Some(entry) if entry.is_expired() => (resp_int(0), true, false, false),
             Some(entry) => match entry.value.as_set() {
@@ -2825,7 +2840,7 @@ async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -2833,14 +2848,14 @@ async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let members = &args[2..];
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => {
                 let mut out = Vec::new();
                 append_array_header(&mut out, members.len());
                 for _ in members {
                     append_int(&mut out, 0);
                 }
-                (out, false, false, false)
+                (out.into(), false, false, false)
             }
             Some(entry) if entry.is_expired() => {
                 let mut out = Vec::new();
@@ -2848,7 +2863,7 @@ async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 for _ in members {
                     append_int(&mut out, 0);
                 }
-                (out, true, false, false)
+                (out.into(), true, false, false)
             }
             Some(entry) => match entry.value.as_set() {
                 None => (resp_wrongtype(), false, false, false),
@@ -2858,7 +2873,7 @@ async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                     for m in members {
                         append_int(&mut out, if s.contains(m.as_slice()) { 1 } else { 0 });
                     }
-                    (out, false, true, db.is_ear_namespace(&ns))
+                    (out.into(), false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2872,7 +2887,7 @@ async fn cmd_smismember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -2882,14 +2897,14 @@ async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let (ns, key) = parse_ns_key(raw_key);
         if db
             .entries
-            .get(&ns)
-            .and_then(|m| m.get(&key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(&ns, &key);
             continue;
         }
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => {}
             Some(entry) => match entry.value.as_set() {
                 None => return resp_wrongtype(),
@@ -2906,7 +2921,7 @@ async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_array(&members)
 }
 
-async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -2916,14 +2931,14 @@ async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let (ns, key) = parse_ns_key(raw_key);
         if db
             .entries
-            .get(&ns)
-            .and_then(|m| m.get(&key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(&ns, &key);
             return resp_array(&[]);
         }
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => return resp_array(&[]),
             Some(entry) => match entry.value.as_set() {
                 None => return resp_wrongtype(),
@@ -2954,17 +2969,17 @@ async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_array(&members)
 }
 
-async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
     let mut db = store.write().await;
-    let parsed: Vec<(String, String)> = args[1..].iter().map(|raw| parse_ns_key(raw)).collect();
+    let parsed: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = args[1..].iter().map(|raw| parse_ns_key(raw)).collect();
     for (idx, (ns, key)) in parsed.iter().enumerate() {
         if db
             .entries
-            .get(ns)
-            .and_then(|m| m.get(key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(ns, key);
@@ -2976,7 +2991,7 @@ async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let mut sets: Vec<Option<&HashSet<Vec<u8>>>> = Vec::new();
     for (idx, (ns, key)) in parsed.iter().enumerate() {
-        match db.entries.get(ns).and_then(|m| m.get(key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => {
                 if idx == 0 {
                     return resp_array(&[]);
@@ -3005,7 +3020,7 @@ async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_array(&members)
 }
 
-async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -3016,14 +3031,14 @@ async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let (ns, key) = parse_ns_key(raw_key);
         if db
             .entries
-            .get(&ns)
-            .and_then(|m| m.get(&key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(&ns, &key);
             continue;
         }
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => {}
             Some(entry) => match entry.value.as_set() {
                 None => return resp_wrongtype(),
@@ -3041,24 +3056,24 @@ async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         hits: AtomicU64::new(0),
         expiry: None,
     };
-    let m = db.put_deferred(dst_ns, dst_key, entry);
+    let m = db.put_deferred(dst_ns.as_ref(), dst_key.as_ref(), entry);
     drop(db);
     m.emit();
     resp_int(count)
 }
 
-async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
     let (dst_ns, dst_key) = parse_ns_key(&args[1]);
     let mut db = store.write().await;
-    let parsed: Vec<(String, String)> = args[2..].iter().map(|raw| parse_ns_key(raw)).collect();
+    let parsed: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = args[2..].iter().map(|raw| parse_ns_key(raw)).collect();
     for (ns, key) in &parsed {
         if db
             .entries
-            .get(ns)
-            .and_then(|m| m.get(key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(ns, key);
@@ -3068,7 +3083,7 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut sets: Vec<&HashSet<Vec<u8>>> = Vec::new();
     let mut empty = false;
     for (ns, key) in &parsed {
-        match db.entries.get(ns).and_then(|m| m.get(key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => {
                 empty = true;
                 break;
@@ -3101,8 +3116,8 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
     let count = result.len() as i64;
     let m = db.put_deferred(
-        dst_ns,
-        dst_key,
+        dst_ns.as_ref(),
+        dst_key.as_ref(),
         Entry {
             value: Value::Set(result),
             hits: AtomicU64::new(0),
@@ -3114,18 +3129,18 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(count)
 }
 
-async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
     let (dst_ns, dst_key) = parse_ns_key(&args[1]);
     let mut db = store.write().await;
-    let parsed: Vec<(String, String)> = args[2..].iter().map(|raw| parse_ns_key(raw)).collect();
+    let parsed: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = args[2..].iter().map(|raw| parse_ns_key(raw)).collect();
     for (ns, key) in &parsed {
         if db
             .entries
-            .get(ns)
-            .and_then(|m| m.get(key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(ns, key);
@@ -3134,7 +3149,7 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let mut sets: Vec<Option<&HashSet<Vec<u8>>>> = Vec::new();
     for (ns, key) in &parsed {
-        match db.entries.get(ns).and_then(|m| m.get(key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => sets.push(None),
             Some(entry) => match entry.value.as_set() {
                 None => return resp_wrongtype(),
@@ -3161,8 +3176,8 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     };
     let count = result.len() as i64;
     let m = db.put_deferred(
-        dst_ns,
-        dst_key,
+        dst_ns.as_ref(),
+        dst_key.as_ref(),
         Entry {
             value: Value::Set(result),
             hits: AtomicU64::new(0),
@@ -3174,7 +3189,7 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(count)
 }
 
-async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -3185,8 +3200,8 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
@@ -3195,8 +3210,8 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let found = match db
         .entries
-        .get_mut(&src_ns)
-        .and_then(|m| m.get_mut(&src_key))
+        .get_mut::<str>(src_ns.as_ref())
+        .and_then(|m| m.get_mut::<str>(src_key.as_ref()))
     {
         None => return resp_int(0),
         Some(entry) => match entry.value.as_set_mut() {
@@ -3212,8 +3227,8 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     // Insert into dst
     match db
         .entries
-        .get_mut(&dst_ns)
-        .and_then(|m| m.get_mut(&dst_key))
+        .get_mut::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get_mut::<str>(dst_key.as_ref()))
     {
         Some(entry) => match entry.value.as_set_mut() {
             Some(s) => {
@@ -3224,8 +3239,9 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => {
             let mut s = HashSet::new();
             s.insert(member);
-            db.entries.entry(dst_ns.clone()).or_default().insert(
-                dst_key.clone(),
+            db.entries.entry(dst_ns.clone().into_owned()).or_default().
+insert(
+                dst_key.clone().into_owned(),
                 Entry {
                     value: Value::Set(s),
                     hits: AtomicU64::new(0),
@@ -3237,7 +3253,7 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(1)
 }
 
-async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 3 {
         return wrong_args(&args[0]);
     }
@@ -3257,8 +3273,8 @@ async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
@@ -3269,7 +3285,7 @@ async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         };
     }
 
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => {
             if count.is_some() {
                 resp_array(&[])
@@ -3302,7 +3318,7 @@ async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 3 {
         return wrong_args(&args[0]);
     }
@@ -3322,8 +3338,8 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
@@ -3334,7 +3350,7 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         };
     }
 
-    let (resp, mark) = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let (resp, mark) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => {
             if count_opt.is_some() {
                 (resp_array(&[]), false)
@@ -3387,7 +3403,7 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 // ZSET COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 {
         return wrong_args(&args[0]);
     }
@@ -3442,14 +3458,14 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
     // Validate type
-    if let Some(e) = db.entries.get(&ns).and_then(|m| m.get(&key))
+    if let Some(e) = db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref()))
         && e.value.as_zset().is_none()
     {
         return resp_wrongtype();
@@ -3488,9 +3504,9 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     for (score, member) in pairs {
         let entry = db
             .entries
-            .entry(ns.clone())
+            .entry(ns.clone().into_owned())
             .or_default()
-            .entry(key.clone())
+            .entry(key.clone().into_owned())
             .or_insert_with(|| Entry {
                 value: Value::ZSet(ZSetData::default()),
                 hits: AtomicU64::new(0),
@@ -3558,7 +3574,7 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 {
         return wrong_args(&args[0]);
     }
@@ -3607,7 +3623,7 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_zset() {
@@ -3817,7 +3833,7 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 {
         return wrong_args(&args[0]);
     }
@@ -3862,7 +3878,7 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_zset() {
@@ -3913,7 +3929,7 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 {
         return wrong_args(&args[0]);
     }
@@ -3958,7 +3974,7 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_zset() {
@@ -4009,7 +4025,7 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 {
         return wrong_args(&args[0]);
     }
@@ -4029,7 +4045,7 @@ async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             Some(entry) => match entry.value.as_zset() {
@@ -4076,7 +4092,7 @@ async fn cmd_zrevrange(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 || args.len() > 4 {
         return wrong_args(&args[0]);
     }
@@ -4101,11 +4117,11 @@ async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             let rank = zset.sorted.partition_point(|e| {
                 e.score < score || (e.score == score && e.member.as_slice() < member.as_slice())
             });
-            let resp = if withscore {
+            let resp: std::borrow::Cow<'static, [u8]> = if withscore {
                 let mut out = b"*2\r\n".to_vec();
                 out.extend_from_slice(&resp_int(rank as i64));
                 out.extend_from_slice(&resp_bulk(&format_score(score)));
-                out
+                out.into()
             } else {
                 resp_int(rank as i64)
             };
@@ -4118,7 +4134,7 @@ async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 || args.len() > 4 {
         return wrong_args(&args[0]);
     }
@@ -4144,11 +4160,11 @@ async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 e.score < score || (e.score == score && e.member.as_slice() < member.as_slice())
             });
             let rev_rank = zset.sorted.len() - 1 - rank;
-            let resp = if withscore {
+            let resp: std::borrow::Cow<'static, [u8]> = if withscore {
                 let mut out = b"*2\r\n".to_vec();
                 out.extend_from_slice(&resp_int(rev_rank as i64));
                 out.extend_from_slice(&resp_bulk(&format_score(score)));
-                out
+                out.into()
             } else {
                 resp_int(rev_rank as i64)
             };
@@ -4161,7 +4177,7 @@ async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -4189,7 +4205,7 @@ async fn cmd_zscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zmscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zmscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -4219,10 +4235,10 @@ async fn cmd_zmscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             Some(&score) => append_bulk(&mut out, &format_score(score)),
         }
     }
-    out
+    out.into()
 }
 
-async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -4231,14 +4247,14 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
@@ -4261,7 +4277,7 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -4269,14 +4285,14 @@ async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
@@ -4285,7 +4301,7 @@ async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -4301,14 +4317,14 @@ async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
@@ -4336,7 +4352,7 @@ async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -4352,14 +4368,14 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
     }
 
-    let current_score: f64 = match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    let current_score: f64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0.0,
         Some(entry) => match entry.value.as_zset() {
             None => return resp_wrongtype(),
@@ -4370,9 +4386,9 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let new_score = current_score + by;
     let entry = db
         .entries
-        .entry(ns.clone())
+        .entry(ns.clone().into_owned())
         .or_default()
-        .entry(key.clone())
+        .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
             value: Value::ZSet(ZSetData::default()),
             hits: AtomicU64::new(0),
@@ -4387,7 +4403,7 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_bulk(&format_score(new_score))
 }
 
-async fn cmd_zrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 4 {
         return wrong_args(&args[0]);
     }
@@ -4422,7 +4438,7 @@ async fn cmd_zrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
             None => (resp_array(&[]), false, false, false),
             Some(entry) => match entry.value.as_zset() {
@@ -4458,7 +4474,7 @@ async fn cmd_zrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -4474,14 +4490,14 @@ async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
@@ -4497,7 +4513,7 @@ async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -4519,14 +4535,14 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
@@ -4559,7 +4575,7 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -4575,14 +4591,14 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
@@ -4614,7 +4630,7 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 4 {
         return wrong_args(&args[0]);
     }
@@ -4630,14 +4646,14 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
@@ -4661,7 +4677,7 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 3 {
         return wrong_args(&args[0]);
     }
@@ -4681,14 +4697,14 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_array(&[]),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
@@ -4709,7 +4725,7 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 3 {
         return wrong_args(&args[0]);
     }
@@ -4729,14 +4745,14 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_array(&[]),
         Some(entry) => match entry.value.as_zset_mut() {
             None => resp_wrongtype(),
@@ -4757,7 +4773,7 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 || args.len() > 4 {
         return wrong_args(&args[0]);
     }
@@ -4778,7 +4794,7 @@ async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             Some(entry) if entry.is_expired() => {
                 let resp = if count_opt.is_some() {
                     resp_array(&[])
@@ -4851,7 +4867,7 @@ async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 // GENERIC KEY COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn cmd_del(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_del(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -4866,7 +4882,7 @@ async fn cmd_del(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(count)
 }
 
-async fn cmd_exists(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_exists(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -4876,9 +4892,9 @@ async fn cmd_exists(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let mut expired_keys: Vec<(String, String)> = Vec::new();
         for raw_key in &args[1..] {
             let (ns, key) = parse_ns_key(raw_key);
-            match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
                 None => {}
-                Some(entry) if entry.is_expired() => expired_keys.push((ns, key)),
+                Some(entry) if entry.is_expired() => expired_keys.push((ns.as_ref().to_owned(), key.as_ref().to_owned())),
                 Some(_) => count += 1,
             }
         }
@@ -4888,18 +4904,20 @@ async fn cmd_exists(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(count)
 }
 
-async fn cmd_type(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_type(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
-            None => (b"+none\r\n".to_vec(), false),
-            Some(entry) if entry.is_expired() => (b"+none\r\n".to_vec(), true),
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => (std::borrow::Cow::Borrowed(b"+none\r\n" as &[u8]), false),
+            Some(entry) if entry.is_expired() => {
+                (std::borrow::Cow::Borrowed(b"+none\r\n" as &[u8]), true)
+            }
             Some(entry) => (
-                format!("+{}\r\n", entry.value.type_name()).into_bytes(),
+                std::borrow::Cow::Owned(format!("+{}\r\n", entry.value.type_name()).into_bytes()),
                 false,
             ),
         }
@@ -4910,14 +4928,14 @@ async fn cmd_type(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_ttl(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_ttl(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_int(-2), false),
             Some(entry) if entry.is_expired() => (resp_int(-2), true),
             Some(entry) => (resp_int(entry.time_to_expiry_secs()), false),
@@ -4929,14 +4947,14 @@ async fn cmd_ttl(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_pttl(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_pttl(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let (resp, expired) = {
         let db = store.read().await;
-        match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_int(-2), false),
             Some(entry) if entry.is_expired() => (resp_int(-2), true),
             Some(entry) => (resp_int(entry.time_to_expiry_ms()), false),
@@ -4948,7 +4966,7 @@ async fn cmd_pttl(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp
 }
 
-async fn cmd_expire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_expire(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -4967,14 +4985,14 @@ async fn cmd_expire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    let entry = match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    let entry = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => return resp_int(0),
         Some(e) => e,
     };
@@ -5000,11 +5018,11 @@ async fn cmd_expire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     entry.expiry = Some(new_expiry);
     let deadline = new_expiry;
     drop(db);
-    schedule_expiry(store, ns, key, deadline);
+    schedule_expiry(store, ns.as_ref(), key.as_ref(), deadline);
     resp_int(1)
 }
 
-async fn cmd_expireat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_expireat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -5029,14 +5047,14 @@ async fn cmd_expireat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    let entry = match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    let entry = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => return resp_int(0),
         Some(e) => e,
     };
@@ -5060,11 +5078,11 @@ async fn cmd_expireat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     entry.expiry = Some(new_expiry);
     let deadline = new_expiry;
     drop(db);
-    schedule_expiry(store, ns, key, deadline);
+    schedule_expiry(store, ns.as_ref(), key.as_ref(), deadline);
     resp_int(1)
 }
 
-async fn cmd_pexpire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_pexpire(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -5085,14 +5103,14 @@ async fn cmd_pexpire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    let entry = match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    let entry = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => return resp_int(0),
         Some(e) => e,
     };
@@ -5116,11 +5134,11 @@ async fn cmd_pexpire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     entry.expiry = Some(new_expiry);
     let deadline = new_expiry;
     drop(db);
-    schedule_expiry(store, ns, key, deadline);
+    schedule_expiry(store, ns.as_ref(), key.as_ref(), deadline);
     resp_int(1)
 }
 
-async fn cmd_pexpireat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_pexpireat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -5145,14 +5163,14 @@ async fn cmd_pexpireat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    let entry = match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    let entry = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => return resp_int(0),
         Some(e) => e,
     };
@@ -5176,11 +5194,11 @@ async fn cmd_pexpireat(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     entry.expiry = Some(new_expiry);
     let deadline = new_expiry;
     drop(db);
-    schedule_expiry(store, ns, key, deadline);
+    schedule_expiry(store, ns.as_ref(), key.as_ref(), deadline);
     resp_int(1)
 }
 
-async fn cmd_persist(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_persist(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -5188,14 +5206,14 @@ async fn cmd_persist(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => {
             if entry.expiry.is_none() {
@@ -5208,7 +5226,7 @@ async fn cmd_persist(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_expiretime(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_expiretime(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -5216,14 +5234,14 @@ async fn cmd_expiretime(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(-2);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(-2),
         Some(entry) => match entry.expiry {
             None => resp_int(-1),
@@ -5249,7 +5267,7 @@ async fn cmd_expiretime(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_pexpiretime(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_pexpiretime(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -5257,14 +5275,14 @@ async fn cmd_pexpiretime(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     let mut db = store.write().await;
     if db
         .entries
-        .get(&ns)
-        .and_then(|m| m.get(&key))
+        .get::<str>(ns.as_ref())
+        .and_then(|m| m.get::<str>(key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
         return resp_int(-2);
     }
-    match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(-2),
         Some(entry) => match entry.expiry {
             None => resp_int(-1),
@@ -5290,7 +5308,7 @@ async fn cmd_pexpiretime(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_rename(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_rename(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -5300,8 +5318,8 @@ async fn cmd_rename(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
@@ -5312,13 +5330,13 @@ async fn cmd_rename(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         None => return resp_err("ERR no such key"),
         Some(e) => e,
     };
-    let m = db.put_deferred(dst_ns, dst_key, entry);
+    let m = db.put_deferred(dst_ns.as_ref(), dst_key.as_ref(), entry);
     drop(db);
     m.emit();
     resp_ok()
 }
 
-async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 3 {
         return wrong_args(&args[0]);
     }
@@ -5328,8 +5346,8 @@ async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
@@ -5337,8 +5355,8 @@ async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
     if db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_none()
     {
         return resp_err("ERR no such key");
@@ -5346,29 +5364,29 @@ async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&dst_ns)
-        .and_then(|m| m.get(&dst_key))
+        .get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&dst_ns, &dst_key);
     }
     if db
         .entries
-        .get(&dst_ns)
-        .and_then(|m| m.get(&dst_key))
+        .get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
         .is_some()
     {
         return resp_int(0);
     }
 
     let entry = db.delete(&src_ns, &src_key).unwrap();
-    let m = db.put_deferred(dst_ns, dst_key, entry);
+    let m = db.put_deferred(dst_ns.as_ref(), dst_key.as_ref(), entry);
     drop(db);
     m.emit();
     resp_int(1)
 }
 
-async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5458,10 +5476,10 @@ async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     for item in &page {
         append_bulk(&mut out, item);
     }
-    out
+    out.into()
 }
 
-pub(crate) async fn cmd_keys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+pub(crate) async fn cmd_keys(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -5488,7 +5506,7 @@ pub(crate) async fn cmd_keys(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_array(&matched)
 }
 
-pub(crate) async fn cmd_touch(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+pub(crate) async fn cmd_touch(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5498,14 +5516,14 @@ pub(crate) async fn cmd_touch(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let (ns, key) = parse_ns_key(raw_key);
         if db
             .entries
-            .get(&ns)
-            .and_then(|m| m.get(&key))
+            .get::<str>(ns.as_ref())
+            .and_then(|m| m.get::<str>(key.as_ref()))
             .is_some_and(|e| e.is_expired())
         {
             db.delete(&ns, &key);
             continue;
         }
-        if let Some(entry) = db.entries.get_mut(&ns).and_then(|m| m.get_mut(&key)) {
+        if let Some(entry) = db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
             entry.hits.store(0, std::sync::atomic::Ordering::Relaxed);
             count += 1;
         }
@@ -5513,7 +5531,7 @@ pub(crate) async fn cmd_touch(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(count)
 }
 
-async fn cmd_copy(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_copy(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 3 {
         return wrong_args(&args[0]);
     }
@@ -5526,28 +5544,28 @@ async fn cmd_copy(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 
     if db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
         return resp_int(0);
     }
 
-    let src_value = match db.entries.get(&src_ns).and_then(|m| m.get(&src_key)) {
+    let src_value = match db.entries.get::<str>(src_ns.as_ref()).and_then(|m| m.get::<str>(src_key.as_ref())) {
         None => return resp_int(0),
         Some(e) => e.value.clone(),
     };
     let src_expiry = db
         .entries
-        .get(&src_ns)
-        .and_then(|m| m.get(&src_key))
+        .get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
         .and_then(|e| e.expiry);
 
     if db
         .entries
-        .get(&dst_ns)
-        .and_then(|m| m.get(&dst_key))
+        .get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&dst_ns, &dst_key);
@@ -5556,8 +5574,8 @@ async fn cmd_copy(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if !replace
         && db
             .entries
-            .get(&dst_ns)
-            .and_then(|m| m.get(&dst_key))
+            .get::<str>(dst_ns.as_ref())
+            .and_then(|m| m.get::<str>(dst_key.as_ref()))
             .is_some()
     {
         return resp_int(0);
@@ -5568,18 +5586,18 @@ async fn cmd_copy(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
         hits: AtomicU64::new(0),
         expiry: src_expiry,
     };
-    let m = db.put_deferred(dst_ns.clone(), dst_key.clone(), new_entry);
+    let m = db.put_deferred(dst_ns.as_ref(), dst_key.as_ref(), new_entry);
     drop(db);
     m.emit();
 
     if let Some(deadline) = src_expiry {
-        schedule_expiry(store, dst_ns, dst_key, deadline);
+        schedule_expiry(store, dst_ns.as_ref(), dst_key.as_ref(), deadline);
     }
 
     resp_int(1)
 }
 
-async fn cmd_object(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_object(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5591,7 +5609,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             }
             let (ns, key) = parse_ns_key(&args[2]);
             let db = store.read().await;
-            match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
                 None => resp_null(),
                 Some(entry) => {
                     let enc = match &entry.value {
@@ -5612,7 +5630,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
             }
             let (ns, key) = parse_ns_key(&args[2]);
             let db = store.read().await;
-            match db.entries.get(&ns).and_then(|m| m.get(&key)) {
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
                 None => resp_null(),
                 Some(entry) => {
                     resp_int(entry.hits.load(std::sync::atomic::Ordering::Relaxed) as i64)
@@ -5632,7 +5650,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_unlink(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_unlink(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     // Same as DEL
     cmd_del(args, store).await
 }
@@ -5641,7 +5659,7 @@ async fn cmd_unlink(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
 // SERVER COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn cmd_hello(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> Vec<u8> {
+async fn cmd_hello(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> std::borrow::Cow<'static, [u8]> {
     let version: u8 = if args.len() >= 2 {
         match std::str::from_utf8(&args[1])
             .ok()
@@ -5691,13 +5709,13 @@ async fn cmd_hello(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> Ve
     }
 }
 
-fn cmd_reset(conn: &mut ConnState) -> Vec<u8> {
+fn cmd_reset(conn: &mut ConnState) -> std::borrow::Cow<'static, [u8]> {
     conn.resp_version = 2;
     conn.client_name = None;
-    b"+RESET\r\n".to_vec()
+    std::borrow::Cow::Borrowed(b"+RESET\r\n")
 }
 
-async fn cmd_select(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_select(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 2 {
         return wrong_args(&args[0]);
     }
@@ -5715,7 +5733,7 @@ async fn cmd_select(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_dbsize(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_dbsize(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() != 1 {
         return wrong_args(&args[0]);
     }
@@ -5723,19 +5741,19 @@ async fn cmd_dbsize(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     resp_int(db.total_keys() as i64)
 }
 
-async fn cmd_flushdb(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_flushdb(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     let _ = args;
     store.write().await.flush_all();
     resp_ok()
 }
 
-async fn cmd_flushall(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
+async fn cmd_flushall(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     let _ = args;
     store.write().await.flush_all();
     resp_ok()
 }
 
-async fn cmd_info(_args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u8> {
+async fn cmd_info(_args: &[Vec<u8>], store: &Store, conn: &ConnState) -> std::borrow::Cow<'static, [u8]> {
     let db = store.read().await;
     let used = db.used_bytes;
     let total_keys = db.total_keys();
@@ -5756,7 +5774,7 @@ async fn cmd_info(_args: &[Vec<u8>], store: &Store, conn: &ConnState) -> Vec<u8>
     }
 }
 
-async fn cmd_config(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_config(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5770,7 +5788,7 @@ async fn cmd_config(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_command(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_command(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() == 1 {
         return resp_array(&[]);
     }
@@ -5784,7 +5802,7 @@ async fn cmd_command(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_client(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> Vec<u8> {
+async fn cmd_client(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5830,7 +5848,7 @@ async fn cmd_client(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> V
     }
 }
 
-async fn cmd_latency(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_latency(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5843,7 +5861,7 @@ async fn cmd_latency(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_slowlog(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_slowlog(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5856,7 +5874,7 @@ async fn cmd_slowlog(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_debug(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_debug(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
@@ -5877,11 +5895,11 @@ async fn cmd_debug(args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
     }
 }
 
-async fn cmd_wait(_args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_wait(_args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     resp_int(0)
 }
 
-async fn cmd_xadd(_args: &[Vec<u8>], _store: &Store) -> Vec<u8> {
+async fn cmd_xadd(_args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static, [u8]> {
     resp_err("stream type not supported")
 }
 
@@ -5893,7 +5911,7 @@ pub(crate) async fn dispatch(
     args: &[Vec<u8>],
     store: &Store,
     conn: &mut ConnState,
-) -> (Vec<u8>, bool) {
+) -> (std::borrow::Cow<'static, [u8]>, bool) {
     if args.is_empty() {
         return (resp_err("empty command"), false);
     }
@@ -6045,11 +6063,9 @@ pub(crate) async fn dispatch(
         b"WAIT" => cmd_wait(args, store).await,
         b"XADD" => cmd_xadd(args, store).await,
 
-        _ => format!(
-            "-ERR unknown command {}\r\n",
-            String::from_utf8_lossy(&args[0])
-        )
-        .into_bytes(),
+        _ => std::borrow::Cow::Owned(
+            format!("-ERR unknown command {}\r\n", String::from_utf8_lossy(&args[0])).into_bytes(),
+        ),
     };
     (resp, false)
 }
@@ -6138,7 +6154,7 @@ mod tests {
         let store = make_store();
         let mut conn = make_conn();
         let (resp, quit) = dispatch(&args(&["PING"]), &store, &mut conn).await;
-        assert_eq!(resp, b"+PONG\r\n");
+        assert_eq!(&*resp, b"+PONG\r\n");
         assert!(!quit);
     }
 
@@ -6147,7 +6163,7 @@ mod tests {
         let store = make_store();
         let mut conn = make_conn();
         let (resp, _) = dispatch(&args(&["ping"]), &store, &mut conn).await;
-        assert_eq!(resp, b"+PONG\r\n");
+        assert_eq!(&*resp, b"+PONG\r\n");
     }
 
     #[tokio::test]
@@ -6155,7 +6171,7 @@ mod tests {
         let store = make_store();
         let mut conn = make_conn();
         let (resp, quit) = dispatch(&args(&["QUIT"]), &store, &mut conn).await;
-        assert_eq!(resp, b"+OK\r\n");
+        assert_eq!(&*resp, b"+OK\r\n");
         assert!(quit);
     }
 
@@ -6174,11 +6190,11 @@ mod tests {
     async fn set_and_get_roundtrip() {
         let store = make_store();
         assert_eq!(
-            cmd_set(&args(&["SET", "k", "hello"]), &store).await,
+            &*(cmd_set(&args(&["SET", "k", "hello"]), &store).await),
             b"+OK\r\n"
         );
         assert_eq!(
-            cmd_get(&args(&["GET", "k"]), &store).await,
+            &*(cmd_get(&args(&["GET", "k"]), &store).await),
             b"$5\r\nhello\r\n"
         );
     }
@@ -6189,7 +6205,7 @@ mod tests {
         cmd_set(&args(&["SET", "k", "first"]), &store).await;
         cmd_set(&args(&["SET", "k", "second"]), &store).await;
         assert_eq!(
-            cmd_get(&args(&["GET", "k"]), &store).await,
+            &*(cmd_get(&args(&["GET", "k"]), &store).await),
             b"$6\r\nsecond\r\n"
         );
     }
@@ -6238,7 +6254,7 @@ mod tests {
     async fn get_missing_key_returns_null() {
         let store = make_store();
         assert_eq!(
-            cmd_get(&args(&["GET", "missing"]), &store).await,
+            &*(cmd_get(&args(&["GET", "missing"]), &store).await),
             b"$-1\r\n"
         );
     }
@@ -6283,7 +6299,7 @@ mod tests {
     async fn del_existing_key_returns_1() {
         let store = make_store();
         cmd_set(&args(&["SET", "k", "v"]), &store).await;
-        assert_eq!(cmd_del(&args(&["DEL", "k"]), &store).await, b":1\r\n");
+        assert_eq!(&*(cmd_del(&args(&["DEL", "k"]), &store).await), b":1\r\n");
     }
 
     #[tokio::test]
@@ -6291,13 +6307,13 @@ mod tests {
         let store = make_store();
         cmd_set(&args(&["SET", "k", "v"]), &store).await;
         cmd_del(&args(&["DEL", "k"]), &store).await;
-        assert_eq!(cmd_get(&args(&["GET", "k"]), &store).await, b"$-1\r\n");
+        assert_eq!(&*(cmd_get(&args(&["GET", "k"]), &store).await), b"$-1\r\n");
     }
 
     #[tokio::test]
     async fn del_missing_key_returns_0() {
         let store = make_store();
-        assert_eq!(cmd_del(&args(&["DEL", "nope"]), &store).await, b":0\r\n");
+        assert_eq!(&*(cmd_del(&args(&["DEL", "nope"]), &store).await), b":0\r\n");
     }
 
     #[tokio::test]
@@ -6324,14 +6340,14 @@ mod tests {
     #[tokio::test]
     async fn ttl_missing_key_returns_minus2() {
         let store = make_store();
-        assert_eq!(cmd_ttl(&args(&["TTL", "nope"]), &store).await, b":-2\r\n");
+        assert_eq!(&*(cmd_ttl(&args(&["TTL", "nope"]), &store).await), b":-2\r\n");
     }
 
     #[tokio::test]
     async fn ttl_key_without_expiry_returns_minus1() {
         let store = make_store();
         cmd_set(&args(&["SET", "k", "v"]), &store).await;
-        assert_eq!(cmd_ttl(&args(&["TTL", "k"]), &store).await, b":-1\r\n");
+        assert_eq!(&*(cmd_ttl(&args(&["TTL", "k"]), &store).await), b":-1\r\n");
     }
 
     #[tokio::test]
@@ -6347,7 +6363,7 @@ mod tests {
     async fn incr_creates_key_with_value_1() {
         let store = make_store();
         assert_eq!(
-            cmd_incr(&args(&["INCR", "counter"]), &store).await,
+            &*(cmd_incr(&args(&["INCR", "counter"]), &store).await),
             b":1\r\n"
         );
     }
@@ -6357,7 +6373,7 @@ mod tests {
         let store = make_store();
         cmd_set(&args(&["SET", "counter", "5"]), &store).await;
         assert_eq!(
-            cmd_incr(&args(&["INCR", "counter"]), &store).await,
+            &*(cmd_incr(&args(&["INCR", "counter"]), &store).await),
             b":6\r\n"
         );
     }
@@ -6390,7 +6406,7 @@ mod tests {
         let r2 = cmd_append(&args(&["APPEND", "k", " world"]), &store).await;
         assert_eq!(parse_int_resp(&r2), 11);
         assert_eq!(
-            cmd_get(&args(&["GET", "k"]), &store).await,
+            &*(cmd_get(&args(&["GET", "k"]), &store).await),
             b"$11\r\nhello world\r\n"
         );
     }
@@ -6416,7 +6432,7 @@ mod tests {
     async fn lpush_creates_list() {
         let store = make_store();
         assert_eq!(
-            cmd_lpush(&args(&["LPUSH", "mylist", "a"]), &store).await,
+            &*(cmd_lpush(&args(&["LPUSH", "mylist", "a"]), &store).await),
             b":1\r\n"
         );
     }
@@ -6435,7 +6451,7 @@ mod tests {
         let store = make_store();
         cmd_rpush(&args(&["RPUSH", "list", "a", "b", "c"]), &store).await;
         let resp = cmd_rpop(&args(&["RPOP", "list"]), &store).await;
-        assert_eq!(resp, b"$1\r\nc\r\n");
+        assert_eq!(&*resp, b"$1\r\nc\r\n");
     }
 
     #[tokio::test]
@@ -6474,7 +6490,7 @@ mod tests {
         let resp = cmd_hset(&args(&["HSET", "myhash", "field1", "value1"]), &store).await;
         assert_eq!(parse_int_resp(&resp), 1);
         let resp = cmd_hget(&args(&["HGET", "myhash", "field1"]), &store).await;
-        assert_eq!(resp, b"$6\r\nvalue1\r\n");
+        assert_eq!(&*resp, b"$6\r\nvalue1\r\n");
     }
 
     #[tokio::test]
@@ -6499,7 +6515,7 @@ mod tests {
         let store = make_store();
         cmd_hset(&args(&["HSET", "h", "f", "v"]), &store).await;
         let resp = cmd_hget(&args(&["HGET", "h", "nofield"]), &store).await;
-        assert_eq!(resp, b"$-1\r\n");
+        assert_eq!(&*resp, b"$-1\r\n");
     }
 
     // ── SADD / SMEMBERS ──────────────────────────────────────────────────────
@@ -6561,15 +6577,15 @@ mod tests {
         cmd_zadd(&args(&["ZADD", "z", "1", "v"]), &store).await;
 
         assert_eq!(
-            cmd_type(&args(&["TYPE", "s"]), &store).await,
+            &*(cmd_type(&args(&["TYPE", "s"]), &store).await),
             b"+string\r\n"
         );
-        assert_eq!(cmd_type(&args(&["TYPE", "l"]), &store).await, b"+list\r\n");
-        assert_eq!(cmd_type(&args(&["TYPE", "h"]), &store).await, b"+hash\r\n");
-        assert_eq!(cmd_type(&args(&["TYPE", "st"]), &store).await, b"+set\r\n");
-        assert_eq!(cmd_type(&args(&["TYPE", "z"]), &store).await, b"+zset\r\n");
+        assert_eq!(&*(cmd_type(&args(&["TYPE", "l"]), &store).await), b"+list\r\n");
+        assert_eq!(&*(cmd_type(&args(&["TYPE", "h"]), &store).await), b"+hash\r\n");
+        assert_eq!(&*(cmd_type(&args(&["TYPE", "st"]), &store).await), b"+set\r\n");
+        assert_eq!(&*(cmd_type(&args(&["TYPE", "z"]), &store).await), b"+zset\r\n");
         assert_eq!(
-            cmd_type(&args(&["TYPE", "missing"]), &store).await,
+            &*(cmd_type(&args(&["TYPE", "missing"]), &store).await),
             b"+none\r\n"
         );
     }
@@ -6651,13 +6667,13 @@ mod tests {
         let store = make_store();
         cmd_set(&args(&["SET", "k", "v", "PX", "20"]), &store).await;
         assert_eq!(
-            cmd_persist(&args(&["PERSIST", "k"]), &store).await,
+            &*(cmd_persist(&args(&["PERSIST", "k"]), &store).await),
             b":1\r\n"
         );
 
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        assert_eq!(cmd_get(&args(&["GET", "k"]), &store).await, b"$1\r\nv\r\n");
+        assert_eq!(&*(cmd_get(&args(&["GET", "k"]), &store).await), b"$1\r\nv\r\n");
     }
 
     #[tokio::test]
@@ -6665,13 +6681,13 @@ mod tests {
         let store = make_store();
         cmd_set(&args(&["SET", "k", "v", "PX", "20"]), &store).await;
         assert_eq!(
-            cmd_pexpire(&args(&["PEXPIRE", "k", "120"]), &store).await,
+            &*(cmd_pexpire(&args(&["PEXPIRE", "k", "120"]), &store).await),
             b":1\r\n"
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(cmd_get(&args(&["GET", "k"]), &store).await, b"$1\r\nv\r\n");
+        assert_eq!(&*(cmd_get(&args(&["GET", "k"]), &store).await), b"$1\r\nv\r\n");
     }
 
     // ── Namespace tests ───────────────────────────────────────────────────────
@@ -6682,11 +6698,11 @@ mod tests {
         cmd_set(&args(&["SET", "ns1/k", "v1"]), &store).await;
         cmd_set(&args(&["SET", "ns2/k", "v2"]), &store).await;
         assert_eq!(
-            cmd_get(&args(&["GET", "ns1/k"]), &store).await,
+            &*(cmd_get(&args(&["GET", "ns1/k"]), &store).await),
             b"$2\r\nv1\r\n"
         );
         assert_eq!(
-            cmd_get(&args(&["GET", "ns2/k"]), &store).await,
+            &*(cmd_get(&args(&["GET", "ns2/k"]), &store).await),
             b"$2\r\nv2\r\n"
         );
     }
@@ -6697,9 +6713,9 @@ mod tests {
         cmd_set(&args(&["SET", "ns1/k", "v1"]), &store).await;
         cmd_set(&args(&["SET", "ns2/k", "v2"]), &store).await;
         cmd_del(&args(&["DEL", "ns1/k"]), &store).await;
-        assert_eq!(cmd_get(&args(&["GET", "ns1/k"]), &store).await, b"$-1\r\n");
+        assert_eq!(&*(cmd_get(&args(&["GET", "ns1/k"]), &store).await), b"$-1\r\n");
         assert_eq!(
-            cmd_get(&args(&["GET", "ns2/k"]), &store).await,
+            &*(cmd_get(&args(&["GET", "ns2/k"]), &store).await),
             b"$2\r\nv2\r\n"
         );
     }
@@ -6711,11 +6727,11 @@ mod tests {
         cmd_incr(&args(&["INCR", "ns1/counter"]), &store).await;
         cmd_incr(&args(&["INCR", "ns2/counter"]), &store).await;
         assert_eq!(
-            cmd_incr(&args(&["INCR", "ns1/counter"]), &store).await,
+            &*(cmd_incr(&args(&["INCR", "ns1/counter"]), &store).await),
             b":3\r\n"
         );
         assert_eq!(
-            cmd_incr(&args(&["INCR", "ns2/counter"]), &store).await,
+            &*(cmd_incr(&args(&["INCR", "ns2/counter"]), &store).await),
             b":2\r\n"
         );
     }
@@ -6726,11 +6742,11 @@ mod tests {
         cmd_lpush(&args(&["LPUSH", "ns1/list", "a"]), &store).await;
         cmd_lpush(&args(&["LPUSH", "ns2/list", "b"]), &store).await;
         assert_eq!(
-            cmd_lpush(&args(&["LPUSH", "ns1/list", "c"]), &store).await,
+            &*(cmd_lpush(&args(&["LPUSH", "ns1/list", "c"]), &store).await),
             b":2\r\n"
         );
         assert_eq!(
-            cmd_lpush(&args(&["LPUSH", "ns2/list", "d"]), &store).await,
+            &*(cmd_lpush(&args(&["LPUSH", "ns2/list", "d"]), &store).await),
             b":2\r\n"
         );
     }
@@ -6743,7 +6759,7 @@ mod tests {
         let secs = parse_int_resp(&cmd_ttl(&args(&["TTL", "ns1/k"]), &store).await);
         assert!(secs > 0, "ns1/k should have TTL");
         // ns2/k has no expiry -> -1
-        assert_eq!(cmd_ttl(&args(&["TTL", "ns2/k"]), &store).await, b":-1\r\n");
+        assert_eq!(&*(cmd_ttl(&args(&["TTL", "ns2/k"]), &store).await), b":-1\r\n");
     }
 
     #[tokio::test]
@@ -6818,7 +6834,7 @@ mod tests {
     #[tokio::test]
     async fn keys_empty_store_returns_empty_array() {
         let store = make_store();
-        assert_eq!(cmd_keys(&args(&["KEYS", "*"]), &store).await, b"*0\r\n");
+        assert_eq!(&*(cmd_keys(&args(&["KEYS", "*"]), &store).await), b"*0\r\n");
     }
 
     #[tokio::test]
@@ -6856,7 +6872,7 @@ mod tests {
     async fn keys_no_match_returns_empty_array() {
         let store = make_store();
         cmd_set(&args(&["SET", "foo", "1"]), &store).await;
-        assert_eq!(cmd_keys(&args(&["KEYS", "z*"]), &store).await, b"*0\r\n");
+        assert_eq!(&*(cmd_keys(&args(&["KEYS", "z*"]), &store).await), b"*0\r\n");
     }
 
     #[tokio::test]
@@ -6970,8 +6986,8 @@ mod tests {
                 if db.ear_pending.contains(&(ns.clone(), key.clone()))
                     && db
                         .entries
-                        .get(ns)
-                        .and_then(|m| m.get(key.as_str()))
+                        .get::<str>(ns.as_ref())
+                        .and_then(|m| m.get::<str>(key.as_ref()))
                         .is_some_and(|e| !e.is_expired())
                 {
                     db.delete(ns, key);

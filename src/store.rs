@@ -425,10 +425,12 @@ impl Db {
     /// calling `.emit()` at an appropriate point (ideally after releasing the lock).
     pub(crate) fn put_deferred(
         &mut self,
-        namespace: String,
-        key: String,
+        namespace: &str,
+        key: &str,
         entry: Entry,
     ) -> StoreMetrics {
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
         // A fresh write cancels any pending EAR eviction for this key.
         self.ear_pending.remove(&(namespace.clone(), key.clone()));
         let new_size = Self::entry_size(&namespace, &key, entry.value.byte_len());
@@ -461,7 +463,7 @@ impl Db {
     /// Insert an entry and immediately emit Prometheus gauge updates.
     /// Most callers should prefer this; use `put_deferred` only when the write
     /// lock will already be dropped before metrics are needed.
-    pub(crate) fn put(&mut self, namespace: String, key: String, entry: Entry) {
+    pub(crate) fn put(&mut self, namespace: &str, key: &str, entry: Entry) {
         self.put_deferred(namespace, key, entry).emit();
     }
 
@@ -556,8 +558,8 @@ mod tests {
     fn populate_ns(db: &mut Db, ns: &str, entries: &[(&str, u64)], value: &[u8]) -> usize {
         for (key, hits) in entries {
             db.put(
-                ns.to_string(),
-                key.to_string(),
+                ns,
+                *key,
                 Entry::new(value.to_vec(), None),
             );
             db.entries
@@ -589,8 +591,8 @@ mod tests {
         let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lru);
         // "ns"(2) + "a"(1) + "vvv"(3) = 6
         db.put(
-            "ns".to_string(),
-            "a".to_string(),
+            "ns",
+            "a",
             Entry::new(b"vvv".to_vec(), None),
         );
         assert_eq!(db.used_bytes, 6);
@@ -637,8 +639,8 @@ mod tests {
         // Actually 6-6+10 = 10 <= 10 → true. Let's use a bigger delta.
         // net_delta=15: 6+15=21 > 10, overflow=11; only "a"(6) can be evicted → freed=6 < 11
         db.put(
-            "ns".to_string(),
-            "a".to_string(),
+            "ns",
+            "a",
             Entry::new(b"vvv".to_vec(), None),
         );
         assert!(!db.evict_for_write("ns", 15));
@@ -659,7 +661,7 @@ mod tests {
     #[test]
     fn per_namespace_policy_overrides_global() {
         let mut ns_policies = HashMap::new();
-        ns_policies.insert("special".to_string(), EvictionPolicy::Mru);
+        ns_policies.insert("special".to_owned(), EvictionPolicy::Mru);
         let db = Db::new(100).with_eviction(1.0, EvictionPolicy::Lru, ns_policies);
         assert_eq!(db.policy_for_namespace("special"), EvictionPolicy::Mru);
         assert_eq!(db.policy_for_namespace("other"), EvictionPolicy::Lru);
@@ -676,8 +678,8 @@ mod tests {
     fn net_delta_existing_key_grows() {
         let mut db = Db::new(1000);
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"hi".to_vec(), None),
         );
         // old: "ns"(2)+"k"(1)+"hi"(2)=5; new: "ns"(2)+"k"(1)+"hello"(5)=8; delta=3
@@ -688,8 +690,8 @@ mod tests {
     fn net_delta_existing_key_shrinks_returns_zero() {
         let mut db = Db::new(1000);
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"hello".to_vec(), None),
         );
         // old=8, new=5: saturating_sub → 0
@@ -701,7 +703,7 @@ mod tests {
     #[test]
     fn tracks_hits_returns_false_for_ear() {
         let mut ns_policies = HashMap::new();
-        ns_policies.insert("ns".to_string(), EvictionPolicy::ExpireAfterRead);
+        ns_policies.insert("ns".to_owned(), EvictionPolicy::ExpireAfterRead);
         let db = Db::new(1000).with_eviction(1.0, EvictionPolicy::None, ns_policies);
         assert!(!db.tracks_hits("ns"));
     }
@@ -717,7 +719,7 @@ mod tests {
     #[test]
     fn evict_for_write_returns_false_for_ear() {
         let mut ns_policies = HashMap::new();
-        ns_policies.insert("ns".to_string(), EvictionPolicy::ExpireAfterRead);
+        ns_policies.insert("ns".to_owned(), EvictionPolicy::ExpireAfterRead);
         let mut db = Db::new(100).with_eviction(0.0, EvictionPolicy::None, ns_policies);
         assert!(!db.evict_for_write("ns", 5));
     }
@@ -725,7 +727,7 @@ mod tests {
     #[test]
     fn is_ear_namespace_returns_true_for_ear() {
         let mut ns_policies = HashMap::new();
-        ns_policies.insert("session".to_string(), EvictionPolicy::ExpireAfterRead);
+        ns_policies.insert("session".to_owned(), EvictionPolicy::ExpireAfterRead);
         let db = Db::new(1000).with_eviction(1.0, EvictionPolicy::None, ns_policies);
         assert!(db.is_ear_namespace("session"));
         assert!(!db.is_ear_namespace("other"));
@@ -735,14 +737,14 @@ mod tests {
     fn mark_ear_marks_existing_non_expired_key() {
         let mut db = Db::new(1000);
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"v".to_vec(), None),
         );
         db.mark_ear("ns", "k");
         assert!(
             db.ear_pending
-                .contains(&("ns".to_string(), "k".to_string()))
+                .contains(&("ns".to_owned(), "k".to_owned()))
         );
     }
 
@@ -752,7 +754,7 @@ mod tests {
         db.mark_ear("ns", "k");
         assert!(
             !db.ear_pending
-                .contains(&("ns".to_string(), "k".to_string()))
+                .contains(&("ns".to_owned(), "k".to_owned()))
         );
     }
 
@@ -764,11 +766,11 @@ mod tests {
             hits: AtomicU64::new(0),
             expiry: Some(Instant::now() - Duration::from_secs(1)),
         };
-        db.put("ns".to_string(), "k".to_string(), expired);
+        db.put("ns", "k", expired);
         db.mark_ear("ns", "k");
         assert!(
             !db.ear_pending
-                .contains(&("ns".to_string(), "k".to_string()))
+                .contains(&("ns".to_owned(), "k".to_owned()))
         );
     }
 
@@ -776,23 +778,23 @@ mod tests {
     fn put_clears_ear_mark() {
         let mut db = Db::new(1000);
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"v".to_vec(), None),
         );
         db.mark_ear("ns", "k");
         assert!(
             db.ear_pending
-                .contains(&("ns".to_string(), "k".to_string()))
+                .contains(&("ns".to_owned(), "k".to_owned()))
         );
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"v2".to_vec(), None),
         );
         assert!(
             !db.ear_pending
-                .contains(&("ns".to_string(), "k".to_string()))
+                .contains(&("ns".to_owned(), "k".to_owned()))
         );
     }
 
@@ -800,15 +802,15 @@ mod tests {
     fn delete_clears_ear_mark() {
         let mut db = Db::new(1000);
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"v".to_vec(), None),
         );
         db.mark_ear("ns", "k");
         db.delete("ns", "k");
         assert!(
             !db.ear_pending
-                .contains(&("ns".to_string(), "k".to_string()))
+                .contains(&("ns".to_owned(), "k".to_owned()))
         );
     }
 
@@ -816,8 +818,8 @@ mod tests {
     fn flush_all_clears_ear_marks() {
         let mut db = Db::new(1000);
         db.put(
-            "ns".to_string(),
-            "k".to_string(),
+            "ns",
+            "k",
             Entry::new(b"v".to_vec(), None),
         );
         db.mark_ear("ns", "k");
