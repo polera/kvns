@@ -207,7 +207,7 @@ pub(crate) fn load(path: &Path, memory_limit: usize) -> io::Result<Db> {
     for (ns, ns_map) in persisted.entries {
         for (key, p_entry) in ns_map {
             if let Some(entry) = persisted_to_entry(p_entry) {
-                db.put(ns.clone(), key, entry);
+                db.put(&ns, &key, entry);
             }
         }
     }
@@ -310,8 +310,8 @@ mod tests {
     fn save_and_load_roundtrip() {
         let path = temp_path();
         let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
-        db.put("default".into(), "foo".into(), string_entry("bar"));
-        db.put("ns1".into(), "x".into(), string_entry("42"));
+        db.put("default", "foo", string_entry("bar"));
+        db.put("ns1", "x", string_entry("42"));
 
         save(&db, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
@@ -341,10 +341,10 @@ mod tests {
     fn load_skips_expired_entries() {
         let path = temp_path();
         let mut db = Db::new(DEFAULT_MEMORY_LIMIT);
-        db.put("default".into(), "live".into(), string_entry("v"));
+        db.put("default", "live", string_entry("v"));
         // Inject an already-expired entry directly (bypassing put's normal path)
-        db.entries.entry("default".into()).or_default().insert(
-            "dead".into(),
+        db.entries.entry("default".to_owned()).or_default().insert(
+            "dead".to_owned(),
             Entry {
                 value: Value::String(b"v".to_vec()),
                 hits: AtomicU64::new(0),
@@ -390,8 +390,8 @@ mod tests {
         hm.insert(b"field1".to_vec(), b"val1".to_vec());
         hm.insert(b"field2".to_vec(), b"val2".to_vec());
         db.put(
-            "default".into(),
-            "myhash".into(),
+            "default",
+            "myhash",
             Entry {
                 value: Value::Hash(hm),
                 hits: AtomicU64::new(0),
@@ -420,8 +420,8 @@ mod tests {
         s.insert(b"a".to_vec());
         s.insert(b"b".to_vec());
         db.put(
-            "default".into(),
-            "myset".into(),
+            "default",
+            "myset",
             Entry {
                 value: Value::Set(s),
                 hits: AtomicU64::new(0),
@@ -457,8 +457,8 @@ mod tests {
         ];
         let index = sorted.iter().map(|e| (e.member.clone(), e.score)).collect();
         db.put(
-            "default".into(),
-            "myzset".into(),
+            "default",
+            "myzset",
             Entry {
                 value: Value::ZSet(ZSetData { sorted, index }),
                 hits: AtomicU64::new(0),

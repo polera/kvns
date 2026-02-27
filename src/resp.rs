@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 use crate::config::{
@@ -256,23 +258,23 @@ async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
 
 // ── RESP2 response builders ───────────────────────────────────────────────────
 
-pub(crate) fn resp_ok() -> Vec<u8> {
-    b"+OK\r\n".to_vec()
+pub(crate) fn resp_ok() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"+OK\r\n")
 }
-pub(crate) fn resp_pong() -> Vec<u8> {
-    b"+PONG\r\n".to_vec()
+pub(crate) fn resp_pong() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"+PONG\r\n")
 }
-pub(crate) fn resp_null() -> Vec<u8> {
-    b"$-1\r\n".to_vec()
+pub(crate) fn resp_null() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"$-1\r\n")
 }
-pub(crate) fn resp_int(n: i64) -> Vec<u8> {
-    format!(":{n}\r\n").into_bytes()
+pub(crate) fn resp_int(n: i64) -> Cow<'static, [u8]> {
+    Cow::Owned(format!(":{n}\r\n").into_bytes())
 }
-pub(crate) fn resp_err(msg: &str) -> Vec<u8> {
-    format!("-ERR {msg}\r\n").into_bytes()
+pub(crate) fn resp_err(msg: &str) -> Cow<'static, [u8]> {
+    Cow::Owned(format!("-ERR {msg}\r\n").into_bytes())
 }
-pub(crate) fn resp_wrongtype() -> Vec<u8> {
-    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+pub(crate) fn resp_wrongtype() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
 }
 
 pub(crate) fn append_array_header(out: &mut Vec<u8>, len: usize) {
@@ -299,26 +301,26 @@ pub(crate) fn append_bulk(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
-pub(crate) fn resp_bulk(data: &[u8]) -> Vec<u8> {
+pub(crate) fn resp_bulk(data: &[u8]) -> Cow<'static, [u8]> {
     let mut out = Vec::with_capacity(data.len() + 32);
     append_bulk(&mut out, data);
-    out
+    Cow::Owned(out)
 }
 
-pub(crate) fn resp_array(items: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn resp_array(items: &[Vec<u8>]) -> Cow<'static, [u8]> {
     let mut out = Vec::new();
     append_array_header(&mut out, items.len());
     for item in items {
         append_bulk(&mut out, item);
     }
-    out
+    Cow::Owned(out)
 }
 
-pub(crate) fn resp_null_array() -> Vec<u8> {
-    b"*-1\r\n".to_vec()
+pub(crate) fn resp_null_array() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"*-1\r\n")
 }
 
-pub(crate) fn wrong_args(cmd: &[u8]) -> Vec<u8> {
+pub(crate) fn wrong_args(cmd: &[u8]) -> Cow<'static, [u8]> {
     resp_err(&format!(
         "wrong number of arguments for {}",
         String::from_utf8_lossy(cmd)
@@ -328,49 +330,49 @@ pub(crate) fn wrong_args(cmd: &[u8]) -> Vec<u8> {
 // ── RESP3 response builders ───────────────────────────────────────────────────
 
 #[allow(dead_code)]
-pub(crate) fn resp_null_resp3() -> Vec<u8> {
-    b"_\r\n".to_vec()
+pub(crate) fn resp_null_resp3() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"_\r\n")
 }
 
 #[allow(dead_code)]
-pub(crate) fn resp_bool(b: bool) -> Vec<u8> {
+pub(crate) fn resp_bool(b: bool) -> Cow<'static, [u8]> {
     if b {
-        b"#t\r\n".to_vec()
+        Cow::Borrowed(b"#t\r\n")
     } else {
-        b"#f\r\n".to_vec()
+        Cow::Borrowed(b"#f\r\n")
     }
 }
 
 #[allow(dead_code)]
-pub(crate) fn resp_double(f: f64) -> Vec<u8> {
+pub(crate) fn resp_double(f: f64) -> Cow<'static, [u8]> {
     if f.is_nan() {
-        b",nan\r\n".to_vec()
+        Cow::Borrowed(b",nan\r\n")
     } else if f.is_infinite() {
         if f > 0.0 {
-            b",inf\r\n".to_vec()
+            Cow::Borrowed(b",inf\r\n")
         } else {
-            b",-inf\r\n".to_vec()
+            Cow::Borrowed(b",-inf\r\n")
         }
     } else {
-        format!(",{f}\r\n").into_bytes()
+        Cow::Owned(format!(",{f}\r\n").into_bytes())
     }
 }
 
 #[allow(dead_code)]
-pub(crate) fn resp_big_number(n: &str) -> Vec<u8> {
-    format!("({n}\r\n").into_bytes()
+pub(crate) fn resp_big_number(n: &str) -> Cow<'static, [u8]> {
+    Cow::Owned(format!("({n}\r\n").into_bytes())
 }
 
 #[allow(dead_code)]
-pub(crate) fn resp_blob_error(code: &str, msg: &str) -> Vec<u8> {
+pub(crate) fn resp_blob_error(code: &str, msg: &str) -> Cow<'static, [u8]> {
     let payload = format!("{code} {msg}");
     let mut out = format!("!{}\r\n", payload.len()).into_bytes();
     out.extend_from_slice(payload.as_bytes());
     out.extend_from_slice(b"\r\n");
-    out
+    Cow::Owned(out)
 }
 
-pub(crate) fn resp_verbatim(enc: &[u8; 3], data: &[u8]) -> Vec<u8> {
+pub(crate) fn resp_verbatim(enc: &[u8; 3], data: &[u8]) -> Cow<'static, [u8]> {
     // =<len>\r\n<enc>:<data>\r\n
     let payload_len = 3 + 1 + data.len(); // enc(3) + ':' + data
     let mut out = format!("={payload_len}\r\n").into_bytes();
@@ -378,37 +380,37 @@ pub(crate) fn resp_verbatim(enc: &[u8; 3], data: &[u8]) -> Vec<u8> {
     out.push(b':');
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
-    out
+    Cow::Owned(out)
 }
 
 /// RESP3 map: %<N>\r\n followed by alternating bulk key/value pairs.
-pub(crate) fn resp_map(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn resp_map(pairs: &[(Vec<u8>, Vec<u8>)]) -> Cow<'static, [u8]> {
     let mut out = format!("%{}\r\n", pairs.len()).into_bytes();
     for (k, v) in pairs {
         append_bulk(&mut out, k);
         append_bulk(&mut out, v);
     }
-    out
+    Cow::Owned(out)
 }
 
 /// RESP3 set type: ~<N>\r\n followed by bulk items.
 #[allow(dead_code)]
-pub(crate) fn resp_set_type(items: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn resp_set_type(items: &[Vec<u8>]) -> Cow<'static, [u8]> {
     let mut out = format!("~{}\r\n", items.len()).into_bytes();
     for item in items {
         append_bulk(&mut out, item);
     }
-    out
+    Cow::Owned(out)
 }
 
 /// RESP3 push type: ><N>\r\n followed by bulk items.
 #[allow(dead_code)]
-pub(crate) fn resp_push(items: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn resp_push(items: &[Vec<u8>]) -> Cow<'static, [u8]> {
     let mut out = format!(">{}\r\n", items.len()).into_bytes();
     for item in items {
         append_bulk(&mut out, item);
     }
-    out
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -437,8 +439,8 @@ mod tests {
         let data = b"GET mykey\r\n";
         let mut r = BufReader::new(&data[..]);
         let result = parse_resp(&mut r).await.unwrap().unwrap();
-        assert_eq!(result[0], b"GET");
-        assert_eq!(result[1], b"mykey");
+        assert_eq!(&*result[0], b"GET");
+        assert_eq!(&*result[1], b"mykey");
     }
 
     #[tokio::test]
@@ -461,8 +463,8 @@ mod tests {
         let data = b"*2\r\n$3\r\nGET\r\n$-1\r\n";
         let mut r = BufReader::new(&data[..]);
         let result = parse_resp(&mut r).await.unwrap().unwrap();
-        assert_eq!(result[0], b"GET");
-        assert_eq!(result[1], b"");
+        assert_eq!(&*result[0], b"GET");
+        assert_eq!(&*result[1], b"");
     }
 
     #[tokio::test]
@@ -541,13 +543,13 @@ mod tests {
 
     #[tokio::test]
     async fn resp3_null_serializes_correctly() {
-        assert_eq!(resp_null_resp3(), b"_\r\n");
+        assert_eq!(&*resp_null_resp3(), b"_\r\n");
     }
 
     #[tokio::test]
     async fn resp3_bool_serializes_correctly() {
-        assert_eq!(resp_bool(true), b"#t\r\n");
-        assert_eq!(resp_bool(false), b"#f\r\n");
+        assert_eq!(&*resp_bool(true), b"#t\r\n");
+        assert_eq!(&*resp_bool(false), b"#f\r\n");
     }
 
     #[tokio::test]
@@ -560,13 +562,13 @@ mod tests {
 
     #[tokio::test]
     async fn resp_null_array_is_star_minus_one() {
-        assert_eq!(resp_null_array(), b"*-1\r\n");
+        assert_eq!(&*resp_null_array(), b"*-1\r\n");
     }
 
     #[tokio::test]
     async fn resp_double_infinity() {
-        assert_eq!(resp_double(f64::INFINITY), b",inf\r\n");
-        assert_eq!(resp_double(f64::NEG_INFINITY), b",-inf\r\n");
+        assert_eq!(&*resp_double(f64::INFINITY), b",inf\r\n");
+        assert_eq!(&*resp_double(f64::NEG_INFINITY), b",-inf\r\n");
     }
 
     #[tokio::test]
