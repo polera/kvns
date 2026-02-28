@@ -51,7 +51,8 @@ impl Value {
             Value::List(items) => items.iter().map(|b| b.len()).sum(),
             Value::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
             Value::Set(s) => s.iter().map(|v| v.len()).sum(),
-            Value::ZSet(data) => data.sorted.iter().map(|e| 8 + e.member.len()).sum(),
+            Value::ZSet(data) => data.sorted.iter().map(|e| 8 + e.member.len()).sum::<usize>()
+                + data.index.iter().map(|(k, _)| k.len() + 8).sum::<usize>(),
         }
     }
 

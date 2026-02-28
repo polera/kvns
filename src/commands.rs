@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::resp::{
     append_array_header, append_bulk, append_int, append_null, resp_array, resp_bulk, resp_err,
-    resp_int, resp_map, resp_null, resp_null_array, resp_ok, resp_pong, resp_verbatim,
+    resp_int, resp_map, resp_null, resp_null_array, resp_ok, resp_pong, resp_usize, resp_verbatim,
     resp_wrongtype, wrong_args,
 };
 use crate::store::{Db, Entry, Store, StoreMetrics, Value, ZEntry, ZSetData};
@@ -109,7 +109,7 @@ fn ensure_expiry_scheduler(store: &Store) -> mpsc::UnboundedSender<ExpiryEvent> 
     {
         let guard = EXPIRY_QUEUE_TX_BY_STORE
             .read()
-            .expect("expiry scheduler rwlock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = guard.get(&key) {
             if !tx.is_closed() {
                 return tx.clone();
@@ -119,7 +119,7 @@ fn ensure_expiry_scheduler(store: &Store) -> mpsc::UnboundedSender<ExpiryEvent> 
     // Slow path: exclusive write lock with double-check.
     let mut guard = EXPIRY_QUEUE_TX_BY_STORE
         .write()
-        .expect("expiry scheduler rwlock poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = guard.get(&key) {
         if !tx.is_closed() {
             return tx.clone();
@@ -147,7 +147,7 @@ fn schedule_expiry(store: &Store, ns: &str, key: &str, deadline: Instant) {
         }
         let mut guard = EXPIRY_QUEUE_TX_BY_STORE
             .write()
-            .expect("expiry scheduler rwlock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         guard.remove(&key_id);
     }
 }
@@ -203,7 +203,7 @@ async fn run_expiry_scheduler(
 
     let mut guard = EXPIRY_QUEUE_TX_BY_STORE
         .write()
-        .expect("expiry scheduler rwlock poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     guard.remove(&key_id);
 }
 
@@ -908,7 +908,7 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         None => return resp_wrongtype(),
         Some(b) => b.extend_from_slice(&append_data),
     }
-    let result_len = entry.value.as_string().unwrap().len();
+    let result_len = new_len;
     let delta = Db::entry_size(&ns, &key, result_len).saturating_sub(Db::entry_size(
         &ns,
         &key,
@@ -920,7 +920,7 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let ns_bytes = *nb;
     metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
-    resp_int(result_len as i64)
+    resp_usize(result_len)
 }
 
 async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -935,7 +935,7 @@ async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
             Some(entry) if entry.is_expired() => (resp_int(0), true),
             Some(entry) => match entry.value.as_string() {
                 None => (resp_wrongtype(), false),
-                Some(bytes) => (resp_int(bytes.len() as i64), false),
+                Some(bytes) => (resp_usize(bytes.len()), false),
             },
         }
     };
@@ -1198,7 +1198,7 @@ async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_val, None));
     drop(db);
     m.emit();
-    resp_int(new_len as i64)
+    resp_usize(new_len)
 }
 
 async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1322,7 +1322,7 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> std::borrow::C
     metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
     metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
-    resp_int(len as i64)
+    resp_usize(len)
 }
 
 async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1381,7 +1381,7 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
     metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
     metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
-    resp_int(len as i64)
+    resp_usize(len)
 }
 
 async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1609,7 +1609,7 @@ async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_int(0),
         Some(entry) => match &entry.value {
-            Value::List(l) => resp_int(l.len() as i64),
+            Value::List(l) => resp_usize(l.len()),
             _ => resp_wrongtype(),
         },
     }
@@ -1913,7 +1913,7 @@ async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
                 Some(idx) => {
                     let insert_at = if position == "AFTER" { idx + 1 } else { idx };
                     list.insert(insert_at, element);
-                    resp_int(list.len() as i64)
+                    resp_usize(list.len())
                 }
             },
             _ => resp_wrongtype(),
@@ -2388,7 +2388,7 @@ async fn cmd_hlen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             Some(entry) if entry.is_expired() => (resp_int(0), true),
             Some(entry) => match entry.value.as_hash() {
                 None => (resp_wrongtype(), false),
-                Some(h) => (resp_int(h.len() as i64), false),
+                Some(h) => (resp_usize(h.len()), false),
             },
         }
     };
@@ -2703,7 +2703,7 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     for m in members {
         set.insert(m.clone());
     }
-    let added = (set.len() - before) as i64;
+    let added = set.len() - before;
 
     // Update memory
     let new_byte_len: usize = set.iter().map(|v| v.len()).sum();
@@ -2717,7 +2717,7 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
     metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
 
-    resp_int(added)
+    resp_usize(added)
 }
 
 async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -2801,7 +2801,7 @@ async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         None => resp_int(0),
         Some(entry) => match entry.value.as_set() {
             None => resp_wrongtype(),
-            Some(s) => resp_int(s.len() as i64),
+            Some(s) => resp_usize(s.len()),
         },
     }
 }
@@ -2953,7 +2953,7 @@ async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         .iter()
         .enumerate()
         .min_by_key(|(_, s)| s.len())
-        .expect("non-empty sets");
+        .unwrap_or_else(|| unreachable!("sets is non-empty, guarded above"));
     let mut result: HashSet<Vec<u8>> = HashSet::new();
     for member in smallest.iter() {
         if sets
@@ -3007,7 +3007,7 @@ async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
     if sets.is_empty() || sets[0].is_none() {
         return resp_array(&[]);
     }
-    let first = sets[0].expect("checked is_some");
+    let first = sets[0].unwrap_or_else(|| unreachable!("sets is non-empty, guarded above"));
     let mut result: HashSet<Vec<u8>> = HashSet::new();
     for member in first {
         let present_elsewhere = sets[1..].iter().flatten().any(|s| s.contains(member));
@@ -3050,7 +3050,7 @@ async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
             },
         }
     }
-    let count = result.len() as i64;
+    let count = result.len();
     let entry = Entry {
         value: Value::Set(result),
         hits: AtomicU64::new(0),
@@ -3059,7 +3059,7 @@ async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
     let m = db.put_deferred(dst_ns.as_ref(), dst_key.as_ref(), entry);
     drop(db);
     m.emit();
-    resp_int(count)
+    resp_usize(count)
 }
 
 async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -3114,7 +3114,7 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
         }
         out
     };
-    let count = result.len() as i64;
+    let count = result.len();
     let m = db.put_deferred(
         dst_ns.as_ref(),
         dst_key.as_ref(),
@@ -3126,7 +3126,7 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
     );
     drop(db);
     m.emit();
-    resp_int(count)
+    resp_usize(count)
 }
 
 async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -3174,7 +3174,7 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'st
             }
         }
     };
-    let count = result.len() as i64;
+    let count = result.len();
     let m = db.put_deferred(
         dst_ns.as_ref(),
         dst_key.as_ref(),
@@ -3186,7 +3186,7 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'st
     );
     drop(db);
     m.emit();
-    resp_int(count)
+    resp_usize(count)
 }
 
 async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -3451,6 +3451,13 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         }
     }
 
+    if nx && xx {
+        return resp_err("XX and NX options at the same time are not compatible");
+    }
+    if gt && lt || nx && (gt || lt) {
+        return resp_err("GT, LT, and NX options at the same time are not compatible");
+    }
+
     if idx + 1 >= args.len() || !(args.len() - idx).is_multiple_of(2) {
         return wrong_args(&args[0]);
     }
@@ -3491,7 +3498,12 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                     .ok()
                     .and_then(|s| s.parse::<f64>().ok())
                 {
-                    Some(s) => s,
+                    Some(s) => {
+                        if s.is_nan() {
+                            return resp_err("not a finite value");
+                        }
+                        s
+                    }
                     None => return resp_err("not a float or out of range"),
                 }
             };
@@ -4119,11 +4131,11 @@ async fn cmd_zrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
             });
             let resp: std::borrow::Cow<'static, [u8]> = if withscore {
                 let mut out = b"*2\r\n".to_vec();
-                out.extend_from_slice(&resp_int(rank as i64));
+                out.extend_from_slice(&resp_usize(rank));
                 out.extend_from_slice(&resp_bulk(&format_score(score)));
                 out.into()
             } else {
-                resp_int(rank as i64)
+                resp_usize(rank)
             };
             if is_ear {
                 let mut db = store.write().await;
@@ -4162,11 +4174,11 @@ async fn cmd_zrevrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
             let rev_rank = zset.sorted.len() - 1 - rank;
             let resp: std::borrow::Cow<'static, [u8]> = if withscore {
                 let mut out = b"*2\r\n".to_vec();
-                out.extend_from_slice(&resp_int(rev_rank as i64));
+                out.extend_from_slice(&resp_usize(rev_rank));
                 out.extend_from_slice(&resp_bulk(&format_score(score)));
                 out.into()
             } else {
-                resp_int(rev_rank as i64)
+                resp_usize(rev_rank)
             };
             if is_ear {
                 let mut db = store.write().await;
@@ -4271,7 +4283,7 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         }
                     }
                 }
-                resp_int((before - data.len()) as i64)
+                resp_usize(before - data.len())
             }
         },
     }
@@ -4296,7 +4308,7 @@ async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         None => resp_int(0),
         Some(entry) => match entry.value.as_zset() {
             None => resp_wrongtype(),
-            Some(data) => resp_int(data.len() as i64),
+            Some(data) => resp_usize(data.len()),
         },
     }
 }
@@ -4346,7 +4358,7 @@ async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
                         above && below
                     })
                     .count();
-                resp_int(count as i64)
+                resp_usize(count)
             }
         },
     }
@@ -4507,7 +4519,7 @@ async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'sta
                     .iter()
                     .filter(|e| member_in_lex_range(&e.member, &min, &max))
                     .count();
-                resp_int(count as i64)
+                resp_usize(count)
             }
         },
     }
@@ -4569,7 +4581,7 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
                         data.index.remove(e.member.as_slice());
                     }
                 }
-                resp_int(count as i64)
+                resp_usize(count)
             }
         },
     }
@@ -4624,7 +4636,7 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
                 for m in to_remove {
                     data.index.remove(m.as_slice());
                 }
-                resp_int((before - data.len()) as i64)
+                resp_usize(before - data.len())
             }
         },
     }
@@ -4671,7 +4683,7 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
                 for m in to_remove {
                     data.index.remove(m.as_slice());
                 }
-                resp_int((before - data.len()) as i64)
+                resp_usize(before - data.len())
             }
         },
     }
@@ -5261,7 +5273,7 @@ async fn cmd_expiretime(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'st
                         .unwrap_or_default()
                         .as_secs()
                 };
-                resp_int(unix_secs as i64)
+                resp_int(i64::try_from(unix_secs).unwrap_or(i64::MAX))
             }
         },
     }
@@ -5302,7 +5314,7 @@ async fn cmd_pexpiretime(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
                         .unwrap_or_default()
                         .as_millis() as u64
                 };
-                resp_int(unix_ms as i64)
+                resp_int(i64::try_from(unix_ms).unwrap_or(i64::MAX))
             }
         },
     }
@@ -5418,12 +5430,13 @@ async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         }
     }
 
-    let db = store.read().await;
-    let mut matched_seen = 0usize;
-    let mut page: Vec<Vec<u8>> = Vec::with_capacity(page_size);
-    let mut has_more = false;
+    // Prevent infinite loop when COUNT 0 is supplied.
+    let page_size = page_size.max(1);
 
-    'scan: for (ns, ns_map) in &db.entries {
+    let db = store.read().await;
+    let mut all_keys: Vec<Vec<u8>> = Vec::new();
+
+    for (ns, ns_map) in &db.entries {
         for (key, entry) in ns_map {
             if entry.is_expired() {
                 continue;
@@ -5433,12 +5446,6 @@ async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             {
                 continue;
             }
-
-            if pattern.is_none() && matched_seen < cursor {
-                matched_seen += 1;
-                continue;
-            }
-
             let display: Vec<u8> = if ns == "default" {
                 key.as_bytes().to_vec()
             } else {
@@ -5449,31 +5456,23 @@ async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             {
                 continue;
             }
-
-            if matched_seen < cursor {
-                matched_seen += 1;
-                continue;
-            }
-            if page.len() >= page_size {
-                has_more = true;
-                break 'scan;
-            }
-            page.push(display);
-            matched_seen += 1;
+            all_keys.push(display);
         }
     }
+    drop(db);
+    all_keys.sort_unstable();
 
-    let next_cursor = if has_more {
-        cursor.saturating_add(page.len())
-    } else {
-        0
-    };
+    let total = all_keys.len();
+    let start = cursor.min(total);
+    let end = (start + page_size).min(total);
+    let page = &all_keys[start..end];
+    let next_cursor: usize = if end < total { end } else { 0 };
 
     let mut out = Vec::new();
     append_array_header(&mut out, 2);
     append_bulk(&mut out, next_cursor.to_string().as_bytes());
     append_array_header(&mut out, page.len());
-    for item in &page {
+    for item in page {
         append_bulk(&mut out, item);
     }
     out.into()
@@ -5633,7 +5632,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
             match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
                 None => resp_null(),
                 Some(entry) => {
-                    resp_int(entry.hits.load(std::sync::atomic::Ordering::Relaxed) as i64)
+                    resp_int(i64::try_from(entry.hits.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(i64::MAX))
                 }
             }
         }
@@ -5738,7 +5737,7 @@ async fn cmd_dbsize(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         return wrong_args(&args[0]);
     }
     let db = store.read().await;
-    resp_int(db.total_keys() as i64)
+    resp_usize(db.total_keys())
 }
 
 async fn cmd_flushdb(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -5819,7 +5818,7 @@ async fn cmd_client(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> s
             None => resp_null(),
             Some(name) => resp_bulk(name),
         },
-        "ID" => resp_int(conn.client_id as i64),
+        "ID" => resp_int(i64::try_from(conn.client_id).unwrap_or(i64::MAX)),
         "INFO" => {
             let name = conn
                 .client_name

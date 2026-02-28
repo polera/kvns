@@ -270,6 +270,9 @@ pub(crate) fn resp_null() -> Cow<'static, [u8]> {
 pub(crate) fn resp_int(n: i64) -> Cow<'static, [u8]> {
     Cow::Owned(format!(":{n}\r\n").into_bytes())
 }
+pub(crate) fn resp_usize(n: usize) -> Cow<'static, [u8]> {
+    resp_int(i64::try_from(n).unwrap_or(i64::MAX))
+}
 pub(crate) fn resp_err(msg: &str) -> Cow<'static, [u8]> {
     Cow::Owned(format!("-ERR {msg}\r\n").into_bytes())
 }
