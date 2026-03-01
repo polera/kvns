@@ -26,6 +26,8 @@ struct ParsedKey {
     shard_idx: usize,
 }
 
+type ShardWriteGuard<'a> = (usize, tokio::sync::RwLockWriteGuard<'a, HashMap<Vec<u8>, ShardedEntry>>);
+
 pub(crate) struct ShardedDb {
     shards: Vec<RwLock<HashMap<Vec<u8>, ShardedEntry>>>,
     used_bytes: AtomicUsize,
@@ -137,11 +139,11 @@ impl ShardedDb {
         let expired = shard
             .get(&parsed.canonical)
             .is_some_and(|entry| entry.expiry.is_some_and(|deadline| now >= deadline));
-        if expired {
-            if let Some(entry) = shard.remove(&parsed.canonical) {
-                let size = Self::entry_size(parsed.key_len, entry.value.len());
-                self.release_bytes(size);
-            }
+        if expired
+            && let Some(entry) = shard.remove(&parsed.canonical)
+        {
+            let size = Self::entry_size(parsed.key_len, entry.value.len());
+            self.release_bytes(size);
             // record_total_used intentionally omitted: metrics are updated on
             // writes; flushing gauges on every expired-key eviction during reads
             // adds a metrics registry lookup to the GET hot path.
@@ -377,10 +379,7 @@ impl ShardedDb {
                 .push((parsed, value));
         }
         // Acquire all write locks in shard-index order.
-        let mut guards: Vec<(
-            usize,
-            tokio::sync::RwLockWriteGuard<'_, HashMap<Vec<u8>, ShardedEntry>>,
-        )> = Vec::with_capacity(by_shard.len());
+        let mut guards: Vec<ShardWriteGuard<'_>> = Vec::with_capacity(by_shard.len());
         for &shard_idx in by_shard.keys() {
             let guard = self.shards[shard_idx].write().await;
             guards.push((shard_idx, guard));

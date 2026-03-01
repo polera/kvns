@@ -110,20 +110,20 @@ fn ensure_expiry_scheduler(store: &Store) -> mpsc::UnboundedSender<ExpiryEvent> 
         let guard = EXPIRY_QUEUE_TX_BY_STORE
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(tx) = guard.get(&key) {
-            if !tx.is_closed() {
-                return tx.clone();
-            }
+        if let Some(tx) = guard.get(&key)
+            && !tx.is_closed()
+        {
+            return tx.clone();
         }
     }
     // Slow path: exclusive write lock with double-check.
     let mut guard = EXPIRY_QUEUE_TX_BY_STORE
         .write()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = guard.get(&key) {
-        if !tx.is_closed() {
-            return tx.clone();
-        }
+    if let Some(tx) = guard.get(&key)
+        && !tx.is_closed()
+    {
+        return tx.clone();
     }
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(run_expiry_scheduler(Arc::clone(store), rx, key));
@@ -509,10 +509,10 @@ pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
 
     let mut db = store.write().await;
     let net_delta = db.net_delta(&ns, &key, value_len);
-    if db.used_bytes.saturating_add(net_delta) > db.memory_limit {
-        if !db.evict_for_write(&ns, net_delta) {
-            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
-        }
+    if db.used_bytes.saturating_add(net_delta) > db.memory_limit
+        && !db.evict_for_write(&ns, net_delta)
+    {
+        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), entry);
     drop(db);
