@@ -52,7 +52,7 @@ impl Value {
             Value::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
             Value::Set(s) => s.iter().map(|v| v.len()).sum(),
             Value::ZSet(data) => data.sorted.iter().map(|e| 8 + e.member.len()).sum::<usize>()
-                + data.index.iter().map(|(k, _)| k.len() + 8).sum::<usize>(),
+                + data.index.keys().map(|k| k.len() + 8).sum::<usize>(),
         }
     }
 
@@ -560,7 +560,7 @@ mod tests {
         for (key, hits) in entries {
             db.put(
                 ns,
-                *key,
+                key,
                 Entry::new(value.to_vec(), None),
             );
             db.entries

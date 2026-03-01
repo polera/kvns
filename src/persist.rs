@@ -189,12 +189,7 @@ pub(crate) fn save_entries(
     Ok(())
 }
 
-/// Atomically serialise `db` to `path` (write to `<path>.tmp`, then rename).
-pub(crate) fn save(db: &Db, path: &Path) -> io::Result<()> {
-    save_entries(&db.entries, path)
-}
-
-/// Deserialise a `Db` from `path`.  Expired entries are silently dropped.
+/// Deserialize a `Db` from `path`.  Expired entries are silently dropped.
 ///
 /// Returns `Err` with `ErrorKind::NotFound` if the file does not exist, which
 /// callers can use to distinguish "first run" from genuine I/O errors.
@@ -313,7 +308,7 @@ mod tests {
         db.put("default", "foo", string_entry("bar"));
         db.put("ns1", "x", string_entry("42"));
 
-        save(&db, &path).expect("save failed");
+        save_entries(&db.entries, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
 
         assert_eq!(
@@ -352,7 +347,7 @@ mod tests {
             },
         );
 
-        save(&db, &path).expect("save failed");
+        save_entries(&db.entries, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
 
         assert!(
@@ -398,7 +393,7 @@ mod tests {
                 expiry: None,
             },
         );
-        save(&db, &path).expect("save failed");
+        save_entries(&db.entries, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
         let entry = loaded
             .entries
@@ -428,7 +423,7 @@ mod tests {
                 expiry: None,
             },
         );
-        save(&db, &path).expect("save failed");
+        save_entries(&db.entries, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
         let entry = loaded
             .entries
@@ -465,7 +460,7 @@ mod tests {
                 expiry: None,
             },
         );
-        save(&db, &path).expect("save failed");
+        save_entries(&db.entries, &path).expect("save failed");
         let loaded = load(&path, DEFAULT_MEMORY_LIMIT).expect("load failed");
         let entry = loaded
             .entries

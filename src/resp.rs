@@ -103,12 +103,6 @@ fn split_inline_command(line: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-pub(crate) async fn parse_resp<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<Option<Vec<Vec<u8>>>> {
-    parse_resp_with_limits(reader, RespLimits::default()).await
-}
-
 pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limits: RespLimits,
@@ -425,7 +419,7 @@ mod tests {
     async fn parse_array_set_command() {
         let data = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(result, vec![b"SET", b"foo", b"bar"]);
     }
 
@@ -433,7 +427,7 @@ mod tests {
     async fn parse_inline_ping() {
         let data = b"PING\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(result, vec![b"PING"]);
     }
 
@@ -441,7 +435,7 @@ mod tests {
     async fn parse_inline_with_args() {
         let data = b"GET mykey\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(&*result[0], b"GET");
         assert_eq!(&*result[1], b"mykey");
     }
@@ -450,14 +444,14 @@ mod tests {
     async fn parse_eof_returns_none() {
         let data: &[u8] = b"";
         let mut r = BufReader::new(data);
-        assert!(parse_resp(&mut r).await.unwrap().is_none());
+        assert!(parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn parse_empty_line_returns_empty_vec() {
         let data = b"\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert!(result.is_empty());
     }
 
@@ -465,7 +459,7 @@ mod tests {
     async fn parse_null_bulk_string() {
         let data = b"*2\r\n$3\r\nGET\r\n$-1\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(&*result[0], b"GET");
         assert_eq!(&*result[1], b"");
     }
@@ -474,7 +468,7 @@ mod tests {
     async fn parse_resp3_null() {
         let data = b"_\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert!(result.is_empty());
     }
 
@@ -482,7 +476,7 @@ mod tests {
     async fn parse_resp3_bool_true() {
         let data = b"#t\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(result, vec![b"1"]);
     }
 
@@ -490,7 +484,7 @@ mod tests {
     async fn parse_resp3_bool_false() {
         let data = b"#f\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(result, vec![b"0"]);
     }
 
@@ -498,7 +492,7 @@ mod tests {
     async fn parse_resp3_double() {
         let data = b",3.14\r\n";
         let mut r = BufReader::new(&data[..]);
-        let result = parse_resp(&mut r).await.unwrap().unwrap();
+        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
         assert_eq!(result, vec![b"3.14"]);
     }
 
