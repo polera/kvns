@@ -221,12 +221,32 @@ pub(crate) async fn run_periodic_flush(store: Store, path: PathBuf, interval_sec
     ticker.tick().await; // skip the immediate first tick
     loop {
         ticker.tick().await;
-        let snapshot = {
+        // Clone the raw entry map under the read lock (O(N) clone), then
+        // release the lock immediately.  The PersistedDb conversion, rkyv
+        // serialisation, and file I/O all run inside spawn_blocking with no
+        // lock held, keeping the async executor free.
+        let entries_clone = {
             let db = store.read().await;
             db.entries.clone()
         };
         let flush_path = path.clone();
-        match tokio::task::spawn_blocking(move || save_entries(&snapshot, &flush_path)).await {
+        match tokio::task::spawn_blocking(move || {
+            let persisted = persisted_db_from_entries(&entries_clone);
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&persisted)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            if let Some(parent) = flush_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let tmp = flush_path.with_extension("tmp");
+            let mut file = File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            drop(file);
+            fs::rename(&tmp, &flush_path)?;
+            Ok::<(), io::Error>(())
+        })
+        .await
+        {
             Ok(Ok(())) => debug!(path = %path.display(), "flushed store to disk"),
             Ok(Err(e)) => {
                 error!(error = %e, path = %path.display(), "failed to flush store to disk")

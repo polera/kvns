@@ -305,7 +305,9 @@ pub(crate) fn resp_bulk(data: &[u8]) -> Cow<'static, [u8]> {
 }
 
 pub(crate) fn resp_array(items: &[Vec<u8>]) -> Cow<'static, [u8]> {
-    let mut out = Vec::new();
+    // Pre-size: array header + per-item bulk header (≤ ~16 bytes) + data.
+    let capacity = 16 + items.iter().map(|b| b.len() + 16).sum::<usize>();
+    let mut out = Vec::with_capacity(capacity);
     append_array_header(&mut out, items.len());
     for item in items {
         append_bulk(&mut out, item);

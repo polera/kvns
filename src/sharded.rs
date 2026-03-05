@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
+use crate::commands::i64_to_bytes;
 use crate::resp::{
     append_array_header, append_bulk, append_null, resp_bulk, resp_err, resp_int, resp_null,
     resp_ok, resp_pong, wrong_args,
@@ -232,7 +233,7 @@ impl ShardedDb {
             None => return Err(resp_err(overflow_err)),
         };
 
-        let new_value = next.to_string().into_bytes();
+        let new_value = i64_to_bytes(next);
         let old_size = shard
             .get(&parsed.canonical)
             .map(|entry| Self::entry_size(key_len, entry.value.len()))
@@ -495,10 +496,21 @@ pub(crate) async fn dispatch(
         if args.len() < 2 {
             return (wrong_args(&args[0]), false);
         }
-        let mut out = Vec::new();
-        append_array_header(&mut out, args.len() - 1);
+        let key_count = args.len() - 1;
+        // Spawn one task per key so reads on independent shards run in parallel
+        // across executor threads instead of acquiring shard locks one at a time.
+        let mut handles: Vec<tokio::task::JoinHandle<Option<Vec<u8>>>> =
+            Vec::with_capacity(key_count);
         for raw_key in &args[1..] {
-            match store.get_value(raw_key).await {
+            let store = Arc::clone(store);
+            let key = raw_key.clone();
+            handles.push(tokio::task::spawn(async move { store.get_value(&key).await }));
+        }
+        // Await in original order to preserve MGET result ordering.
+        let mut out = Vec::new();
+        append_array_header(&mut out, key_count);
+        for handle in handles {
+            match handle.await.expect("MGET task panicked") {
                 Some(value) => append_bulk(&mut out, &value),
                 None => append_null(&mut out),
             }
@@ -708,26 +720,18 @@ pub(crate) async fn dispatch(
         if args.len() != 1 {
             return (wrong_args(&args[0]), false);
         }
+        // Use read locks: DBSIZE must not block writers.  Expired-but-not-yet-
+        // evicted keys may be counted momentarily; this matches Redis semantics
+        // (DBSIZE is approximate when lazy expiry is used).
         let now = Instant::now();
         let mut total = 0usize;
         for shard_lock in &store.shards {
-            let mut shard = shard_lock.write().await;
-            let mut released = 0usize;
-            shard.retain(|key, entry| {
-                if entry.expiry.is_some_and(|deadline| now >= deadline) {
-                    let key_len = key.len().saturating_sub(1);
-                    released += ShardedDb::entry_size(key_len, entry.value.len());
-                    false
-                } else {
-                    true
-                }
-            });
-            if released > 0 {
-                store.release_bytes(released);
-            }
-            total += shard.len();
+            let shard = shard_lock.read().await;
+            total += shard
+                .values()
+                .filter(|e| !e.expiry.is_some_and(|d| now >= d))
+                .count();
         }
-        store.record_total_used();
         return (resp_int(total as i64), false);
     }
 

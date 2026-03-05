@@ -7,6 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::pubsub::{PubSubHub, PubSubMessage};
+
 use crate::resp::{
     append_array_header, append_bulk, append_int, append_null, resp_array, resp_bulk, resp_err,
     resp_int, resp_map, resp_null, resp_null_array, resp_ok, resp_pong, resp_usize, resp_verbatim,
@@ -16,10 +18,38 @@ use crate::store::{Db, Entry, Store, StoreMetrics, Value, ZEntry, ZSetData};
 
 // ── Connection state ──────────────────────────────────────────────────────────
 
+/// Queued-command state active between MULTI and EXEC/DISCARD.
+pub(crate) struct MultiState {
+    pub queued: Vec<Vec<Vec<u8>>>,
+    /// Set when a command is rejected during queuing (EXEC → EXECABORT).
+    pub error: bool,
+}
+
+impl MultiState {
+    fn new() -> Self {
+        Self { queued: Vec::new(), error: false }
+    }
+}
+
 pub(crate) struct ConnState {
     pub resp_version: u8,
     pub client_name: Option<Vec<u8>>,
     pub client_id: u64,
+    /// Active transaction (MULTI issued but EXEC/DISCARD not yet received).
+    pub multi_state: Option<MultiState>,
+    /// (namespace, key) → write_version at WATCH time.
+    pub watched: HashMap<(String, String), u64>,
+    /// Sender half of the per-connection pub-sub message channel.
+    /// Created lazily on the first SUBSCRIBE/PSUBSCRIBE command so that
+    /// non-pub-sub connections pay no channel allocation cost.
+    pub pubsub_tx: Option<mpsc::UnboundedSender<PubSubMessage>>,
+    /// Receiver half, held here only until the server loop picks it up via
+    /// `take()` after the first subscribe command returns.
+    pub pubsub_rx_slot: Option<mpsc::UnboundedReceiver<PubSubMessage>>,
+    /// Channels this connection has explicitly subscribed to.
+    pub subscribed_channels: HashSet<String>,
+    /// Patterns this connection has subscribed to via PSUBSCRIBE.
+    pub subscribed_patterns: HashSet<String>,
 }
 
 impl ConnState {
@@ -28,7 +58,31 @@ impl ConnState {
             resp_version: 2,
             client_name: None,
             client_id: id,
+            multi_state: None,
+            watched: HashMap::new(),
+            pubsub_tx: None,
+            pubsub_rx_slot: None,
+            subscribed_channels: HashSet::new(),
+            subscribed_patterns: HashSet::new(),
         }
+    }
+
+    /// Returns the sender for this connection's pub-sub channel, creating the
+    /// channel on the first call.  The receiver is placed in `pubsub_rx_slot`
+    /// for the server loop to `take()` after dispatch returns.
+    pub(crate) fn pubsub_sender(&mut self) -> mpsc::UnboundedSender<PubSubMessage> {
+        if let Some(tx) = &self.pubsub_tx {
+            return tx.clone();
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pubsub_tx = Some(tx.clone());
+        self.pubsub_rx_slot = Some(rx);
+        tx
+    }
+
+    /// True when the connection is in pub-sub mode (at least one active subscription).
+    pub(crate) fn in_pubsub(&self) -> bool {
+        !self.subscribed_channels.is_empty() || !self.subscribed_patterns.is_empty()
     }
 }
 
@@ -284,20 +338,92 @@ fn class_match(class: &[u8], ch: u8) -> bool {
     if negate { !found } else { found }
 }
 
-fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    match (pattern, text) {
-        ([], []) => true,
-        ([], _) => false,
-        ([b'*', rest @ ..], _) => {
-            glob_match(rest, text) || (!text.is_empty() && glob_match(pattern, &text[1..]))
+/// Iterative glob match — O(N·M) worst case, no stack growth.
+///
+/// Supports Redis-compatible glob syntax: `*` (any sequence), `?` (any single
+/// byte), `[abc]` / `[a-z]` / `[^abc]` character classes.
+pub(crate) fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0usize; // current position in pattern
+    let mut ti = 0usize; // current position in text
+    // Saved positions used for backtracking when a `*` was seen.
+    // `usize::MAX` means "no star seen yet".
+    let mut star_pi = usize::MAX;
+    let mut star_ti = 0usize;
+
+    loop {
+        if ti < text.len() {
+            if pi < pattern.len() {
+                match pattern[pi] {
+                    b'*' => {
+                        // Record where the star is; advance pattern but not text
+                        // so we first try matching zero characters.
+                        star_pi = pi;
+                        star_ti = ti;
+                        pi += 1;
+                    }
+                    b'?' => {
+                        pi += 1;
+                        ti += 1;
+                    }
+                    b'[' => {
+                        match pattern[pi + 1..].iter().position(|&b| b == b']') {
+                            Some(rel_end) => {
+                                let class = &pattern[pi + 1..pi + 1 + rel_end];
+                                let close = pi + 1 + rel_end; // index of ']'
+                                if class_match(class, text[ti]) {
+                                    pi = close + 1;
+                                    ti += 1;
+                                } else if star_pi != usize::MAX {
+                                    pi = star_pi + 1;
+                                    star_ti += 1;
+                                    ti = star_ti;
+                                } else {
+                                    return false;
+                                }
+                            }
+                            None => {
+                                // Unclosed '[': treat as literal '['.
+                                if text[ti] == b'[' {
+                                    pi += 1;
+                                    ti += 1;
+                                } else if star_pi != usize::MAX {
+                                    pi = star_pi + 1;
+                                    star_ti += 1;
+                                    ti = star_ti;
+                                } else {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    p_ch => {
+                        if p_ch == text[ti] {
+                            pi += 1;
+                            ti += 1;
+                        } else if star_pi != usize::MAX {
+                            pi = star_pi + 1;
+                            star_ti += 1;
+                            ti = star_ti;
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+            } else if star_pi != usize::MAX {
+                // Pattern exhausted but text has more: let the last `*` consume one more char.
+                pi = star_pi + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        } else {
+            // Text exhausted: skip any trailing `*`s in pattern.
+            while pi < pattern.len() && pattern[pi] == b'*' {
+                pi += 1;
+            }
+            return pi == pattern.len();
         }
-        (_, []) => false,
-        ([b'?', p_rest @ ..], [_, t_rest @ ..]) => glob_match(p_rest, t_rest),
-        ([b'[', p_rest @ ..], [ch, t_rest @ ..]) => match p_rest.iter().position(|&b| b == b']') {
-            None => *ch == b'[' && glob_match(p_rest, t_rest),
-            Some(end) => class_match(&p_rest[..end], *ch) && glob_match(&p_rest[end + 1..], t_rest),
-        },
-        ([p, p_rest @ ..], [t, t_rest @ ..]) => *p == *t && glob_match(p_rest, t_rest),
     }
 }
 
@@ -406,16 +532,33 @@ fn format_score(s: f64) -> Vec<u8> {
     format!("{}", s).into_bytes()
 }
 
+// ── Integer formatting ─────────────────────────────────────────────────────────
+
+/// Format `n` into a `Vec<u8>` using a stack buffer, avoiding the intermediate
+/// `String` heap allocation that `n.to_string().into_bytes()` would incur.
+/// i64::MIN is 20 chars including the leading '-'; 21 bytes is sufficient.
+pub(crate) fn i64_to_bytes(n: i64) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = [0u8; 21];
+    let mut cur = std::io::Cursor::new(&mut buf[..]);
+    write!(cur, "{n}").expect("i64 always formats without error");
+    let len = cur.position() as usize;
+    buf[..len].to_vec()
+}
+
 // ── OOM helper ────────────────────────────────────────────────────────────────
 
-fn check_oom(db: &mut Db, ns: &str, key: &str, new_byte_len: usize) -> bool {
-    if db.would_exceed(ns, key, new_byte_len) {
-        let net_delta = db.net_delta(ns, key, new_byte_len);
-        if !db.evict_for_write(ns, net_delta) {
+fn check_oom_net(db: &mut Db, ns: &str, net: usize) -> bool {
+    if db.used_bytes.saturating_add(net) > db.memory_limit {
+        if !db.evict_for_write(ns, net) {
             return false;
         }
     }
     true
+}
+
+fn check_oom(db: &mut Db, ns: &str, key: &str, new_byte_len: usize) -> bool {
+    check_oom_net(db, ns, db.net_delta(ns, key, new_byte_len))
 }
 
 fn resp_array_of_nulls(count: usize) -> std::borrow::Cow<'static, [u8]> {
@@ -538,7 +681,7 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [
         Missing,
         Expired,
         WrongType,
-        Value(Vec<u8>, bool), // value, is_ear
+        Value(std::borrow::Cow<'static, [u8]>, bool), // resp-encoded value, is_ear
     }
 
     let read_state = {
@@ -555,7 +698,11 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [
                             .hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    ReadGet::Value(bytes.to_vec(), db.is_ear_namespace(&ns))
+                    // Build the RESP response while still holding the read lock so
+                    // we copy the value bytes exactly once (into the response buffer)
+                    // rather than first into an intermediate Vec and then again into
+                    // the response.
+                    ReadGet::Value(resp_bulk(bytes), db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -568,12 +715,12 @@ async fn cmd_get(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [
             resp_null()
         }
         ReadGet::WrongType => resp_wrongtype(),
-        ReadGet::Value(value, is_ear) => {
+        ReadGet::Value(resp, is_ear) => {
             if is_ear {
                 let mut db = store.write().await;
                 db.mark_ear(&ns, &key);
             }
-            resp_bulk(&value)
+            resp
         }
     }
 }
@@ -895,7 +1042,7 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         },
     };
     let new_len = existing_len + append_data.len();
-    if !check_oom(&mut db, &ns, &key, new_len) {
+    if !check_oom_net(&mut db, &ns, append_data.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
     let entry = db
@@ -918,8 +1065,11 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(delta);
     let ns_bytes = *nb;
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
-    metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
+    let total_bytes = db.used_bytes;
+    let ns_str = ns.as_ref().to_owned();
+    drop(db);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_str).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
     resp_usize(result_len)
 }
 
@@ -973,7 +1123,7 @@ pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
         Some(n) => n,
         None => return resp_err("increment would overflow"),
     };
-    let new_value = next.to_string().into_bytes();
+    let new_value = i64_to_bytes(next);
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
@@ -1018,7 +1168,7 @@ async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         Some(n) => n,
         None => return resp_err("increment would overflow"),
     };
-    let new_value = next.to_string().into_bytes();
+    let new_value = i64_to_bytes(next);
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
@@ -1056,7 +1206,7 @@ async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         Some(n) => n,
         None => return resp_err("decrement would overflow"),
     };
-    let new_value = next.to_string().into_bytes();
+    let new_value = i64_to_bytes(next);
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
@@ -1101,7 +1251,7 @@ async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         Some(n) => n,
         None => return resp_err("decrement would overflow"),
     };
-    let new_value = next.to_string().into_bytes();
+    let new_value = i64_to_bytes(next);
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
@@ -1146,7 +1296,8 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
     if next.is_nan() || next.is_infinite() {
         return resp_err("increment would produce NaN or Infinity");
     }
-    let new_value = format!("{}", next).into_bytes();
+    let mut new_value = Vec::with_capacity(24);
+    { use std::io::Write; write!(new_value, "{}", next).unwrap(); }
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
@@ -1319,9 +1470,13 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> std::borrow::C
     *nb = nb.saturating_add(net_delta);
     let ns_bytes = *nb;
     let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
-    metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
-    metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
+    let total_bytes = db.used_bytes;
+    let ns_str = ns.as_ref().to_owned();
+    db.touch_key_version(&ns, &key);
+    drop(db);
+    metrics::gauge!("kvns_keys_total", "namespace" => ns_str.clone()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_str).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
     resp_usize(len)
 }
 
@@ -1378,9 +1533,13 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
     *nb = nb.saturating_add(net_delta);
     let ns_bytes = *nb;
     let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
-    metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
-    metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
+    let total_bytes = db.used_bytes;
+    let ns_str = ns.as_ref().to_owned();
+    db.touch_key_version(&ns, &key);
+    drop(db);
+    metrics::gauge!("kvns_keys_total", "namespace" => ns_str.clone()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_str).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
     resp_usize(len)
 }
 
@@ -1389,20 +1548,43 @@ async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
+    let new_items = &args[2..];
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
+    // Expire under the same lock so the existence check and push are atomic.
+    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_some_and(|e| e.is_expired()) {
         db.delete(&ns, &key);
     }
-    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_none() {
-        return resp_int(0);
+    let existing_byte_len = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+        None => return resp_int(0),
+        Some(e) => match &e.value {
+            Value::List(l) => l.iter().map(|v| v.len()).sum::<usize>(),
+            _ => return resp_wrongtype(),
+        },
+    };
+    let added_byte_len: usize = new_items.iter().map(|v| v.len()).sum();
+    let net_delta = Db::entry_size(&ns, &key, existing_byte_len + added_byte_len)
+        .saturating_sub(Db::entry_size(&ns, &key, existing_byte_len));
+    if db.used_bytes.saturating_add(net_delta) > db.memory_limit && !db.evict_for_write(&ns, net_delta) {
+        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
+    let entry = db.entries.entry(ns.clone().into_owned()).or_default().entry(key.clone().into_owned())
+        .or_insert_with(|| Entry { value: Value::List(VecDeque::new()), hits: AtomicU64::new(0), expiry: None });
+    let list = match &mut entry.value { Value::List(l) => l, _ => unreachable!() };
+    for item in new_items.iter() { list.push_front(item.clone()); }
+    let len = list.len();
+    db.used_bytes = db.used_bytes.saturating_add(net_delta);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
+    *nb = nb.saturating_add(net_delta);
+    let ns_bytes = *nb;
+    let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
+    let total_bytes = db.used_bytes;
+    let ns_str = ns.as_ref().to_owned();
+    db.touch_key_version(&ns, &key);
     drop(db);
-    cmd_lpush(args, store).await
+    metrics::gauge!("kvns_keys_total", "namespace" => ns_str.clone()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_str).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
+    resp_usize(len)
 }
 
 async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1410,20 +1592,43 @@ async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
+    let new_items = &args[2..];
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
+    // Expire under the same lock so the existence check and push are atomic.
+    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_some_and(|e| e.is_expired()) {
         db.delete(&ns, &key);
     }
-    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_none() {
-        return resp_int(0);
+    let existing_byte_len = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+        None => return resp_int(0),
+        Some(e) => match &e.value {
+            Value::List(l) => l.iter().map(|v| v.len()).sum::<usize>(),
+            _ => return resp_wrongtype(),
+        },
+    };
+    let added_byte_len: usize = new_items.iter().map(|v| v.len()).sum();
+    let net_delta = Db::entry_size(&ns, &key, existing_byte_len + added_byte_len)
+        .saturating_sub(Db::entry_size(&ns, &key, existing_byte_len));
+    if db.used_bytes.saturating_add(net_delta) > db.memory_limit && !db.evict_for_write(&ns, net_delta) {
+        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
+    let entry = db.entries.entry(ns.clone().into_owned()).or_default().entry(key.clone().into_owned())
+        .or_insert_with(|| Entry { value: Value::List(VecDeque::new()), hits: AtomicU64::new(0), expiry: None });
+    let list = match &mut entry.value { Value::List(l) => l, _ => unreachable!() };
+    for item in new_items.iter() { list.push_back(item.clone()); }
+    let len = list.len();
+    db.used_bytes = db.used_bytes.saturating_add(net_delta);
+    let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
+    *nb = nb.saturating_add(net_delta);
+    let ns_bytes = *nb;
+    let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
+    let total_bytes = db.used_bytes;
+    let ns_str = ns.as_ref().to_owned();
+    db.touch_key_version(&ns, &key);
     drop(db);
-    cmd_rpush(args, store).await
+    metrics::gauge!("kvns_keys_total", "namespace" => ns_str.clone()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_str).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
+    resp_usize(len)
 }
 
 async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1497,12 +1702,16 @@ async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         LPopResult::Single(val, empty) => {
             if empty {
                 db.delete(&ns, &key);
+            } else {
+                db.touch_key_version(&ns, &key);
             }
             resp_bulk(&val)
         }
         LPopResult::Multi(popped, empty) => {
             if empty {
                 db.delete(&ns, &key);
+            } else if !popped.is_empty() {
+                db.touch_key_version(&ns, &key);
             }
             resp_array(&popped)
         }
@@ -1579,12 +1788,16 @@ async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         RPopResult::Single(val, empty) => {
             if empty {
                 db.delete(&ns, &key);
+            } else {
+                db.touch_key_version(&ns, &key);
             }
             resp_bulk(&val)
         }
         RPopResult::Multi(popped, empty) => {
             if empty {
                 db.delete(&ns, &key);
+            } else if !popped.is_empty() {
+                db.touch_key_version(&ns, &key);
             }
             resp_array(&popped)
         }
@@ -1596,23 +1809,21 @@ async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_int(0);
+    let (resp, expired) = {
+        let db = store.read().await;
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => (resp_int(0), false),
+            Some(entry) if entry.is_expired() => (resp_int(0), true),
+            Some(entry) => match &entry.value {
+                Value::List(l) => (resp_usize(l.len()), false),
+                _ => (resp_wrongtype(), false),
+            },
+        }
+    };
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
     }
-    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => resp_int(0),
-        Some(entry) => match &entry.value {
-            Value::List(l) => resp_usize(l.len()),
-            _ => resp_wrongtype(),
-        },
-    }
+    resp
 }
 
 async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1745,22 +1956,26 @@ async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
         return resp_err("ERR no such key");
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_err("ERR no such key"),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_err("ERR no such key"), false),
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
                 let len = list.len() as i64;
                 let idx = if idx_i < 0 { len + idx_i } else { idx_i };
                 if idx < 0 || idx >= len {
-                    resp_err("ERR index out of range")
+                    (resp_err("ERR index out of range"), false)
                 } else {
                     list[idx as usize] = new_val;
-                    resp_ok()
+                    (resp_ok(), true)
                 }
             }
-            _ => resp_wrongtype(),
+            _ => return resp_wrongtype(),
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1786,8 +2001,8 @@ async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
                 let mut removed = 0i64;
@@ -1818,11 +2033,15 @@ async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         removed += 1;
                     }
                 }
-                resp_int(removed)
+                (resp_int(removed), removed > 0)
             }
-            _ => resp_wrongtype(),
+            _ => return resp_wrongtype(),
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1854,8 +2073,8 @@ async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         db.delete(&ns, &key);
         return resp_ok();
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_ok(),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_ok(), false),
         Some(entry) => match &mut entry.value {
             Value::List(list) => {
                 let len = list.len() as i64;
@@ -1880,11 +2099,15 @@ async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
                         .collect();
                     *list = new_list;
                 }
-                resp_ok()
+                (resp_ok(), true)
             }
-            _ => resp_wrongtype(),
+            _ => return resp_wrongtype(),
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1905,20 +2128,24 @@ async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match &mut entry.value {
             Value::List(list) => match list.iter().position(|e| e == &pivot) {
-                None => resp_int(-1),
+                None => (resp_int(-1), false),
                 Some(idx) => {
                     let insert_at = if position == "AFTER" { idx + 1 } else { idx };
                     list.insert(insert_at, element);
-                    resp_usize(list.len())
+                    (resp_usize(list.len()), true)
                 }
             },
-            _ => resp_wrongtype(),
+            _ => return resp_wrongtype(),
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1955,18 +2182,11 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         }
         i += 2;
     }
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_null();
-    }
-    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => resp_null(),
+    let (resp, expired) = {
+    let db = store.read().await;
+    let result = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+        None => (resp_null(), false),
+        Some(entry) if entry.is_expired() => (resp_null(), true),
         Some(entry) => match &entry.value {
             Value::List(list) => {
                 let mut results: Vec<Vec<u8>> = Vec::new();
@@ -1979,7 +2199,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         if item == &element {
                             match_count += 1;
                             if match_count > skip as i64 {
-                                results.push(format!("{}", idx).into_bytes());
+                                results.push(i64_to_bytes(idx as i64));
                                 if let Some(c) = count_opt {
                                     if c > 0 && results.len() >= c {
                                         break;
@@ -1995,7 +2215,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         if item == &element {
                             match_count += 1;
                             if match_count > skip as i64 {
-                                results.push(format!("{}", idx).into_bytes());
+                                results.push(i64_to_bytes(idx as i64));
                                 if let Some(c) = count_opt {
                                     if c > 0 && results.len() >= c {
                                         break;
@@ -2008,17 +2228,24 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                     }
                 }
 
-                if count_opt.is_some() {
+                let r = if count_opt.is_some() {
                     resp_array(&results)
                 } else if results.is_empty() {
                     resp_null()
                 } else {
                     resp_bulk(&results[0])
-                }
+                };
+                (r, false)
             }
-            _ => resp_wrongtype(),
+            _ => (resp_wrongtype(), false),
         },
+    };
+    result
+    };
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
     }
+    resp
 }
 
 async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -2040,6 +2267,16 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         db.delete(&src_ns, &src_key);
         return resp_null();
     }
+
+    // Capture old sizes before any mutation for byte accounting.
+    let old_src_size = db.entries.get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
+        .map(|e| Db::entry_size(&src_ns, &src_key, e.value.byte_len()))
+        .unwrap_or(0);
+    let old_dst_size = db.entries.get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
+        .map(|e| Db::entry_size(&dst_ns, &dst_key, e.value.byte_len()))
+        .unwrap_or(0);
 
     let element = match db
         .entries
@@ -2088,8 +2325,7 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
             } else {
                 new_list.push_back(element);
             }
-            db.entries.entry(dst_ns.clone().into_owned()).or_default().
-insert(
+            db.entries.entry(dst_ns.clone().into_owned()).or_default().insert(
                 dst_key.clone().into_owned(),
                 Entry {
                     value: Value::List(new_list),
@@ -2099,6 +2335,27 @@ insert(
             );
         }
     }
+
+    // Update byte accounting for both keys.
+    let new_src_size = db.entries.get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
+        .map(|e| Db::entry_size(&src_ns, &src_key, e.value.byte_len()))
+        .unwrap_or(0);
+    let new_dst_size = db.entries.get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
+        .map(|e| Db::entry_size(&dst_ns, &dst_key, e.value.byte_len()))
+        .unwrap_or(0);
+    db.used_bytes = db.used_bytes
+        .saturating_sub(old_src_size).saturating_add(new_src_size)
+        .saturating_sub(old_dst_size).saturating_add(new_dst_size);
+    let nb_src = db.namespace_bytes.entry(src_ns.clone().into_owned()).or_insert(0);
+    *nb_src = nb_src.saturating_sub(old_src_size).saturating_add(new_src_size);
+    let nb_dst = db.namespace_bytes.entry(dst_ns.clone().into_owned()).or_insert(0);
+    *nb_dst = nb_dst.saturating_sub(old_dst_size).saturating_add(new_dst_size);
+    db.write_version += 1;
+    let v = db.write_version;
+    db.key_versions.entry(src_ns.into_owned()).or_default().insert(src_key.into_owned(), v);
+    db.key_versions.entry(dst_ns.into_owned()).or_default().insert(dst_key.into_owned(), v);
 
     result
 }
@@ -2127,17 +2384,28 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
     }
 
-    let existing_byte_len: usize = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => 0,
-        Some(e) => match e.value.as_hash() {
-            None => return resp_wrongtype(),
-            Some(h) => h.iter().map(|(k, v)| k.len() + v.len()).sum(),
-        },
-    };
-
-    let added_len: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
-    let new_approx = existing_byte_len + added_len;
-    if !check_oom(&mut db, &ns, &key, new_approx) {
+    let (existing_byte_len, oom_net, is_new_key): (usize, usize, bool) =
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => {
+                let value_bytes: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
+                (0, Db::entry_size(&ns, &key, value_bytes), true)
+            }
+            Some(e) => match e.value.as_hash() {
+                None => return resp_wrongtype(),
+                Some(h) => {
+                    let existing = h.iter().map(|(k, v)| k.len() + v.len()).sum();
+                    let net: isize = pairs
+                        .iter()
+                        .map(|(field, value)| match h.get(field.as_slice()) {
+                            None => (field.len() + value.len()) as isize,
+                            Some(old_v) => value.len() as isize - old_v.len() as isize,
+                        })
+                        .sum();
+                    (existing, net.max(0) as usize, false)
+                }
+            },
+        };
+    if !check_oom_net(&mut db, &ns, oom_net) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
 
@@ -2166,7 +2434,7 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
 
     // Update memory accounting
     let new_byte_len: usize = hash.iter().map(|(k, v)| k.len() + v.len()).sum();
-    let old_size = Db::entry_size(&ns, &key, existing_byte_len);
+    let old_size = if is_new_key { 0 } else { Db::entry_size(&ns, &key, existing_byte_len) };
     let new_size = Db::entry_size(&ns, &key, new_byte_len);
     let delta = new_size.saturating_sub(old_size);
     db.used_bytes = db.used_bytes.saturating_add(delta);
@@ -2174,9 +2442,13 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     *nb = nb.saturating_add(delta);
     let ns_bytes = *nb;
     let ns_keys = db.entries.get::<str>(ns.as_ref()).map(|m| m.len()).unwrap_or(0);
-    metrics::gauge!("kvns_keys_total", "namespace" => ns.as_ref().to_owned()).set(ns_keys as f64);
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
-    metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
+    let total_bytes = db.used_bytes;
+    let ns_owned = ns.as_ref().to_owned();
+    db.touch_key_version(&ns, &key);
+    drop(db);
+    metrics::gauge!("kvns_keys_total", "namespace" => ns_owned.clone()).set(ns_keys as f64);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_owned).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
 
     resp_int(new_fields)
 }
@@ -2227,10 +2499,10 @@ async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_hash_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(h) => {
                 let mut removed = 0i64;
                 for f in fields {
@@ -2238,10 +2510,14 @@ async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         removed += 1;
                     }
                 }
-                resp_int(removed)
+                (resp_int(removed), removed > 0)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_hexists(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -2250,27 +2526,21 @@ async fn cmd_hexists(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
     }
     let (ns, key) = parse_ns_key(&args[1]);
     let field = &args[2];
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_int(0);
+    let (resp, expired) = {
+        let db = store.read().await;
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => (resp_int(0), false),
+            Some(entry) if entry.is_expired() => (resp_int(0), true),
+            Some(entry) => match entry.value.as_hash() {
+                None => (resp_wrongtype(), false),
+                Some(h) => (resp_int(if h.contains_key(field.as_slice()) { 1 } else { 0 }), false),
+            },
+        }
+    };
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
     }
-    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => resp_int(0),
-        Some(entry) => match entry.value.as_hash() {
-            None => resp_wrongtype(),
-            Some(h) => resp_int(if h.contains_key(field.as_slice()) {
-                1
-            } else {
-                0
-            }),
-        },
-    }
+    resp
 }
 
 async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> std::borrow::Cow<'static, [u8]> {
@@ -2495,6 +2765,7 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         }
         None => return resp_wrongtype(),
     }
+    db.touch_key_version(&ns, &key);
     resp_int(next)
 }
 
@@ -2557,6 +2828,7 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'
         }
         None => return resp_wrongtype(),
     }
+    db.touch_key_version(&ns, &key);
     resp_bulk(&new_val)
 }
 
@@ -2672,15 +2944,26 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
     }
 
-    let existing_byte_len: usize = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => 0,
-        Some(e) => match e.value.as_set() {
-            None => return resp_wrongtype(),
-            Some(s) => s.iter().map(|v| v.len()).sum(),
-        },
-    };
-    let added_len: usize = members.iter().map(|m| m.len()).sum();
-    if !check_oom(&mut db, &ns, &key, existing_byte_len + added_len) {
+    let (existing_byte_len, oom_net, is_new_key): (usize, usize, bool) =
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => {
+                let value_bytes: usize = members.iter().map(|m| m.len()).sum();
+                (0, Db::entry_size(&ns, &key, value_bytes), true)
+            }
+            Some(e) => match e.value.as_set() {
+                None => return resp_wrongtype(),
+                Some(s) => {
+                    let existing = s.iter().map(|v| v.len()).sum();
+                    let net: usize = members
+                        .iter()
+                        .filter(|m| !s.contains(m.as_slice()))
+                        .map(|m| m.len())
+                        .sum();
+                    (existing, net, false)
+                }
+            },
+        };
+    if !check_oom_net(&mut db, &ns, oom_net) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
 
@@ -2707,15 +2990,19 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
 
     // Update memory
     let new_byte_len: usize = set.iter().map(|v| v.len()).sum();
-    let old_size = Db::entry_size(&ns, &key, existing_byte_len);
+    let old_size = if is_new_key { 0 } else { Db::entry_size(&ns, &key, existing_byte_len) };
     let new_size = Db::entry_size(&ns, &key, new_byte_len);
     let delta = new_size.saturating_sub(old_size);
     db.used_bytes = db.used_bytes.saturating_add(delta);
     let nb = db.namespace_bytes.entry(ns.clone().into_owned()).or_insert(0);
     *nb = nb.saturating_add(delta);
     let ns_bytes = *nb;
-    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns.as_ref().to_owned()).set(ns_bytes as f64);
-    metrics::gauge!("kvns_memory_used_bytes_total").set(db.used_bytes as f64);
+    let total_bytes = db.used_bytes;
+    let ns_owned = ns.as_ref().to_owned();
+    db.touch_key_version(&ns, &key);
+    drop(db);
+    metrics::gauge!("kvns_memory_used_bytes", "namespace" => ns_owned).set(ns_bytes as f64);
+    metrics::gauge!("kvns_memory_used_bytes_total").set(total_bytes as f64);
 
     resp_usize(added)
 }
@@ -2736,10 +3023,10 @@ async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_set_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(s) => {
                 let mut removed = 0i64;
                 for m in members {
@@ -2747,10 +3034,14 @@ async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         removed += 1;
                     }
                 }
-                resp_int(removed)
+                (resp_int(removed), removed > 0)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -2787,23 +3078,21 @@ async fn cmd_scard(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return resp_int(0);
+    let (resp, expired) = {
+        let db = store.read().await;
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => (resp_int(0), false),
+            Some(entry) if entry.is_expired() => (resp_int(0), true),
+            Some(entry) => match entry.value.as_set() {
+                None => (resp_wrongtype(), false),
+                Some(s) => (resp_usize(s.len()), false),
+            },
+        }
+    };
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
     }
-    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => resp_int(0),
-        Some(entry) => match entry.value.as_set() {
-            None => resp_wrongtype(),
-            Some(s) => resp_usize(s.len()),
-        },
-    }
+    resp
 }
 
 async fn cmd_sismember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -2891,30 +3180,31 @@ async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    let mut db = store.write().await;
-    let mut result: HashSet<Vec<u8>> = HashSet::new();
-    for raw_key in &args[1..] {
-        let (ns, key) = parse_ns_key(raw_key);
-        if db
-            .entries
-            .get::<str>(ns.as_ref())
-            .and_then(|m| m.get::<str>(key.as_ref()))
-            .is_some_and(|e| e.is_expired())
-        {
-            db.delete(&ns, &key);
-            continue;
-        }
-        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-            None => {}
-            Some(entry) => match entry.value.as_set() {
-                None => return resp_wrongtype(),
-                Some(s) => {
-                    for member in s {
-                        result.insert(member.clone());
-                    }
+    let mut expired: Vec<(String, String)> = Vec::new();
+    let result = {
+        let db = store.read().await;
+        let mut acc: HashSet<Vec<u8>> = HashSet::new();
+        for raw_key in &args[1..] {
+            let (ns, key) = parse_ns_key(raw_key);
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+                None => {}
+                Some(entry) if entry.is_expired() => {
+                    expired.push((ns.into_owned(), key.into_owned()));
                 }
-            },
+                Some(entry) => match entry.value.as_set() {
+                    None => return resp_wrongtype(),
+                    Some(s) => {
+                        for member in s {
+                            acc.insert(member.clone());
+                        }
+                    }
+                },
+            }
         }
+        acc
+    };
+    for (ns, key) in &expired {
+        cleanup_expired_key(store, ns, key).await;
     }
     let mut members: Vec<Vec<u8>> = result.into_iter().collect();
     members.sort();
@@ -2925,38 +3215,42 @@ async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    let mut db = store.write().await;
-    let mut sets: Vec<&HashSet<Vec<u8>>> = Vec::new();
-    for raw_key in &args[1..] {
-        let (ns, key) = parse_ns_key(raw_key);
-        if db
-            .entries
-            .get::<str>(ns.as_ref())
-            .and_then(|m| m.get::<str>(key.as_ref()))
-            .is_some_and(|e| e.is_expired())
-        {
-            db.delete(&ns, &key);
-            return resp_array(&[]);
+    // Read pass: clone sets and collect expired keys.
+    let mut expired: Vec<(String, String)> = Vec::new();
+    let sets_owned: Vec<HashSet<Vec<u8>>> = {
+        let db = store.read().await;
+        let mut acc: Vec<HashSet<Vec<u8>>> = Vec::new();
+        for raw_key in &args[1..] {
+            let (ns, key) = parse_ns_key(raw_key);
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+                None => return resp_array(&[]),
+                Some(entry) if entry.is_expired() => {
+                    expired.push((ns.into_owned(), key.into_owned()));
+                    // An expired key contributes no members, so intersection is empty.
+                    return resp_array(&[]);
+                }
+                Some(entry) => match entry.value.as_set() {
+                    None => return resp_wrongtype(),
+                    Some(s) => acc.push(s.clone()),
+                },
+            }
         }
-        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-            None => return resp_array(&[]),
-            Some(entry) => match entry.value.as_set() {
-                None => return resp_wrongtype(),
-                Some(s) => sets.push(s),
-            },
-        }
+        acc
+    };
+    for (ns, key) in &expired {
+        cleanup_expired_key(store, ns, key).await;
     }
-    if sets.is_empty() {
+    if sets_owned.is_empty() {
         return resp_array(&[]);
     }
-    let (smallest_idx, smallest) = sets
+    let (smallest_idx, smallest) = sets_owned
         .iter()
         .enumerate()
         .min_by_key(|(_, s)| s.len())
-        .unwrap_or_else(|| unreachable!("sets is non-empty, guarded above"));
+        .unwrap_or_else(|| unreachable!("sets_owned is non-empty, guarded above"));
     let mut result: HashSet<Vec<u8>> = HashSet::new();
     for member in smallest.iter() {
-        if sets
+        if sets_owned
             .iter()
             .enumerate()
             .all(|(idx, s)| idx == smallest_idx || s.contains(member))
@@ -2973,44 +3267,45 @@ async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    let mut db = store.write().await;
-    let parsed: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = args[1..].iter().map(|raw| parse_ns_key(raw)).collect();
-    for (idx, (ns, key)) in parsed.iter().enumerate() {
-        if db
-            .entries
-            .get::<str>(ns.as_ref())
-            .and_then(|m| m.get::<str>(key.as_ref()))
-            .is_some_and(|e| e.is_expired())
-        {
-            db.delete(ns, key);
-            if idx == 0 {
-                return resp_array(&[]);
-            }
-        }
-    }
-
-    let mut sets: Vec<Option<&HashSet<Vec<u8>>>> = Vec::new();
-    for (idx, (ns, key)) in parsed.iter().enumerate() {
-        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-            None => {
-                if idx == 0 {
-                    return resp_array(&[]);
+    let mut expired: Vec<(String, String)> = Vec::new();
+    // None in the vec means "key missing or expired" for non-first slots.
+    let sets_owned: Vec<Option<HashSet<Vec<u8>>>> = {
+        let db = store.read().await;
+        let mut acc: Vec<Option<HashSet<Vec<u8>>>> = Vec::new();
+        for (idx, raw_key) in args[1..].iter().enumerate() {
+            let (ns, key) = parse_ns_key(raw_key);
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+                None => {
+                    if idx == 0 {
+                        return resp_array(&[]);
+                    }
+                    acc.push(None);
                 }
-                sets.push(None);
+                Some(entry) if entry.is_expired() => {
+                    expired.push((ns.into_owned(), key.into_owned()));
+                    if idx == 0 {
+                        return resp_array(&[]);
+                    }
+                    acc.push(None);
+                }
+                Some(entry) => match entry.value.as_set() {
+                    None => return resp_wrongtype(),
+                    Some(s) => acc.push(Some(s.clone())),
+                },
             }
-            Some(entry) => match entry.value.as_set() {
-                None => return resp_wrongtype(),
-                Some(s) => sets.push(Some(s)),
-            },
         }
+        acc
+    };
+    for (ns, key) in &expired {
+        cleanup_expired_key(store, ns, key).await;
     }
-    if sets.is_empty() || sets[0].is_none() {
+    if sets_owned.is_empty() || sets_owned[0].is_none() {
         return resp_array(&[]);
     }
-    let first = sets[0].unwrap_or_else(|| unreachable!("sets is non-empty, guarded above"));
+    let first = sets_owned[0].as_ref().unwrap_or_else(|| unreachable!("guarded above"));
     let mut result: HashSet<Vec<u8>> = HashSet::new();
     for member in first {
-        let present_elsewhere = sets[1..].iter().flatten().any(|s| s.contains(member));
+        let present_elsewhere = sets_owned[1..].iter().flatten().any(|s| s.contains(member));
         if !present_elsewhere {
             result.insert(member.clone());
         }
@@ -3208,6 +3503,16 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         return resp_int(0);
     }
 
+    // Capture old sizes before any mutation for byte accounting.
+    let old_src_size = db.entries.get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
+        .map(|e| Db::entry_size(&src_ns, &src_key, e.value.byte_len()))
+        .unwrap_or(0);
+    let old_dst_size = db.entries.get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
+        .map(|e| Db::entry_size(&dst_ns, &dst_key, e.value.byte_len()))
+        .unwrap_or(0);
+
     let found = match db
         .entries
         .get_mut::<str>(src_ns.as_ref())
@@ -3239,8 +3544,7 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         None => {
             let mut s = HashSet::new();
             s.insert(member);
-            db.entries.entry(dst_ns.clone().into_owned()).or_default().
-insert(
+            db.entries.entry(dst_ns.clone().into_owned()).or_default().insert(
                 dst_key.clone().into_owned(),
                 Entry {
                     value: Value::Set(s),
@@ -3250,6 +3554,28 @@ insert(
             );
         }
     }
+
+    // Update byte accounting for both keys.
+    let new_src_size = db.entries.get::<str>(src_ns.as_ref())
+        .and_then(|m| m.get::<str>(src_key.as_ref()))
+        .map(|e| Db::entry_size(&src_ns, &src_key, e.value.byte_len()))
+        .unwrap_or(0);
+    let new_dst_size = db.entries.get::<str>(dst_ns.as_ref())
+        .and_then(|m| m.get::<str>(dst_key.as_ref()))
+        .map(|e| Db::entry_size(&dst_ns, &dst_key, e.value.byte_len()))
+        .unwrap_or(0);
+    db.used_bytes = db.used_bytes
+        .saturating_sub(old_src_size).saturating_add(new_src_size)
+        .saturating_sub(old_dst_size).saturating_add(new_dst_size);
+    let nb_src = db.namespace_bytes.entry(src_ns.clone().into_owned()).or_insert(0);
+    *nb_src = nb_src.saturating_sub(old_src_size).saturating_add(new_src_size);
+    let nb_dst = db.namespace_bytes.entry(dst_ns.clone().into_owned()).or_insert(0);
+    *nb_dst = nb_dst.saturating_sub(old_dst_size).saturating_add(new_dst_size);
+    db.write_version += 1;
+    let v = db.write_version;
+    db.key_versions.entry(src_ns.into_owned()).or_default().insert(src_key.into_owned(), v);
+    db.key_versions.entry(dst_ns.into_owned()).or_default().insert(dst_key.into_owned(), v);
+
     resp_int(1)
 }
 
@@ -3285,37 +3611,36 @@ async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         };
     }
 
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => {
-            if count.is_some() {
-                resp_array(&[])
-            } else {
-                resp_null()
-            }
-        }
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (if count.is_some() { resp_array(&[]) } else { resp_null() }, false),
         Some(entry) => match entry.value.as_set_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(s) => {
                 if let Some(c) = count {
                     let popped: Vec<Vec<u8>> = s.iter().take(c).cloned().collect();
                     for m in &popped {
                         s.remove(m.as_slice());
                     }
-                    resp_array(&popped)
+                    let was_popped = !popped.is_empty();
+                    (resp_array(&popped), was_popped)
                 } else {
                     // pop one
                     let member = s.iter().next().cloned();
                     match member {
-                        None => resp_null(),
+                        None => (resp_null(), false),
                         Some(m) => {
                             s.remove(m.as_slice());
-                            resp_bulk(&m)
+                            (resp_bulk(&m), true)
                         }
                     }
                 }
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -3335,65 +3660,59 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
         None
     };
 
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-        return if count_opt.is_some() {
-            resp_array(&[])
-        } else {
-            resp_null()
-        };
-    }
-
-    let (resp, mark) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => {
-            if count_opt.is_some() {
-                (resp_array(&[]), false)
-            } else {
-                (resp_null(), false)
+    let (resp, expired, mark, is_ear) = {
+        let db = store.read().await;
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => {
+                let r = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                (r, false, false, false)
             }
-        }
-        Some(entry) => match entry.value.as_set() {
-            None => return resp_wrongtype(),
-            Some(s) => {
-                // Clone members to release borrow before potential mark_ear call.
-                let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
-                members.sort();
-                match count_opt {
-                    None => {
-                        if members.is_empty() {
-                            (resp_null(), false)
-                        } else {
-                            (resp_bulk(&members[0]), true)
-                        }
-                    }
-                    Some(count) => {
-                        let abs_count = count.unsigned_abs() as usize;
-                        let allow_repeat = count < 0;
-                        let mut result: Vec<Vec<u8>> = Vec::new();
-                        if allow_repeat {
-                            for i in 0..abs_count {
-                                let idx = i % members.len().max(1);
-                                result.push(members[idx].clone());
-                            }
-                        } else {
-                            let take = abs_count.min(members.len());
-                            for member in members.iter().take(take) {
-                                result.push(member.clone());
+            Some(entry) if entry.is_expired() => {
+                let r = if count_opt.is_some() { resp_array(&[]) } else { resp_null() };
+                (r, true, false, false)
+            }
+            Some(entry) => match entry.value.as_set() {
+                None => (resp_wrongtype(), false, false, false),
+                Some(s) => {
+                    let is_ear = db.is_ear_namespace(&ns);
+                    let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
+                    members.sort();
+                    let (r, mark) = match count_opt {
+                        None => {
+                            if members.is_empty() {
+                                (resp_null(), false)
+                            } else {
+                                (resp_bulk(&members[0]), true)
                             }
                         }
-                        (resp_array(&result), !result.is_empty())
-                    }
+                        Some(count) => {
+                            let abs_count = count.unsigned_abs() as usize;
+                            let allow_repeat = count < 0;
+                            let mut result: Vec<Vec<u8>> = Vec::new();
+                            if allow_repeat {
+                                for i in 0..abs_count {
+                                    let idx = i % members.len().max(1);
+                                    result.push(members[idx].clone());
+                                }
+                            } else {
+                                let take = abs_count.min(members.len());
+                                for member in members.iter().take(take) {
+                                    result.push(member.clone());
+                                }
+                            }
+                            let nonempty = !result.is_empty();
+                            (resp_array(&result), nonempty)
+                        }
+                    };
+                    (r, false, mark, is_ear)
                 }
-            }
-        },
+            },
+        }
     };
-    if mark {
+    if expired {
+        cleanup_expired_key(store, &ns, &key).await;
+    } else if mark && is_ear {
+        let mut db = store.write().await;
         db.mark_ear(&ns, &key);
     }
     resp
@@ -3570,6 +3889,10 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                 added += 1;
             }
         }
+    }
+
+    if added > 0 || changed > 0 || (incr && last_score.is_some()) {
+        db.touch_key_version(&ns, &key);
     }
 
     if incr {
@@ -4266,10 +4589,10 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_zset_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(data) => {
                 let before = data.len();
                 for m in members {
@@ -4283,10 +4606,15 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                         }
                     }
                 }
-                resp_usize(before - data.len())
+                let removed = before - data.len();
+                (resp_usize(removed), removed > 0)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_zcard(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -4412,6 +4740,7 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         }
         None => return resp_wrongtype(),
     }
+    db.touch_key_version(&ns, &key);
     resp_bulk(&format_score(new_score))
 }
 
@@ -4554,10 +4883,10 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_zset_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(data) => {
                 let len = data.sorted.len() as i64;
                 let start = if start_i < 0 {
@@ -4581,10 +4910,14 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
                         data.index.remove(e.member.as_slice());
                     }
                 }
-                resp_usize(count)
+                (resp_usize(count), count > 0)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -4610,10 +4943,10 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_zset_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(data) => {
                 let before = data.len();
                 let mut to_remove: Vec<Vec<u8>> = Vec::new();
@@ -4636,10 +4969,15 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
                 for m in to_remove {
                     data.index.remove(m.as_slice());
                 }
-                resp_usize(before - data.len())
+                let removed = before - data.len();
+                (resp_usize(removed), removed > 0)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -4665,10 +5003,10 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
         db.delete(&ns, &key);
         return resp_int(0);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_int(0),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_int(0), false),
         Some(entry) => match entry.value.as_zset_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(data) => {
                 let before = data.len();
                 let mut to_remove: Vec<Vec<u8>> = Vec::new();
@@ -4683,10 +5021,15 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
                 for m in to_remove {
                     data.index.remove(m.as_slice());
                 }
-                resp_usize(before - data.len())
+                let removed = before - data.len();
+                (resp_usize(removed), removed > 0)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -4716,10 +5059,10 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_array(&[]),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_array(&[]), false),
         Some(entry) => match entry.value.as_zset_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(data) => {
                 let mut result: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..count {
@@ -4731,10 +5074,15 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
                     result.push(e.member);
                     result.push(format_score(e.score));
                 }
-                resp_array(&result)
+                let was_popped = !result.is_empty();
+                (resp_array(&result), was_popped)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -4764,10 +5112,10 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         db.delete(&ns, &key);
         return resp_array(&[]);
     }
-    match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => resp_array(&[]),
+    let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
+        None => (resp_array(&[]), false),
         Some(entry) => match entry.value.as_zset_mut() {
-            None => resp_wrongtype(),
+            None => return resp_wrongtype(),
             Some(data) => {
                 let mut result: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..count {
@@ -4779,10 +5127,15 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
                     result.push(e.member);
                     result.push(format_score(e.score));
                 }
-                resp_array(&result)
+                let was_popped = !result.is_empty();
+                (resp_array(&result), was_popped)
             }
         },
+    };
+    if modified {
+        db.touch_key_version(&ns, &key);
     }
+    resp
 }
 
 async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -5435,6 +5788,7 @@ async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
 
     let db = store.read().await;
     let mut all_keys: Vec<Vec<u8>> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
 
     for (ns, ns_map) in &db.entries {
         for (key, entry) in ns_map {
@@ -5446,17 +5800,21 @@ async fn cmd_scan(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             {
                 continue;
             }
-            let display: Vec<u8> = if ns == "default" {
-                key.as_bytes().to_vec()
+            let display: &[u8] = if ns == "default" {
+                key.as_bytes()
             } else {
-                format!("{ns}/{key}").into_bytes()
+                scratch.clear();
+                scratch.extend_from_slice(ns.as_bytes());
+                scratch.push(b'/');
+                scratch.extend_from_slice(key.as_bytes());
+                &scratch
             };
             if let Some(pat) = pattern
-                && !glob_match(pat, &display)
+                && !glob_match(pat, display)
             {
                 continue;
             }
-            all_keys.push(display);
+            all_keys.push(display.to_vec());
         }
     }
     drop(db);
@@ -5486,18 +5844,23 @@ pub(crate) async fn cmd_keys(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
     let db = store.read().await;
 
     let mut matched: Vec<Vec<u8>> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
     for (ns, ns_map) in &db.entries {
         for (key, entry) in ns_map {
             if entry.is_expired() {
                 continue;
             }
-            let display: Vec<u8> = if ns == "default" {
-                key.as_bytes().to_vec()
+            let display: &[u8] = if ns == "default" {
+                key.as_bytes()
             } else {
-                format!("{ns}/{key}").into_bytes()
+                scratch.clear();
+                scratch.extend_from_slice(ns.as_bytes());
+                scratch.push(b'/');
+                scratch.extend_from_slice(key.as_bytes());
+                &scratch
             };
-            if glob_match(pattern, &display) {
-                matched.push(display);
+            if glob_match(pattern, display) {
+                matched.push(display.to_vec());
             }
         }
     }
@@ -5509,23 +5872,27 @@ pub(crate) async fn cmd_touch(args: &[Vec<u8>], store: &Store) -> std::borrow::C
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    let mut count = 0i64;
-    let mut db = store.write().await;
-    for raw_key in &args[1..] {
-        let (ns, key) = parse_ns_key(raw_key);
-        if db
-            .entries
-            .get::<str>(ns.as_ref())
-            .and_then(|m| m.get::<str>(key.as_ref()))
-            .is_some_and(|e| e.is_expired())
-        {
-            db.delete(&ns, &key);
-            continue;
+    let mut expired: Vec<(String, String)> = Vec::new();
+    let count = {
+        let db = store.read().await;
+        let mut n = 0i64;
+        for raw_key in &args[1..] {
+            let (ns, key) = parse_ns_key(raw_key);
+            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+                None => {}
+                Some(entry) if entry.is_expired() => {
+                    expired.push((ns.into_owned(), key.into_owned()));
+                }
+                Some(entry) => {
+                    entry.hits.store(0, std::sync::atomic::Ordering::Relaxed);
+                    n += 1;
+                }
+            }
         }
-        if let Some(entry) = db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-            entry.hits.store(0, std::sync::atomic::Ordering::Relaxed);
-            count += 1;
-        }
+        n
+    };
+    for (ns, key) in &expired {
+        cleanup_expired_key(store, ns, key).await;
     }
     resp_int(count)
 }
@@ -5903,6 +6270,267 @@ async fn cmd_xadd(_args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'static
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TRANSACTION COMMANDS (MULTI / EXEC / DISCARD / WATCH / UNWATCH)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_multi(conn: &mut ConnState) -> std::borrow::Cow<'static, [u8]> {
+    if conn.multi_state.is_some() {
+        return resp_err("MULTI calls can not be nested");
+    }
+    conn.multi_state = Some(MultiState::new());
+    resp_ok()
+}
+
+fn cmd_discard(conn: &mut ConnState) -> std::borrow::Cow<'static, [u8]> {
+    if conn.multi_state.is_none() {
+        return resp_err("DISCARD without MULTI");
+    }
+    conn.multi_state = None;
+    conn.watched.clear();
+    resp_ok()
+}
+
+async fn cmd_exec(
+    store: &Store,
+    conn: &mut ConnState,
+    hub: &PubSubHub,
+) -> std::borrow::Cow<'static, [u8]> {
+    let Some(ms) = conn.multi_state.take() else {
+        return resp_err("EXEC without MULTI");
+    };
+    // Clear WATCH state regardless of outcome.
+    let watched = std::mem::take(&mut conn.watched);
+
+    if ms.error {
+        return std::borrow::Cow::Borrowed(b"-EXECABORT Transaction discarded because of previous errors.\r\n");
+    }
+
+    // Check watched keys for dirty writes.
+    if !watched.is_empty() {
+        let db = store.read().await;
+        let dirty = watched
+            .iter()
+            .any(|((ns, key), &ver)| db.key_version(ns, key) != ver);
+        drop(db);
+        if dirty {
+            // Optimistic lock failed: return null array (nil multi-bulk).
+            return resp_null_array();
+        }
+    }
+
+    // Execute queued commands and collect responses.
+    let count = ms.queued.len();
+    let mut buf: Vec<u8> = Vec::new();
+    append_array_header(&mut buf, count);
+    for cmd_args in ms.queued {
+        let (resp, _quit) = Box::pin(dispatch(&cmd_args, store, conn, hub)).await;
+        buf.extend_from_slice(&resp);
+    }
+    std::borrow::Cow::Owned(buf)
+}
+
+async fn cmd_watch(
+    args: &[Vec<u8>],
+    store: &Store,
+    conn: &mut ConnState,
+) -> std::borrow::Cow<'static, [u8]> {
+    if args.len() < 2 {
+        return wrong_args(&args[0]);
+    }
+    if conn.multi_state.is_some() {
+        return resp_err("WATCH inside MULTI is not allowed");
+    }
+    let db = store.read().await;
+    for raw_key in &args[1..] {
+        let (ns, key) = parse_ns_key(raw_key);
+        let ver = db.key_version(&ns, &key);
+        conn.watched.insert((ns.into_owned(), key.into_owned()), ver);
+    }
+    drop(db);
+    resp_ok()
+}
+
+fn cmd_unwatch(conn: &mut ConnState) -> std::borrow::Cow<'static, [u8]> {
+    conn.watched.clear();
+    resp_ok()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUB-SUB COMMANDS (SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBLISH)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build the subscription confirmation reply sent for SUBSCRIBE/UNSUBSCRIBE.
+fn pubsub_reply(kind: &[u8], channel: &[u8], count: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    append_array_header(&mut buf, 3);
+    append_bulk(&mut buf, kind);
+    append_bulk(&mut buf, channel);
+    append_int(&mut buf, count as i64);
+    buf
+}
+
+/// Build the subscription confirmation reply sent for PSUBSCRIBE/PUNSUBSCRIBE.
+fn ppubsub_reply(kind: &[u8], pattern: &[u8], count: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    append_array_header(&mut buf, 3);
+    append_bulk(&mut buf, kind);
+    append_bulk(&mut buf, pattern);
+    append_int(&mut buf, count as i64);
+    buf
+}
+
+async fn cmd_subscribe(
+    args: &[Vec<u8>],
+    conn: &mut ConnState,
+    hub: &PubSubHub,
+) -> std::borrow::Cow<'static, [u8]> {
+    if args.len() < 2 {
+        return wrong_args(&args[0]);
+    }
+    let tx = conn.pubsub_sender();
+    {
+        let mut hub_guard = hub.write().await;
+        for channel_bytes in &args[1..] {
+            let channel = String::from_utf8_lossy(channel_bytes).into_owned();
+            hub_guard.subscribe(&channel, conn.client_id, tx.clone());
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity((args.len() - 1) * 80);
+    for channel_bytes in &args[1..] {
+        let channel = String::from_utf8_lossy(channel_bytes).into_owned();
+        conn.subscribed_channels.insert(channel);
+        let count = conn.subscribed_channels.len() + conn.subscribed_patterns.len();
+        buf.extend_from_slice(&pubsub_reply(b"subscribe", channel_bytes, count));
+    }
+    std::borrow::Cow::Owned(buf)
+}
+
+async fn cmd_unsubscribe(
+    args: &[Vec<u8>],
+    conn: &mut ConnState,
+    hub: &PubSubHub,
+) -> std::borrow::Cow<'static, [u8]> {
+    let channels: Vec<String> = if args.len() < 2 {
+        conn.subscribed_channels.iter().cloned().collect()
+    } else {
+        args[1..].iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect()
+    };
+    {
+        let mut hub_guard = hub.write().await;
+        for channel in &channels {
+            hub_guard.unsubscribe(channel, conn.client_id);
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(channels.len().max(1) * 80);
+    if channels.is_empty() {
+        let total = conn.subscribed_channels.len() + conn.subscribed_patterns.len();
+        buf.extend_from_slice(&pubsub_reply(b"unsubscribe", b"", total));
+    } else {
+        for channel in &channels {
+            conn.subscribed_channels.remove(channel);
+            let count = conn.subscribed_channels.len() + conn.subscribed_patterns.len();
+            buf.extend_from_slice(&pubsub_reply(b"unsubscribe", channel.as_bytes(), count));
+        }
+    }
+    std::borrow::Cow::Owned(buf)
+}
+
+async fn cmd_psubscribe(
+    args: &[Vec<u8>],
+    conn: &mut ConnState,
+    hub: &PubSubHub,
+) -> std::borrow::Cow<'static, [u8]> {
+    if args.len() < 2 {
+        return wrong_args(&args[0]);
+    }
+    let tx = conn.pubsub_sender();
+    {
+        let mut hub_guard = hub.write().await;
+        for pattern_bytes in &args[1..] {
+            let pattern = String::from_utf8_lossy(pattern_bytes).into_owned();
+            hub_guard.psubscribe(&pattern, conn.client_id, tx.clone());
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity((args.len() - 1) * 80);
+    for pattern_bytes in &args[1..] {
+        let pattern = String::from_utf8_lossy(pattern_bytes).into_owned();
+        conn.subscribed_patterns.insert(pattern);
+        let count = conn.subscribed_channels.len() + conn.subscribed_patterns.len();
+        buf.extend_from_slice(&ppubsub_reply(b"psubscribe", pattern_bytes, count));
+    }
+    std::borrow::Cow::Owned(buf)
+}
+
+async fn cmd_punsubscribe(
+    args: &[Vec<u8>],
+    conn: &mut ConnState,
+    hub: &PubSubHub,
+) -> std::borrow::Cow<'static, [u8]> {
+    let patterns: Vec<String> = if args.len() < 2 {
+        conn.subscribed_patterns.iter().cloned().collect()
+    } else {
+        args[1..].iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect()
+    };
+    {
+        let mut hub_guard = hub.write().await;
+        for pattern in &patterns {
+            hub_guard.punsubscribe(pattern, conn.client_id);
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(patterns.len().max(1) * 80);
+    if patterns.is_empty() {
+        let total = conn.subscribed_channels.len() + conn.subscribed_patterns.len();
+        buf.extend_from_slice(&ppubsub_reply(b"punsubscribe", b"", total));
+    } else {
+        for pattern in &patterns {
+            conn.subscribed_patterns.remove(pattern);
+            let count = conn.subscribed_channels.len() + conn.subscribed_patterns.len();
+            buf.extend_from_slice(&ppubsub_reply(b"punsubscribe", pattern.as_bytes(), count));
+        }
+    }
+    std::borrow::Cow::Owned(buf)
+}
+
+async fn cmd_publish(
+    args: &[Vec<u8>],
+    hub: &PubSubHub,
+) -> std::borrow::Cow<'static, [u8]> {
+    if args.len() != 3 {
+        return wrong_args(&args[0]);
+    }
+    let channel = String::from_utf8_lossy(&args[1]);
+    let count = hub.read().await.publish(&channel, &args[2]);
+    resp_usize(count)
+}
+
+/// Encode a PubSubMessage into RESP bytes to be written to a subscriber's socket.
+pub(crate) fn encode_pubsub_message(msg: &PubSubMessage, _resp_version: u8) -> Vec<u8> {
+    let cap = match msg {
+        PubSubMessage::Message { channel, data } => 32 + channel.len() + data.len(),
+        PubSubMessage::PMessage { pattern, channel, data } => {
+            48 + pattern.len() + channel.len() + data.len()
+        }
+    };
+    let mut buf = Vec::with_capacity(cap);
+    match msg {
+        PubSubMessage::Message { channel, data } => {
+            append_array_header(&mut buf, 3);
+            append_bulk(&mut buf, b"message");
+            append_bulk(&mut buf, channel.as_bytes());
+            append_bulk(&mut buf, &data);
+        }
+        PubSubMessage::PMessage { pattern, channel, data } => {
+            append_array_header(&mut buf, 4);
+            append_bulk(&mut buf, b"pmessage");
+            append_bulk(&mut buf, pattern.as_bytes());
+            append_bulk(&mut buf, channel.as_bytes());
+            append_bulk(&mut buf, &data);
+        }
+    }
+    buf
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DISPATCH
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -5910,6 +6538,7 @@ pub(crate) async fn dispatch(
     args: &[Vec<u8>],
     store: &Store,
     conn: &mut ConnState,
+    hub: &PubSubHub,
 ) -> (std::borrow::Cow<'static, [u8]>, bool) {
     if args.is_empty() {
         return (resp_err("empty command"), false);
@@ -5923,13 +6552,73 @@ pub(crate) async fn dispatch(
     }
     let cmd = &cmd_upper[..cmd_len];
 
+    // ── Pub-sub mode: only a restricted command set is allowed ────────────────
+    if conn.in_pubsub() {
+        let allowed = matches!(
+            cmd,
+            b"SUBSCRIBE"
+                | b"UNSUBSCRIBE"
+                | b"PSUBSCRIBE"
+                | b"PUNSUBSCRIBE"
+                | b"PING"
+                | b"RESET"
+                | b"QUIT"
+        );
+        if !allowed {
+            return (
+                resp_err(
+                    "Command not allowed in pub/sub mode. \
+                     Use SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE/PING/RESET/QUIT.",
+                ),
+                false,
+            );
+        }
+    }
+
+    // ── MULTI queuing: queue all commands except EXEC/DISCARD/MULTI ──────────
+    if conn.multi_state.is_some()
+        && !matches!(cmd, b"EXEC" | b"DISCARD" | b"MULTI" | b"WATCH" | b"UNWATCH")
+    {
+        conn.multi_state.as_mut().unwrap().queued.push(args.to_vec());
+        return (std::borrow::Cow::Borrowed(b"+QUEUED\r\n"), false);
+    }
+
     let resp = match cmd {
         // Connection
         b"PING" => resp_pong(),
         b"QUIT" => return (resp_ok(), true),
         b"HELLO" => cmd_hello(args, store, conn).await,
-        b"RESET" => cmd_reset(conn),
+        b"RESET" => {
+            // RESET also clears pub-sub state and exits MULTI.
+            if let Some(ms) = conn.multi_state.take() {
+                drop(ms);
+            }
+            conn.watched.clear();
+            // Unsubscribe from all channels/patterns.
+            if conn.in_pubsub() {
+                let mut hub_guard = hub.write().await;
+                hub_guard.remove_client(conn.client_id);
+                drop(hub_guard);
+                conn.subscribed_channels.clear();
+                conn.subscribed_patterns.clear();
+            }
+            cmd_reset(conn)
+        }
         b"SELECT" => cmd_select(args, store).await,
+
+        // Transactions
+        b"MULTI" => cmd_multi(conn),
+        b"EXEC" => return (cmd_exec(store, conn, hub).await, false),
+        b"DISCARD" => cmd_discard(conn),
+        b"WATCH" => cmd_watch(args, store, conn).await,
+        b"UNWATCH" => cmd_unwatch(conn),
+
+        // Pub-sub
+        b"SUBSCRIBE" => cmd_subscribe(args, conn, hub).await,
+        b"UNSUBSCRIBE" => cmd_unsubscribe(args, conn, hub).await,
+        b"PSUBSCRIBE" => cmd_psubscribe(args, conn, hub).await,
+        b"PUNSUBSCRIBE" => cmd_punsubscribe(args, conn, hub).await,
+        b"PUBLISH" => cmd_publish(args, hub).await,
 
         // String
         b"SET" => cmd_set(args, store).await,
@@ -6091,6 +6780,10 @@ mod tests {
         ConnState::new(0)
     }
 
+    fn make_hub() -> crate::pubsub::PubSubHub {
+        crate::pubsub::new_hub()
+    }
+
     fn args(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
@@ -6152,7 +6845,7 @@ mod tests {
     async fn ping_returns_pong() {
         let store = make_store();
         let mut conn = make_conn();
-        let (resp, quit) = dispatch(&args(&["PING"]), &store, &mut conn).await;
+        let (resp, quit) = dispatch(&args(&["PING"]), &store, &mut conn, &make_hub()).await;
         assert_eq!(&*resp, b"+PONG\r\n");
         assert!(!quit);
     }
@@ -6161,7 +6854,7 @@ mod tests {
     async fn ping_case_insensitive() {
         let store = make_store();
         let mut conn = make_conn();
-        let (resp, _) = dispatch(&args(&["ping"]), &store, &mut conn).await;
+        let (resp, _) = dispatch(&args(&["ping"]), &store, &mut conn, &make_hub()).await;
         assert_eq!(&*resp, b"+PONG\r\n");
     }
 
@@ -6169,7 +6862,7 @@ mod tests {
     async fn quit_returns_ok_and_sets_quit_flag() {
         let store = make_store();
         let mut conn = make_conn();
-        let (resp, quit) = dispatch(&args(&["QUIT"]), &store, &mut conn).await;
+        let (resp, quit) = dispatch(&args(&["QUIT"]), &store, &mut conn, &make_hub()).await;
         assert_eq!(&*resp, b"+OK\r\n");
         assert!(quit);
     }
@@ -6178,7 +6871,7 @@ mod tests {
     async fn unknown_command_returns_error() {
         let store = make_store();
         let mut conn = make_conn();
-        let (resp, quit) = dispatch(&args(&["BLORP"]), &store, &mut conn).await;
+        let (resp, quit) = dispatch(&args(&["BLORP"]), &store, &mut conn, &make_hub()).await;
         assert!(resp.starts_with(b"-ERR unknown command BLORP"));
         assert!(!quit);
     }
@@ -6874,6 +7567,37 @@ mod tests {
         assert_eq!(&*(cmd_keys(&args(&["KEYS", "z*"]), &store).await), b"*0\r\n");
     }
 
+    // Degenerate glob pattern that was exponential in the recursive implementation.
+    // Verifies the iterative O(N·M) implementation completes promptly.
+    #[test]
+    fn glob_match_degenerate_star_pattern_is_linear() {
+        // Pattern: *a*a*a*a*a against a string of 30 'b's — no match, worst case for backtracking.
+        let pattern = b"*a*a*a*a*a";
+        let text = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(!glob_match(pattern, text));
+    }
+
+    #[test]
+    fn glob_match_star_matches_empty() {
+        assert!(glob_match(b"*", b""));
+        assert!(glob_match(b"a*", b"a"));
+        assert!(glob_match(b"*b", b"b"));
+    }
+
+    #[test]
+    fn glob_match_multiple_stars() {
+        assert!(glob_match(b"a*b*c", b"aXbYc"));
+        assert!(glob_match(b"a*b*c", b"abc"));
+        assert!(glob_match(b"a*b*c", b"abXc")); // * matches empty, b matches b, * matches X
+        assert!(!glob_match(b"a*b*c", b"aXYZ")); // no 'c' at end
+    }
+
+    #[test]
+    fn glob_match_class_negation() {
+        assert!(glob_match(b"h[^e]llo", b"hallo"));
+        assert!(!glob_match(b"h[^e]llo", b"hello"));
+    }
+
     #[tokio::test]
     async fn keys_skips_expired_entries() {
         let store = make_store();
@@ -7086,5 +7810,235 @@ mod tests {
             }
         }
         panic!("EAR sweep did not delete the key within 2 seconds");
+    }
+
+    // ── MULTI / EXEC / DISCARD ────────────────────────────────────────────────
+
+    fn make_conn_with_pubsub() -> ConnState {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut conn = ConnState::new(0);
+        conn.pubsub_tx = Some(tx);
+        conn
+    }
+
+    #[tokio::test]
+    async fn multi_exec_empty_transaction() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        let (r, _) = dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        let (r, _) = dispatch(&args(&["EXEC"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"*0\r\n");
+    }
+
+    #[tokio::test]
+    async fn multi_exec_queues_and_executes() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        let (r, _) = dispatch(&args(&["SET", "k", "v"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+QUEUED\r\n");
+        let (r, _) = dispatch(&args(&["GET", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+QUEUED\r\n");
+        let (resp, _) = dispatch(&args(&["EXEC"]), &store, &mut conn, &hub).await;
+        // Should be *2 array containing +OK and $1\r\nv
+        assert!(resp.starts_with(b"*2\r\n"));
+        assert!(resp.windows(4).any(|w| w == b"+OK\r"));
+        assert!(resp.windows(2).any(|w| w == b"$1"));
+    }
+
+    #[tokio::test]
+    async fn multi_nested_returns_error() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        let (r, _) = dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"-ERR MULTI calls can not be nested"));
+    }
+
+    #[tokio::test]
+    async fn discard_clears_queue() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        dispatch(&args(&["SET", "k", "v"]), &store, &mut conn, &hub).await;
+        let (r, _) = dispatch(&args(&["DISCARD"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        assert!(conn.multi_state.is_none());
+        // Key should not exist since transaction was discarded.
+        let (r, _) = dispatch(&args(&["GET", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"$-1\r\n");
+    }
+
+    #[tokio::test]
+    async fn exec_without_multi_returns_error() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        let (r, _) = dispatch(&args(&["EXEC"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"-ERR EXEC without MULTI"));
+    }
+
+    #[tokio::test]
+    async fn discard_without_multi_returns_error() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        let (r, _) = dispatch(&args(&["DISCARD"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"-ERR DISCARD without MULTI"));
+    }
+
+    // ── WATCH / UNWATCH ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn watch_exec_succeeds_when_key_unchanged() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        // Set key first.
+        cmd_set(&args(&["SET", "k", "1"]), &store).await;
+        // WATCH then MULTI+EXEC: no one else changed k.
+        dispatch(&args(&["WATCH", "k"]), &store, &mut conn, &hub).await;
+        dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        dispatch(&args(&["GET", "k"]), &store, &mut conn, &hub).await;
+        let (resp, _) = dispatch(&args(&["EXEC"]), &store, &mut conn, &hub).await;
+        // Should return array (not nil).
+        assert!(resp.starts_with(b"*1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn watch_exec_returns_nil_when_key_modified() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        cmd_set(&args(&["SET", "k", "1"]), &store).await;
+        dispatch(&args(&["WATCH", "k"]), &store, &mut conn, &hub).await;
+        // Simulate another client modifying k.
+        cmd_set(&args(&["SET", "k", "2"]), &store).await;
+        dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        dispatch(&args(&["GET", "k"]), &store, &mut conn, &hub).await;
+        let (resp, _) = dispatch(&args(&["EXEC"]), &store, &mut conn, &hub).await;
+        // Optimistic lock failure → null array.
+        assert_eq!(&*resp, b"*-1\r\n");
+    }
+
+    #[tokio::test]
+    async fn watch_inside_multi_returns_error() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        dispatch(&args(&["MULTI"]), &store, &mut conn, &hub).await;
+        let (r, _) = dispatch(&args(&["WATCH", "k"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"-ERR WATCH inside MULTI is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn unwatch_clears_watched_keys() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        dispatch(&args(&["WATCH", "k"]), &store, &mut conn, &hub).await;
+        assert!(!conn.watched.is_empty());
+        dispatch(&args(&["UNWATCH"]), &store, &mut conn, &hub).await;
+        assert!(conn.watched.is_empty());
+    }
+
+    // ── PUBLISH / SUBSCRIBE ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn publish_with_no_subscribers_returns_zero() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn();
+        let (r, _) = dispatch(&args(&["PUBLISH", "chan", "hello"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b":0\r\n");
+    }
+
+    #[tokio::test]
+    async fn subscribe_reply_format() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn_with_pubsub();
+        let (r, _) = dispatch(&args(&["SUBSCRIBE", "news"]), &store, &mut conn, &hub).await;
+        // *3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n
+        assert!(r.starts_with(b"*3\r\n"));
+        assert!(r.windows(9).any(|w| w == b"subscribe"));
+        assert!(conn.subscribed_channels.contains("news"));
+    }
+
+    #[tokio::test]
+    async fn publish_delivers_to_subscriber() {
+        let hub = make_hub();
+        let store = make_store();
+
+        // Subscriber connection.
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<PubSubMessage>();
+        let mut sub_conn = ConnState::new(1);
+        sub_conn.pubsub_tx = Some(sub_tx);
+
+        // Publisher connection (no pubsub channel needed).
+        let mut pub_conn = make_conn();
+
+        dispatch(&args(&["SUBSCRIBE", "events"]), &store, &mut sub_conn, &hub).await;
+
+        let (r, _) =
+            dispatch(&args(&["PUBLISH", "events", "ping"]), &store, &mut pub_conn, &hub).await;
+        assert_eq!(&*r, b":1\r\n"); // 1 subscriber received it
+
+        let msg = sub_rx.try_recv().expect("message should be in channel");
+        match msg {
+            PubSubMessage::Message { channel, data } => {
+                assert_eq!(channel, "events");
+                assert_eq!(&data[..], b"ping");
+            }
+            other => panic!("unexpected message type: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn psubscribe_matches_pattern() {
+        let hub = make_hub();
+        let store = make_store();
+
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<PubSubMessage>();
+        let mut sub_conn = ConnState::new(2);
+        sub_conn.pubsub_tx = Some(sub_tx);
+
+        let mut pub_conn = make_conn();
+
+        dispatch(&args(&["PSUBSCRIBE", "news.*"]), &store, &mut sub_conn, &hub).await;
+        assert!(sub_conn.subscribed_patterns.contains("news.*"));
+
+        dispatch(
+            &args(&["PUBLISH", "news.sports", "goal"]),
+            &store,
+            &mut pub_conn,
+            &hub,
+        )
+        .await;
+
+        let msg = sub_rx.try_recv().expect("pmessage should be in channel");
+        match msg {
+            PubSubMessage::PMessage { pattern, channel, data } => {
+                assert_eq!(pattern, "news.*");
+                assert_eq!(channel, "news.sports");
+                assert_eq!(&data[..], b"goal");
+            }
+            other => panic!("unexpected message type: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_rejected_in_pubsub_mode() {
+        let store = make_store();
+        let hub = make_hub();
+        let mut conn = make_conn_with_pubsub();
+        dispatch(&args(&["SUBSCRIBE", "ch"]), &store, &mut conn, &hub).await;
+        let (r, _) = dispatch(&args(&["SET", "k", "v"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"-ERR Command not allowed in pub/sub mode"));
     }
 }
