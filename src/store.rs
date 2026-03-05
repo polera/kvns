@@ -51,8 +51,10 @@ impl Value {
             Value::List(items) => items.iter().map(|b| b.len()).sum(),
             Value::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
             Value::Set(s) => s.iter().map(|v| v.len()).sum(),
-            Value::ZSet(data) => data.sorted.iter().map(|e| 8 + e.member.len()).sum::<usize>()
-                + data.index.keys().map(|k| k.len() + 8).sum::<usize>(),
+            // Count only the sorted vec (8 bytes for f64 score + member bytes).
+            // The index HashMap is a derived structure; including it would
+            // double-count every member and inflate OOM/eviction thresholds.
+            Value::ZSet(data) => data.sorted.iter().map(|e| 8 + e.member.len()).sum::<usize>(),
         }
     }
 
@@ -228,6 +230,12 @@ pub(crate) struct Db {
     pub(crate) namespace_eviction_policies: HashMap<String, EvictionPolicy>,
     /// Keys pending deletion at the next EAR sweep.
     pub(crate) ear_pending: HashSet<(String, String)>,
+    /// Monotonically increasing write counter; bumped on every put/delete.
+    pub(crate) write_version: u64,
+    /// Last write version for each (namespace, key).  Used by WATCH to detect
+    /// concurrent modifications between WATCH and EXEC.
+    /// Nested to allow zero-allocation lookups via &str keys.
+    pub(crate) key_versions: HashMap<String, HashMap<String, u64>>,
 }
 
 impl Db {
@@ -243,6 +251,8 @@ impl Db {
             eviction_policy: EvictionPolicy::None,
             namespace_eviction_policies: HashMap::new(),
             ear_pending: HashSet::new(),
+            write_version: 0,
+            key_versions: HashMap::new(),
         }
     }
 
@@ -364,12 +374,14 @@ impl Db {
             }
 
             // 7. Evict from sample until round's overflow is covered.
+            // Use delete_deferred to avoid emitting Prometheus gauge updates on
+            // every evicted key while the write lock is held; we emit once below.
             let mut freed = 0usize;
             for (key, _, size) in candidates {
                 if freed >= overflow {
                     break;
                 }
-                self.delete(namespace, &key);
+                self.delete_deferred(namespace, &key);
                 freed += size;
                 total_count += 1;
             }
@@ -378,7 +390,17 @@ impl Db {
 
         // 8. Trace log.
         tracing::debug!(namespace, rounds, "evicted keys");
-        // 9. Metric.
+        // 9. Emit one consolidated gauge snapshot after all evictions complete
+        //    rather than one per deleted key.
+        let ns_keys = self.entries.get(namespace).map(|ns| ns.len()).unwrap_or(0);
+        let ns_bytes = self.namespace_bytes.get(namespace).copied().unwrap_or(0);
+        StoreMetrics {
+            namespace: namespace.to_owned(),
+            ns_keys,
+            ns_bytes,
+            total_bytes: self.used_bytes,
+        }
+        .emit();
         metrics::counter!("kvns_evictions_total", "namespace" => namespace.to_owned())
             .increment(total_count);
 
@@ -403,23 +425,6 @@ impl Db {
     /// Bytes attributed to one entry: namespace + key lengths + value payload.
     pub(crate) fn entry_size(namespace: &str, key: &str, value_byte_len: usize) -> usize {
         namespace.len() + key.len() + value_byte_len
-    }
-
-    pub(crate) fn would_exceed(
-        &self,
-        namespace: &str,
-        key: &str,
-        new_value_byte_len: usize,
-    ) -> bool {
-        let new_size = Self::entry_size(namespace, key, new_value_byte_len);
-        let old_size = self
-            .entries
-            .get(namespace)
-            .and_then(|ns| ns.get(key))
-            .map(|e| Self::entry_size(namespace, key, e.value.byte_len()))
-            .unwrap_or(0);
-        let net_delta = new_size.saturating_sub(old_size);
-        self.used_bytes.saturating_add(net_delta) > self.memory_limit
     }
 
     /// Insert an entry and return the metric snapshot; caller is responsible for
@@ -448,6 +453,11 @@ impl Db {
         let nb = self.namespace_bytes.entry(namespace.clone()).or_insert(0);
         *nb = nb.saturating_sub(old_size).saturating_add(new_size);
         let ns_bytes = *nb;
+        self.write_version += 1;
+        self.key_versions
+            .entry(namespace.clone())
+            .or_default()
+            .insert(key.clone(), self.write_version);
         self.entries
             .entry(namespace.clone())
             .or_default()
@@ -468,9 +478,46 @@ impl Db {
         self.put_deferred(namespace, key, entry).emit();
     }
 
-    pub(crate) fn delete(&mut self, namespace: &str, key: &str) -> Option<Entry> {
-        self.ear_pending
-            .remove(&(namespace.to_owned(), key.to_owned()));
+    /// Stamp `(namespace, key)` with the next write version without going
+    /// through `put_deferred`.  Call this in every command that mutates an
+    /// existing entry in-place (HSET, SADD, LPUSH, etc.) so that WATCH
+    /// correctly detects the modification.
+    pub(crate) fn touch_key_version(&mut self, namespace: &str, key: &str) {
+        self.write_version += 1;
+        self.key_versions
+            .entry(namespace.to_owned())
+            .or_default()
+            .insert(key.to_owned(), self.write_version);
+    }
+
+    /// Returns the write version recorded the last time `(namespace, key)` was
+    /// written.  Returns `0` if the key has never been written.
+    pub(crate) fn key_version(&self, namespace: &str, key: &str) -> u64 {
+        self.key_versions
+            .get(namespace)
+            .and_then(|m| m.get(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Remove a key and return the removed entry along with a metrics snapshot.
+    /// The caller is responsible for calling `.emit()` on the snapshot —
+    /// ideally after the write lock has been released to avoid emitting
+    /// Prometheus gauge updates while writers are blocked.
+    ///
+    /// Use `delete` when immediate emission is acceptable; use this variant
+    /// inside hot loops (e.g. eviction) where deferring is critical.
+    pub(crate) fn delete_deferred(
+        &mut self,
+        namespace: &str,
+        key: &str,
+    ) -> (Option<Entry>, StoreMetrics) {
+        let ns_key = (namespace.to_owned(), key.to_owned());
+        self.ear_pending.remove(&ns_key);
+        self.write_version += 1;
+        if let Some(m) = self.key_versions.get_mut(namespace) {
+            m.remove(key);
+        }
         let removed = self
             .entries
             .get_mut(namespace)
@@ -489,11 +536,19 @@ impl Db {
         }
         let ns_keys = self.entries.get(namespace).map(|ns| ns.len()).unwrap_or(0);
         let ns_bytes = self.namespace_bytes.get(namespace).copied().unwrap_or(0);
-        metrics::gauge!("kvns_keys_total", "namespace" => namespace.to_owned()).set(ns_keys as f64);
-        metrics::gauge!("kvns_memory_used_bytes", "namespace" => namespace.to_owned())
-            .set(ns_bytes as f64);
-        metrics::gauge!("kvns_memory_used_bytes_total").set(self.used_bytes as f64);
-        removed
+        let m = StoreMetrics {
+            namespace: namespace.to_owned(),
+            ns_keys,
+            ns_bytes,
+            total_bytes: self.used_bytes,
+        };
+        (removed, m)
+    }
+
+    pub(crate) fn delete(&mut self, namespace: &str, key: &str) -> Option<Entry> {
+        let (entry, m) = self.delete_deferred(namespace, key);
+        m.emit();
+        entry
     }
 
     /// Total number of non-expired keys across all namespaces.
@@ -510,6 +565,8 @@ impl Db {
         self.used_bytes = 0;
         self.namespace_bytes.clear();
         self.ear_pending.clear();
+        self.write_version += 1;
+        self.key_versions.clear();
         metrics::gauge!("kvns_memory_used_bytes_total").set(0.0);
     }
 }

@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod persist;
+mod pubsub;
 mod resp;
 mod server;
 mod sharded;
@@ -134,6 +135,8 @@ async fn main() {
         (server::Backend::Classic(Arc::clone(&store)), Some(store))
     };
 
+    let hub = pubsub::new_hub();
+
     let addr = config.listen_addr();
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     let max_clients = config.max_clients.max(1);
@@ -169,7 +172,7 @@ async fn main() {
                                 continue;
                             }
                         };
-                        tokio::spawn(server::handle_connection(stream, backend.clone(), limits, permit));
+                        tokio::spawn(server::handle_connection(stream, backend.clone(), limits, permit, hub.clone()));
                     }
                     Err(e) => error!(?e, "accept error"),
                 }
@@ -201,7 +204,7 @@ async fn main() {
                                 continue;
                             }
                         };
-                        tokio::spawn(server::handle_connection(stream, backend.clone(), limits, permit));
+                        tokio::spawn(server::handle_connection(stream, backend.clone(), limits, permit, hub.clone()));
                     }
                     Err(e) => error!(?e, "accept error"),
                 }

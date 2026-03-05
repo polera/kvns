@@ -229,16 +229,23 @@ impl Config {
     }
 
     fn sysctl_total_memory_bytes() -> Option<usize> {
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8(output.stdout)
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
+        use std::sync::OnceLock;
+        // Cache the result: forking sysctl on every call would be wasteful and
+        // blocks the calling thread.  This function is only called at startup,
+        // but the OnceLock protects against accidental future re-use.
+        static CACHED: OnceLock<Option<usize>> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            let output = std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout)
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+        })
     }
 
     /// Parse `"ns1:lru,ns2:mru"` into a `HashMap<String, EvictionPolicy>`.

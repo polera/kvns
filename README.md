@@ -289,3 +289,58 @@ Notes:
 - Benchmark script path: `scripts/benchmark_kvns_vs_dragonfly.sh`
 - Output artifacts are written under `/tmp/kvns-bench-*` (or `BENCH_DIR` if set)
 - Dragonfly baseline numbers are sourced from `https://github.com/dragonflydb/dragonfly#benchmarks` (as of February 23, 2026)
+
+## Benchmark results
+
+### Test environment
+
+| | |
+| --- | --- |
+| **Machine** | Apple M4 (10-core) |
+| **RAM** | 16 GiB |
+| **OS** | macOS 26.3 |
+
+### kvns classic vs Dragonfly
+
+| Metric | kvns | Dragonfly | kvns vs df |
+| --- | ---: | ---: | ---: |
+| Direct SET ops/sec | 201,631 | 183,704 | 109.76% |
+| Direct GET ops/sec | 221,999 | 195,476 | 113.57% |
+| Direct SET avg ms | 0.793 | 0.340 | 2.33x slower |
+| Direct GET avg ms | 0.721 | 0.320 | 2.25x slower |
+| Pipeline SET ops/sec | 842,460 | 3,800,808 | 22.17% |
+| Pipeline GET ops/sec | 2,006,908 | 4,383,297 | 45.79% |
+| Pipeline SET avg ms | 8.544 | 0.223 | 38.31x slower |
+| Pipeline GET avg ms | 3.584 | 0.193 | 18.57x slower |
+
+### kvns sharded vs Dragonfly
+
+| Metric | kvns sharded | Dragonfly | kvns vs df |
+| --- | ---: | ---: | ---: |
+| Direct SET ops/sec | 221,381 | 183,704 | 120.51% |
+| Direct GET ops/sec | 221,370 | 195,476 | 113.25% |
+| Direct SET avg ms | 0.723 | 0.340 | 2.13x slower |
+| Direct GET avg ms | 0.723 | 0.320 | 2.26x slower |
+| Pipeline SET ops/sec | 2,563,445 | 3,800,808 | 67.44% |
+| Pipeline GET ops/sec | 3,937,683 | 4,383,297 | 89.83% |
+| Pipeline SET avg ms | 2.821 | 0.223 | 12.65x slower |
+| Pipeline GET avg ms | 1.844 | 0.193 | 9.55x slower |
+
+### Classic vs sharded
+
+| Metric | Classic | Sharded | Sharded / Classic |
+| --- | ---: | ---: | ---: |
+| Direct SET ops/sec | 201,631 | 221,381 | 1.10x |
+| Direct GET ops/sec | 221,999 | 221,370 | 1.00x |
+| Pipeline SET ops/sec | 842,460 | 2,563,445 | 3.04x |
+| Pipeline GET ops/sec | 2,006,908 | 3,937,683 | 1.96x |
+| Direct SET avg ms | 0.793 | 0.723 | 1.10x |
+| Direct GET avg ms | 0.721 | 0.723 | 1.00x |
+| Pipeline SET avg ms | 8.544 | 2.821 | 3.03x |
+| Pipeline GET avg ms | 3.584 | 1.844 | 1.94x |
+
+Key takeaways:
+
+- kvns classic **outperforms Dragonfly on direct (non-pipelined) throughput** (~10% faster SET, ~14% faster GET).
+- Sharded mode extends that lead on direct SET to **~21%** and improves pipeline throughput by **3x SET / 2x GET** over classic.
+- Sharded pipeline SET reaches **~67%** of Dragonfly's throughput; pipeline GET reaches **~90%**.
