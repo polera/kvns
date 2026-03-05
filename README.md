@@ -48,6 +48,7 @@ Command names are case-insensitive.
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SUNION`, `SINTER`, `SDIFF`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `SMOVE`, `SPOP`, `SRANDMEMBER` |
 | Sorted set | `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREVRANGE`, `ZRANK`, `ZREVRANK`, `ZSCORE`, `ZMSCORE`, `ZREM`, `ZCARD`, `ZCOUNT`, `ZINCRBY`, `ZRANGEBYLEX`, `ZLEXCOUNT`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER` |
 | Generic/keyspace | `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `TTL`, `PTTL`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `RENAME`, `RENAMENX`, `SCAN`, `KEYS`, `TOUCH`, `COPY`, `OBJECT` |
+| Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH` |
 | Server/introspection | `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `INFO`, `CONFIG`, `COMMAND`, `CLIENT`, `LATENCY`, `SLOWLOG`, `DEBUG`, `WAIT`, `XADD` |
 
 Compatibility notes:
@@ -147,6 +148,7 @@ All settings are read from environment variables at startup.
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `KVNS_LOG` | `info` | Log level filter (e.g. `debug`, `warn`, `error`, or `kvns=debug`) |
 | `KVNS_HOST` | `0.0.0.0` | Interface to listen on |
 | `KVNS_PORT` | `6480` | RESP listener port |
 | `KVNS_MEMORY_LIMIT` | `1073741824` | Max memory in bytes (1 GiB). When set, kvns caps it at 70% of detected host RAM |
@@ -204,6 +206,7 @@ When a write would exceed the effective `KVNS_MEMORY_LIMIT`, kvns either rejects
 | `none` | No eviction (default). Writes beyond limit return an error. |
 | `lru` | Evict lowest-hit keys first. |
 | `mru` | Evict highest-hit keys first. |
+| `ear` | Expire-after-read: keys are deleted on the next background sweep after being read. Aliases: `expire_after_read`, `expireafterread`. |
 
 `KVNS_EVICTION_THRESHOLD` controls when eviction begins. With `1.0` (default), eviction starts only at full configured capacity. Lower values (for example `0.8`) start eviction earlier.
 
@@ -232,6 +235,7 @@ kvns exposes Prometheus metrics at `http://<KVNS_METRICS_HOST>:<KVNS_METRICS_POR
 | `kvns_memory_limit_bytes` | Gauge | - | Configured memory limit |
 | `kvns_command_duration_seconds` | Histogram | `command`, `namespace` | Command latency histogram (currently instrumented for `SET`) |
 | `kvns_evictions_total` | Counter | `namespace` | Total keys evicted per namespace |
+| `kvns_ear_evictions_total` | Counter | `namespace` | Total keys deleted by the ExpireAfterRead background sweep |
 
 Per-namespace gauges are created on first write and are set to `0` when the last key in a namespace is removed.
 
