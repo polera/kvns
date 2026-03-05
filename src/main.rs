@@ -7,6 +7,9 @@ mod server;
 mod sharded;
 mod store;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

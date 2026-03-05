@@ -262,7 +262,13 @@ pub(crate) fn resp_null() -> Cow<'static, [u8]> {
     Cow::Borrowed(b"$-1\r\n")
 }
 pub(crate) fn resp_int(n: i64) -> Cow<'static, [u8]> {
-    Cow::Owned(format!(":{n}\r\n").into_bytes())
+    let mut buf = itoa::Buffer::new();
+    let s = buf.format(n);
+    let mut out = Vec::with_capacity(s.len() + 3);
+    out.push(b':');
+    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    Cow::Owned(out)
 }
 pub(crate) fn resp_usize(n: usize) -> Cow<'static, [u8]> {
     resp_int(i64::try_from(n).unwrap_or(i64::MAX))
@@ -275,14 +281,16 @@ pub(crate) fn resp_wrongtype() -> Cow<'static, [u8]> {
 }
 
 pub(crate) fn append_array_header(out: &mut Vec<u8>, len: usize) {
+    let mut buf = itoa::Buffer::new();
     out.push(b'*');
-    out.extend_from_slice(len.to_string().as_bytes());
+    out.extend_from_slice(buf.format(len).as_bytes());
     out.extend_from_slice(b"\r\n");
 }
 
 pub(crate) fn append_int(out: &mut Vec<u8>, n: i64) {
+    let mut buf = itoa::Buffer::new();
     out.push(b':');
-    out.extend_from_slice(n.to_string().as_bytes());
+    out.extend_from_slice(buf.format(n).as_bytes());
     out.extend_from_slice(b"\r\n");
 }
 
@@ -291,8 +299,9 @@ pub(crate) fn append_null(out: &mut Vec<u8>) {
 }
 
 pub(crate) fn append_bulk(out: &mut Vec<u8>, data: &[u8]) {
+    let mut buf = itoa::Buffer::new();
     out.push(b'$');
-    out.extend_from_slice(data.len().to_string().as_bytes());
+    out.extend_from_slice(buf.format(data.len()).as_bytes());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");

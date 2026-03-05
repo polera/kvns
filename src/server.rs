@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::commands::{ConnState, dispatch as dispatch_classic, encode_pubsub_message};
 use crate::pubsub::{PubSubHub, PubSubMessage};
 use crate::resp::{RespLimits, parse_resp_with_limits};
-use crate::sharded::{ShardedStore, dispatch as dispatch_sharded};
+use crate::sharded::{ShardedStore, dispatch as dispatch_sharded_sync};
 use crate::store::Store;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -60,7 +60,7 @@ pub(crate) async fn handle_connection(
                                 Backend::Classic(store) => {
                                     dispatch_classic(&args, store, &mut conn, &hub).await
                                 }
-                                Backend::Sharded(store) => dispatch_sharded(&args, store).await,
+                                Backend::Sharded(store) => dispatch_sharded_sync(&args, store),
                             };
                             // Pick up the receiver if SUBSCRIBE just created the channel.
                             if pubsub_rx.is_none() {
@@ -109,7 +109,7 @@ pub(crate) async fn handle_connection(
                         Backend::Classic(store) => {
                             dispatch_classic(&args, store, &mut conn, &hub).await
                         }
-                        Backend::Sharded(store) => dispatch_sharded(&args, store).await,
+                        Backend::Sharded(store) => dispatch_sharded_sync(&args, store),
                     };
                     // Pick up the receiver if SUBSCRIBE just created the channel.
                     if pubsub_rx.is_none() {
