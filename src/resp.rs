@@ -84,35 +84,26 @@ async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
     Ok(Some(buf.as_slice()))
 }
 
-fn split_inline_command(line: &[u8]) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut i = 0usize;
-    while i < line.len() {
-        while i < line.len() && line[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= line.len() {
-            break;
-        }
-        let start = i;
-        while i < line.len() && !line[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        out.push(line[start..i].to_vec());
-    }
-    out
-}
 
+/// Parse one RESP command into `out`, reusing existing `Vec<u8>` slot capacity.
+///
+/// Returns `true` if a command was parsed, `false` on clean EOF.
+/// `out` is cleared and refilled on every call; inner `Vec<u8>` allocations are
+/// reused across calls (the same `out` should be passed on every iteration of
+/// the connection loop).
 pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limits: RespLimits,
-) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+    out: &mut Vec<Vec<u8>>,
+) -> std::io::Result<bool> {
     let mut line = Vec::new();
     let Some(trimmed) = read_resp_line(reader, &mut line, limits.max_inline_len).await? else {
-        return Ok(None);
+        out.clear();
+        return Ok(false);
     };
+    out.clear();
     if trimmed.is_empty() {
-        return Ok(Some(vec![]));
+        return Ok(true); // empty args — caller checks out.is_empty()
     }
 
     let first = trimmed.first().copied().unwrap_or(0);
@@ -123,15 +114,14 @@ pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
         b'*' => {
             let count = parse_i64(rest, "bad count")?;
             if count < 0 {
-                return Ok(Some(vec![])); // null array
+                return Ok(true); // null array → empty out
             }
             let count = usize::try_from(count).map_err(|_| invalid_data("bad count"))?;
             if count > limits.max_array_len {
                 return Err(invalid_data("too many bulk strings"));
             }
-            let mut args = Vec::with_capacity(count as usize);
             let mut hdr = Vec::new();
-            for _ in 0..count {
+            for i in 0..count {
                 let Some(hdr_line) =
                     read_resp_line(reader, &mut hdr, limits.max_inline_len).await?
                 else {
@@ -142,40 +132,42 @@ pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
                 };
                 let len = parse_bulk_len(hdr_line)?;
                 if len < 0 {
-                    args.push(vec![]);
+                    reuse_slot(out, i, b"");
                 } else {
                     let len = usize::try_from(len).map_err(|_| invalid_data("bad len"))?;
                     if len > limits.max_bulk_len {
                         return Err(invalid_data("bulk string too large"));
                     }
-                    let mut buf = vec![0u8; len];
-                    reader.read_exact(&mut buf).await?;
+                    let slot = reuse_slot_uninit(out, i, len);
+                    reader.read_exact(slot).await?;
                     let mut crlf = [0u8; 2];
                     reader.read_exact(&mut crlf).await?;
-                    args.push(buf);
                 }
             }
-            Ok(Some(args))
+            Ok(true)
         }
 
         // ── RESP3 null ──────────────────────────────────────────────────────
-        b'_' => Ok(Some(vec![])),
+        b'_' => Ok(true), // empty out
 
         // ── RESP3 boolean ───────────────────────────────────────────────────
         b'#' => {
-            let val = if rest == b"t" {
-                b"1".to_vec()
-            } else {
-                b"0".to_vec()
-            };
-            Ok(Some(vec![val]))
+            let val = if rest == b"t" { b"1" as &[u8] } else { b"0" };
+            reuse_slot(out, 0, val);
+            Ok(true)
         }
 
         // ── RESP3 double ────────────────────────────────────────────────────
-        b',' => Ok(Some(vec![rest.to_vec()])),
+        b',' => {
+            reuse_slot(out, 0, rest);
+            Ok(true)
+        }
 
         // ── RESP3 big number ────────────────────────────────────────────────
-        b'(' => Ok(Some(vec![rest.to_vec()])),
+        b'(' => {
+            reuse_slot(out, 0, rest);
+            Ok(true)
+        }
 
         // ── RESP3 set type (~N) — treat like array ──────────────────────────
         b'~' => {
@@ -187,7 +179,8 @@ pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
             if count > limits.max_array_len {
                 return Err(invalid_data("too many bulk strings"));
             }
-            read_bulk_strings(reader, count, limits).await.map(Some)
+            read_bulk_strings_into(reader, count, limits, out).await?;
+            Ok(true)
         }
 
         // ── RESP3 map type (%N) — read 2N bulk strings ──────────────────────
@@ -203,29 +196,51 @@ pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
             let count = count
                 .checked_mul(2)
                 .ok_or_else(|| invalid_data("bad count"))?;
-            read_bulk_strings(reader, count, limits).await.map(Some)
+            read_bulk_strings_into(reader, count, limits, out).await?;
+            Ok(true)
         }
 
         // ── Inline command ──────────────────────────────────────────────────
         _ => {
-            let out = split_inline_command(trimmed);
-            if out.len() > limits.max_array_len {
-                return Err(invalid_data("too many inline arguments"));
-            }
-            Ok(Some(out))
+            split_inline_command_into(trimmed, limits.max_array_len, out)?;
+            Ok(true)
         }
     }
 }
 
-/// Read exactly `n` RESP bulk strings from `reader`.
-async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
+/// Write `data` into slot `idx` of `out`, reusing the existing allocation if present.
+fn reuse_slot(out: &mut Vec<Vec<u8>>, idx: usize, data: &[u8]) {
+    if idx < out.len() {
+        out[idx].clear();
+        out[idx].extend_from_slice(data);
+    } else {
+        out.push(data.to_vec());
+    }
+}
+
+/// Resize slot `idx` of `out` to exactly `len` bytes and return a mutable reference.
+/// Reuses the existing Vec allocation when capacity allows.
+fn reuse_slot_uninit(out: &mut Vec<Vec<u8>>, idx: usize, len: usize) -> &mut [u8] {
+    if idx < out.len() {
+        let slot = &mut out[idx];
+        slot.clear();
+        slot.resize(len, 0);
+        slot.as_mut_slice()
+    } else {
+        out.push(vec![0u8; len]);
+        out[idx].as_mut_slice()
+    }
+}
+
+/// Read exactly `n` RESP bulk strings into `out` (reusing existing slots).
+async fn read_bulk_strings_into<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     n: usize,
     limits: RespLimits,
-) -> std::io::Result<Vec<Vec<u8>>> {
-    let mut args = Vec::with_capacity(n);
+    out: &mut Vec<Vec<u8>>,
+) -> std::io::Result<()> {
     let mut hdr = Vec::new();
-    for _ in 0..n {
+    for i in 0..n {
         let Some(hdr_line) = read_resp_line(reader, &mut hdr, limits.max_inline_len).await? else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -234,20 +249,47 @@ async fn read_bulk_strings<R: AsyncBufRead + Unpin>(
         };
         let len = parse_bulk_len(hdr_line)?;
         if len < 0 {
-            args.push(vec![]);
+            reuse_slot(out, i, b"");
         } else {
             let len = usize::try_from(len).map_err(|_| invalid_data("bad len"))?;
             if len > limits.max_bulk_len {
                 return Err(invalid_data("bulk string too large"));
             }
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
+            let slot = reuse_slot_uninit(out, i, len);
+            reader.read_exact(slot).await?;
             let mut crlf = [0u8; 2];
             reader.read_exact(&mut crlf).await?;
-            args.push(buf);
         }
     }
-    Ok(args)
+    Ok(())
+}
+
+fn split_inline_command_into(
+    line: &[u8],
+    max_args: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> std::io::Result<()> {
+    let mut i = 0usize;
+    let mut idx = 0usize;
+    while i < line.len() {
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= line.len() {
+            break;
+        }
+        if idx >= max_args {
+            return Err(invalid_data("too many inline arguments"));
+        }
+        let start = i;
+        while i < line.len() && !line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        reuse_slot(out, idx, &line[start..i]);
+        idx += 1;
+    }
+    out.truncate(idx);
+    Ok(())
 }
 
 // ── RESP2 response builders ───────────────────────────────────────────────────
@@ -262,7 +304,13 @@ pub(crate) fn resp_null() -> Cow<'static, [u8]> {
     Cow::Borrowed(b"$-1\r\n")
 }
 pub(crate) fn resp_int(n: i64) -> Cow<'static, [u8]> {
-    Cow::Owned(format!(":{n}\r\n").into_bytes())
+    let mut buf = itoa::Buffer::new();
+    let s = buf.format(n);
+    let mut out = Vec::with_capacity(s.len() + 3);
+    out.push(b':');
+    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    Cow::Owned(out)
 }
 pub(crate) fn resp_usize(n: usize) -> Cow<'static, [u8]> {
     resp_int(i64::try_from(n).unwrap_or(i64::MAX))
@@ -275,14 +323,16 @@ pub(crate) fn resp_wrongtype() -> Cow<'static, [u8]> {
 }
 
 pub(crate) fn append_array_header(out: &mut Vec<u8>, len: usize) {
+    let mut buf = itoa::Buffer::new();
     out.push(b'*');
-    out.extend_from_slice(len.to_string().as_bytes());
+    out.extend_from_slice(buf.format(len).as_bytes());
     out.extend_from_slice(b"\r\n");
 }
 
 pub(crate) fn append_int(out: &mut Vec<u8>, n: i64) {
+    let mut buf = itoa::Buffer::new();
     out.push(b':');
-    out.extend_from_slice(n.to_string().as_bytes());
+    out.extend_from_slice(buf.format(n).as_bytes());
     out.extend_from_slice(b"\r\n");
 }
 
@@ -291,8 +341,9 @@ pub(crate) fn append_null(out: &mut Vec<u8>) {
 }
 
 pub(crate) fn append_bulk(out: &mut Vec<u8>, data: &[u8]) {
+    let mut buf = itoa::Buffer::new();
     out.push(b'$');
-    out.extend_from_slice(data.len().to_string().as_bytes());
+    out.extend_from_slice(buf.format(data.len()).as_bytes());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
@@ -412,89 +463,220 @@ pub(crate) fn resp_push(items: &[Vec<u8>]) -> Cow<'static, [u8]> {
     Cow::Owned(out)
 }
 
+// ── Synchronous RESP parser (for io_uring / owned-buffer I/O) ────────────────
+//
+// Works on a `&[u8]` slice of already-buffered data. Returns the number of bytes
+// consumed so the caller can advance its accumulation buffer. Returns `Ok(None)`
+// when the buffer holds an incomplete frame — the caller should read more data
+// and retry without clearing the existing buffer contents.
+//
+// The helpers below are used exclusively from `uring_server` (Linux). The
+// `allow(dead_code)` on each prevents warnings on non-Linux builds.
+
+/// Scan forward for a `\n` (bare or `\r\n`) and return (line_without_terminator, bytes_consumed).
+#[allow(dead_code)]
+fn sync_read_line(buf: &[u8]) -> Option<(&[u8], usize)> {
+    let pos = buf.iter().position(|&b| b == b'\n')?;
+    let consumed = pos + 1;
+    let line = &buf[..pos];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    Some((line, consumed))
+}
+
+#[allow(dead_code)]
+fn sync_parse_i64(bytes: &[u8]) -> Option<i64> {
+    // No trim — RESP does not allow trailing whitespace in length fields.
+    // Matches the behaviour of the async parse_i64() path.
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// Read `n` bulk strings from `buf[pos..]`, filling `out` slots.
+/// Returns the updated absolute position on success, or `Ok(None)` on incomplete data.
+#[allow(dead_code)]
+fn sync_read_bulks(
+    buf: &[u8],
+    mut pos: usize,
+    n: usize,
+    max_bulk_len: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> std::io::Result<Option<usize>> {
+    for i in 0..n {
+        let Some((hdr, hdr_consumed)) = sync_read_line(&buf[pos..]) else {
+            return Ok(None);
+        };
+        if hdr.first().copied() != Some(b'$') {
+            return Err(invalid_data("expected $"));
+        }
+        let len = sync_parse_i64(&hdr[1..]).ok_or_else(|| invalid_data("bad len"))?;
+        pos += hdr_consumed;
+        if len < 0 {
+            reuse_slot(out, i, b"");
+        } else {
+            let len = len as usize;
+            if len > max_bulk_len {
+                return Err(invalid_data("bulk string too large"));
+            }
+            if buf.len() < pos + len + 2 {
+                return Ok(None); // data + \r\n not yet buffered
+            }
+            reuse_slot(out, i, &buf[pos..pos + len]);
+            pos += len + 2;
+        }
+    }
+    out.truncate(n);
+    Ok(Some(pos))
+}
+
+/// Parse one RESP command from `buf` into `out`, reusing existing slot capacity.
+///
+/// Returns `Ok(Some(n))` — `n` bytes consumed, `out` holds the args.
+/// Returns `Ok(None)` — incomplete frame; caller should buffer more data and retry.
+/// Returns `Err(_)` — protocol error; caller should close the connection.
+#[allow(dead_code)]
+pub(crate) fn parse_resp_sync(
+    buf: &[u8],
+    limits: RespLimits,
+    out: &mut Vec<Vec<u8>>,
+) -> std::io::Result<Option<usize>> {
+    out.clear();
+    let Some((line, after_line)) = sync_read_line(buf) else {
+        return Ok(None);
+    };
+
+    match line.first().copied().unwrap_or(0) {
+        b'*' => {
+            let count = sync_parse_i64(&line[1..]).ok_or_else(|| invalid_data("bad count"))?;
+            if count < 0 {
+                return Ok(Some(after_line)); // null array → empty out
+            }
+            let count = count as usize;
+            if count > limits.max_array_len {
+                return Err(invalid_data("too many bulk strings"));
+            }
+            sync_read_bulks(buf, after_line, count, limits.max_bulk_len, out)
+        }
+        0 => Ok(Some(after_line)), // empty line → empty out
+        b'_' => Ok(Some(after_line)), // RESP3 null → empty out
+        b'#' => {
+            reuse_slot(out, 0, if line == b"#t" { b"1" } else { b"0" });
+            Ok(Some(after_line))
+        }
+        b',' | b'(' => {
+            reuse_slot(out, 0, &line[1..]);
+            Ok(Some(after_line))
+        }
+        b'~' => {
+            let count = sync_parse_i64(&line[1..]).ok_or_else(|| invalid_data("bad count"))?;
+            if count < 0 {
+                return Err(invalid_data("bad count"));
+            }
+            let count = count as usize;
+            if count > limits.max_array_len {
+                return Err(invalid_data("too many bulk strings"));
+            }
+            sync_read_bulks(buf, after_line, count, limits.max_bulk_len, out)
+        }
+        b'%' => {
+            let count = sync_parse_i64(&line[1..]).ok_or_else(|| invalid_data("bad count"))?;
+            if count < 0 {
+                return Err(invalid_data("bad count"));
+            }
+            let count = count as usize;
+            if count > limits.max_array_len / 2 {
+                return Err(invalid_data("too many bulk strings"));
+            }
+            let count = count.checked_mul(2).ok_or_else(|| invalid_data("bad count"))?;
+            sync_read_bulks(buf, after_line, count, limits.max_bulk_len, out)
+        }
+        _ => {
+            // Inline command
+            split_inline_command_into(line, limits.max_array_len, out)?;
+            Ok(Some(after_line))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::BufReader;
 
+    async fn parse(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut r = BufReader::new(data);
+        let mut out = Vec::new();
+        let got = parse_resp_with_limits(&mut r, RespLimits::default(), &mut out)
+            .await
+            .unwrap();
+        assert!(got, "expected a command, got EOF");
+        out
+    }
+
+    async fn parse_eof(data: &[u8]) -> bool {
+        let mut r = BufReader::new(data);
+        let mut out = Vec::new();
+        !parse_resp_with_limits(&mut r, RespLimits::default(), &mut out)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn parse_array_set_command() {
-        let data = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n").await;
         assert_eq!(result, vec![b"SET", b"foo", b"bar"]);
     }
 
     #[tokio::test]
     async fn parse_inline_ping() {
-        let data = b"PING\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"PING\r\n").await;
         assert_eq!(result, vec![b"PING"]);
     }
 
     #[tokio::test]
     async fn parse_inline_with_args() {
-        let data = b"GET mykey\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"GET mykey\r\n").await;
         assert_eq!(&*result[0], b"GET");
         assert_eq!(&*result[1], b"mykey");
     }
 
     #[tokio::test]
-    async fn parse_eof_returns_none() {
-        let data: &[u8] = b"";
-        let mut r = BufReader::new(data);
-        assert!(parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().is_none());
+    async fn parse_eof_returns_false() {
+        assert!(parse_eof(b"").await);
     }
 
     #[tokio::test]
     async fn parse_empty_line_returns_empty_vec() {
-        let data = b"\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"\r\n").await;
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn parse_null_bulk_string() {
-        let data = b"*2\r\n$3\r\nGET\r\n$-1\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"*2\r\n$3\r\nGET\r\n$-1\r\n").await;
         assert_eq!(&*result[0], b"GET");
         assert_eq!(&*result[1], b"");
     }
 
     #[tokio::test]
     async fn parse_resp3_null() {
-        let data = b"_\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"_\r\n").await;
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn parse_resp3_bool_true() {
-        let data = b"#t\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"#t\r\n").await;
         assert_eq!(result, vec![b"1"]);
     }
 
     #[tokio::test]
     async fn parse_resp3_bool_false() {
-        let data = b"#f\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b"#f\r\n").await;
         assert_eq!(result, vec![b"0"]);
     }
 
     #[tokio::test]
     async fn parse_resp3_double() {
-        let data = b",3.14\r\n";
-        let mut r = BufReader::new(&data[..]);
-        let result = parse_resp_with_limits(&mut r,  RespLimits::default()).await.unwrap().unwrap();
+        let result = parse(b",3.14\r\n").await;
         assert_eq!(result, vec![b"3.14"]);
     }
 
@@ -506,7 +688,8 @@ mod tests {
             max_array_len: 1,
             ..RespLimits::default()
         };
-        let err = parse_resp_with_limits(&mut r, limits)
+        let mut out = Vec::new();
+        let err = parse_resp_with_limits(&mut r, limits, &mut out)
             .await
             .expect_err("should reject oversized array");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -520,7 +703,8 @@ mod tests {
             max_bulk_len: 3,
             ..RespLimits::default()
         };
-        let err = parse_resp_with_limits(&mut r, limits)
+        let mut out = Vec::new();
+        let err = parse_resp_with_limits(&mut r, limits, &mut out)
             .await
             .expect_err("should reject oversized bulk");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -534,7 +718,8 @@ mod tests {
             max_inline_len: 4,
             ..RespLimits::default()
         };
-        let err = parse_resp_with_limits(&mut r, limits)
+        let mut out = Vec::new();
+        let err = parse_resp_with_limits(&mut r, limits, &mut out)
             .await
             .expect_err("should reject oversized inline command");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

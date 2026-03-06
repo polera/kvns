@@ -152,20 +152,103 @@ async fn kvns_bench_parse_resp<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+/// Parse with buffer reuse: same &mut Vec<Vec<u8>> passed every call.
+async fn parse_reuse(data: &[u8], out: &mut Vec<Vec<u8>>) {
+    use tokio::io::BufReader;
+    let cursor = Cursor::new(data);
+    let mut reader = BufReader::new(cursor);
+    kvns_bench_parse_resp_reuse(&mut reader, out).await.unwrap();
+}
+
+async fn kvns_bench_parse_resp_reuse<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<Vec<u8>>,
+) -> std::io::Result<bool> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let mut line = Vec::new();
+    let n = reader.read_until(b'\n', &mut line).await?;
+    if n == 0 {
+        out.clear();
+        return Ok(false);
+    }
+    while line.last() == Some(&b'\n') { line.pop(); }
+    while line.last() == Some(&b'\r') { line.pop(); }
+    out.clear();
+    if line.is_empty() { return Ok(true); }
+
+    match line[0] {
+        b'*' => {
+            let count: usize = std::str::from_utf8(&line[1..]).unwrap().parse().unwrap();
+            let mut hdr = Vec::new();
+            for i in 0..count {
+                hdr.clear();
+                reader.read_until(b'\n', &mut hdr).await?;
+                while hdr.last() == Some(&b'\n') { hdr.pop(); }
+                while hdr.last() == Some(&b'\r') { hdr.pop(); }
+                let len: usize = std::str::from_utf8(&hdr[1..]).unwrap().parse().unwrap();
+                if i < out.len() {
+                    out[i].resize(len, 0);
+                } else {
+                    out.push(vec![0u8; len]);
+                }
+                reader.read_exact(&mut out[i]).await?;
+                let mut crlf = [0u8; 2];
+                reader.read_exact(&mut crlf).await?;
+            }
+            out.truncate(count);
+            Ok(true)
+        }
+        _ => {
+            let mut idx = 0usize;
+            let mut i = 0usize;
+            while i < line.len() {
+                while i < line.len() && line[i] == b' ' { i += 1; }
+                let start = i;
+                while i < line.len() && line[i] != b' ' { i += 1; }
+                if start < i {
+                    if idx < out.len() {
+                        out[idx].clear();
+                        out[idx].extend_from_slice(&line[start..i]);
+                    } else {
+                        out.push(line[start..i].to_vec());
+                    }
+                    idx += 1;
+                }
+            }
+            out.truncate(idx);
+            Ok(true)
+        }
+    }
+}
+
 fn bench_resp_parse(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut g = c.benchmark_group("resp_parse");
 
+    // Original: allocates a new Vec<Vec<u8>> per call.
     g.bench_function("SET_3args", |b| {
         b.iter(|| rt.block_on(parse_one(black_box(SET_CMD))))
     });
-
     g.bench_function("GET_2args", |b| {
         b.iter(|| rt.block_on(parse_one(black_box(GET_CMD))))
     });
-
     g.bench_function("PING_inline", |b| {
         b.iter(|| rt.block_on(parse_one(black_box(PING_CMD))))
+    });
+
+    // Reuse: pre-allocated buffer, inner Vecs reused across calls.
+    g.bench_function("SET_3args_reuse", |b| {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
+        b.iter(|| rt.block_on(parse_reuse(black_box(SET_CMD), &mut out)))
+    });
+    g.bench_function("GET_2args_reuse", |b| {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
+        b.iter(|| rt.block_on(parse_reuse(black_box(GET_CMD), &mut out)))
+    });
+    g.bench_function("PING_inline_reuse", |b| {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
+        b.iter(|| rt.block_on(parse_reuse(black_box(PING_CMD), &mut out)))
     });
 
     g.finish();

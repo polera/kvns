@@ -11,6 +11,14 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 serde = { version = "1", features = ["derive"] }
 rkyv = { version = "0.8", features = ["std"] }
+parking_lot = "0.12"
+smallvec = { version = "1", features = ["union"] }
+ahash = "0.8"
+itoa = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = "0.4"
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -20,6 +28,6 @@ name = "hotpath"
 harness = false
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"

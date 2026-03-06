@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::commands::{ConnState, dispatch as dispatch_classic, encode_pubsub_message};
 use crate::pubsub::{PubSubHub, PubSubMessage};
 use crate::resp::{RespLimits, parse_resp_with_limits};
-use crate::sharded::{ShardedStore, dispatch as dispatch_sharded};
+use crate::sharded::{ShardedStore, dispatch as dispatch_sharded_sync};
 use crate::store::Store;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -46,21 +46,25 @@ pub(crate) async fn handle_connection(
     // buffered, collapsing N pipelined writes into a single syscall.
     let mut writer = BufWriter::with_capacity(64 * 1024, write_half);
 
+    // Reused across every command on this connection: eliminates the outer Vec<Vec<u8>>
+    // allocation per request, and inner Vec<u8> slots are reused when capacity allows.
+    let mut args: Vec<Vec<u8>> = Vec::with_capacity(8);
+
     loop {
         // When the connection is in pub-sub mode we must interleave incoming
         // commands with push messages arriving on the pub-sub channel.
         if conn.in_pubsub() {
             tokio::select! {
-                parse_result = parse_resp_with_limits(&mut reader, limits.resp) => {
+                parse_result = parse_resp_with_limits(&mut reader, limits.resp, &mut args) => {
                     match parse_result {
-                        Ok(None) => break,
-                        Ok(Some(args)) if args.is_empty() => continue,
-                        Ok(Some(args)) => {
+                        Ok(false) => break,
+                        Ok(true) if args.is_empty() => continue,
+                        Ok(true) => {
                             let (response, quit) = match &backend {
                                 Backend::Classic(store) => {
                                     dispatch_classic(&args, store, &mut conn, &hub).await
                                 }
-                                Backend::Sharded(store) => dispatch_sharded(&args, store).await,
+                                Backend::Sharded(store) => dispatch_sharded_sync(&mut args, store),
                             };
                             // Pick up the receiver if SUBSCRIBE just created the channel.
                             if pubsub_rx.is_none() {
@@ -101,15 +105,15 @@ pub(crate) async fn handle_connection(
                 }
             }
         } else {
-            match parse_resp_with_limits(&mut reader, limits.resp).await {
-                Ok(None) => break,
-                Ok(Some(args)) if args.is_empty() => continue,
-                Ok(Some(args)) => {
+            match parse_resp_with_limits(&mut reader, limits.resp, &mut args).await {
+                Ok(false) => break,
+                Ok(true) if args.is_empty() => continue,
+                Ok(true) => {
                     let (response, quit) = match &backend {
                         Backend::Classic(store) => {
                             dispatch_classic(&args, store, &mut conn, &hub).await
                         }
-                        Backend::Sharded(store) => dispatch_sharded(&args, store).await,
+                        Backend::Sharded(store) => dispatch_sharded_sync(&mut args, store),
                     };
                     // Pick up the receiver if SUBSCRIBE just created the channel.
                     if pubsub_rx.is_none() {
