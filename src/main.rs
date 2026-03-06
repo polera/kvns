@@ -9,9 +9,6 @@ mod store;
 #[cfg(target_os = "linux")]
 mod uring_server;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
