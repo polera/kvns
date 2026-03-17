@@ -158,6 +158,10 @@ impl ShardedDb {
         }
     }
 
+    fn now_if_ttl(&self) -> Option<Instant> {
+        self.has_ttl.load(Ordering::Relaxed).then(Instant::now)
+    }
+
     fn get_value(&self, raw_key: &[u8]) -> Option<Vec<u8>> {
         let parsed = self.parse_key(raw_key);
 
@@ -194,11 +198,7 @@ impl ShardedDb {
         let key_len = parsed.key_len;
 
         // Only pay the clock cost when TTL keys are actually in use.
-        let now_opt = if ttl.is_some() || self.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let now_opt = if ttl.is_some() { Some(Instant::now()) } else { self.now_if_ttl() };
 
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
@@ -236,11 +236,7 @@ impl ShardedDb {
     ) -> Result<i64, Cow<'static, [u8]>> {
         let parsed = self.parse_key(raw_key);
         let key_len = parsed.key_len;
-        let now_opt = if self.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let now_opt = self.now_if_ttl();
 
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
@@ -295,11 +291,7 @@ impl ShardedDb {
     /// success, `Ok(false)` if the key already exists, `Err(())` on OOM.
     fn put_value_if_absent(&self, raw_key: &[u8], value: Vec<u8>) -> Result<bool, ()> {
         let parsed = self.parse_key(raw_key);
-        let now_opt = if self.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let now_opt = self.now_if_ttl();
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
             self.purge_expired_locked(&mut shard, &parsed, now);
@@ -326,11 +318,7 @@ impl ShardedDb {
     /// new length on success, or `Err(bytes)` on OOM where `bytes` is an error response.
     fn append_value(&self, raw_key: &[u8], suffix: &[u8]) -> Result<i64, Cow<'static, [u8]>> {
         let parsed = self.parse_key(raw_key);
-        let now_opt = if self.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let now_opt = self.now_if_ttl();
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
             self.purge_expired_locked(&mut shard, &parsed, now);
@@ -372,11 +360,7 @@ impl ShardedDb {
 
         let parsed = self.parse_key(raw_key);
         let key_len = parsed.key_len;
-        let now_opt = if self.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let now_opt = self.now_if_ttl();
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
             self.purge_expired_locked(&mut shard, &parsed, now);
@@ -417,11 +401,7 @@ impl ShardedDb {
     /// shard write locks in index order to avoid deadlock. Returns `Ok(true)` on
     /// success, `Ok(false)` if any key exists, `Err(())` on OOM.
     fn msetnx_atomic(&self, pairs: Vec<(ParsedKey, Vec<u8>)>) -> Result<bool, ()> {
-        let now_opt = if self.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let now_opt = self.now_if_ttl();
         // Group pairs by shard index (BTreeMap → sorted order prevents deadlock).
         let mut by_shard: BTreeMap<usize, Vec<(ParsedKey, Vec<u8>)>> = BTreeMap::new();
         for (parsed, value) in pairs {
@@ -516,291 +496,217 @@ pub(crate) fn dispatch(
     if args.is_empty() {
         return (resp_err("empty command"), false);
     }
-    let cmd = args[0].as_slice();
-
-    if cmd.eq_ignore_ascii_case(b"PING") {
-        return (resp_pong(), false);
+    // Normalize to ASCII uppercase in a stack buffer — zero heap allocation.
+    let mut cmd_upper = [0u8; 20];
+    let cmd_len = args[0].len().min(cmd_upper.len());
+    for (dst, &src) in cmd_upper[..cmd_len].iter_mut().zip(&args[0][..cmd_len]) {
+        *dst = src.to_ascii_uppercase();
     }
-    if cmd.eq_ignore_ascii_case(b"QUIT") {
-        return (resp_ok(), true);
-    }
+    let cmd = &cmd_upper[..cmd_len];
 
-    if cmd.eq_ignore_ascii_case(b"SET") {
-        let ttl = match set_ttl_from_args(args) {
-            Ok(v) => v,
-            Err(err) => return (err, false),
-        };
-        let value = std::mem::take(&mut args[2]);
-        let response = if store.put_value(&args[1], value, ttl).is_ok() {
+    let resp = match cmd {
+        b"PING" => return (resp_pong(), false),
+        b"QUIT" => return (resp_ok(), true),
+
+        b"SET" => {
+            let ttl = match set_ttl_from_args(args) {
+                Ok(v) => v,
+                Err(err) => return (err, false),
+            };
+            let value = std::mem::take(&mut args[2]);
+            if store.put_value(&args[1], value, ttl).is_ok() {
+                resp_ok()
+            } else {
+                resp_err("OOM command not allowed when used memory > 'maxmemory'")
+            }
+        }
+        b"GET" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            match store.get_value(&args[1]) {
+                Some(value) => resp_bulk(&value),
+                None => resp_null(),
+            }
+        }
+        b"MGET" => {
+            if args.len() < 2 { return (wrong_args(&args[0]), false); }
+            let key_count = args.len() - 1;
+            let mut out = Vec::with_capacity(16 + key_count * 32);
+            append_array_header(&mut out, key_count);
+            for raw_key in &args[1..] {
+                match store.get_value(raw_key) {
+                    Some(value) => append_bulk(&mut out, &value),
+                    None => append_null(&mut out),
+                }
+            }
+            return (out.into(), false);
+        }
+        b"MSET" => {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                return (wrong_args(&args[0]), false);
+            }
+            let mut i = 1usize;
+            while i + 1 < args.len() {
+                let value = std::mem::take(&mut args[i + 1]);
+                if store.put_value(&args[i], value, None).is_err() {
+                    return (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false);
+                }
+                i += 2;
+            }
             resp_ok()
-        } else {
-            resp_err("OOM command not allowed when used memory > 'maxmemory'")
-        };
-        return (response, false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"GET") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
         }
-        let response = match store.get_value(&args[1]) {
-            Some(value) => resp_bulk(&value),
-            None => resp_null(),
-        };
-        return (response, false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"MGET") {
-        if args.len() < 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        let key_count = args.len() - 1;
-        let mut out = Vec::with_capacity(16 + key_count * 32);
-        append_array_header(&mut out, key_count);
-        for raw_key in &args[1..] {
-            match store.get_value(raw_key) {
-                Some(value) => append_bulk(&mut out, &value),
-                None => append_null(&mut out),
+        b"MSETNX" => {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                return (wrong_args(&args[0]), false);
             }
-        }
-        return (out.into(), false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"MSET") {
-        if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
-            return (wrong_args(&args[0]), false);
-        }
-        let mut i = 1usize;
-        while i + 1 < args.len() {
-            let value = std::mem::take(&mut args[i + 1]);
-            if store.put_value(&args[i], value, None).is_err() {
-                return (
-                    resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                    false,
-                );
+            let mut pairs: Vec<(ParsedKey, Vec<u8>)> = Vec::new();
+            let mut i = 1usize;
+            while i + 1 < args.len() {
+                let key = store.parse_key(&args[i]);
+                let value = std::mem::take(&mut args[i + 1]);
+                pairs.push((key, value));
+                i += 2;
             }
-            i += 2;
-        }
-        return (resp_ok(), false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"MSETNX") {
-        if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
-            return (wrong_args(&args[0]), false);
-        }
-        let mut pairs: Vec<(ParsedKey, Vec<u8>)> = Vec::new();
-        let mut i = 1usize;
-        while i + 1 < args.len() {
-            let key = store.parse_key(&args[i]);
-            let value = std::mem::take(&mut args[i + 1]);
-            pairs.push((key, value));
-            i += 2;
-        }
-        return match store.msetnx_atomic(pairs) {
-            Ok(true) => (resp_int(1), false),
-            Ok(false) => (resp_int(0), false),
-            Err(()) => (
-                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                false,
-            ),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"SETNX") {
-        if args.len() != 3 {
-            return (wrong_args(&args[0]), false);
-        }
-        let value = std::mem::take(&mut args[2]);
-        return match store.put_value_if_absent(&args[1], value) {
-            Ok(true) => (resp_int(1), false),
-            Ok(false) => (resp_int(0), false),
-            Err(()) => (
-                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                false,
-            ),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"INCR") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        return match store.apply_integer_delta(&args[1], 1, "increment would overflow") {
-            Ok(next) => (resp_int(next), false),
-            Err(err) => (err, false),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"INCRBY") {
-        if args.len() != 3 {
-            return (wrong_args(&args[0]), false);
-        }
-        let by = match parse_i64_arg(&args[2]) {
-            Ok(v) => v,
-            Err(err) => return (err, false),
-        };
-        return match store.apply_integer_delta(&args[1], by, "increment would overflow") {
-            Ok(next) => (resp_int(next), false),
-            Err(err) => (err, false),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"DECR") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        return match store.apply_integer_delta(&args[1], -1, "decrement would overflow") {
-            Ok(next) => (resp_int(next), false),
-            Err(err) => (err, false),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"DECRBY") {
-        if args.len() != 3 {
-            return (wrong_args(&args[0]), false);
-        }
-        let by = match parse_i64_arg(&args[2]) {
-            Ok(v) => v,
-            Err(err) => return (err, false),
-        };
-        let delta = match by.checked_neg() {
-            Some(v) => v,
-            None => return (resp_err("decrement would overflow"), false),
-        };
-        return match store.apply_integer_delta(&args[1], delta, "decrement would overflow") {
-            Ok(next) => (resp_int(next), false),
-            Err(err) => (err, false),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"STRLEN") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        let response = match store.get_value(&args[1]) {
-            Some(value) => resp_int(value.len() as i64),
-            None => resp_int(0),
-        };
-        return (response, false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"TYPE") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        let response = if store.get_value(&args[1]).is_some() {
-            resp_bulk(b"string")
-        } else {
-            resp_bulk(b"none")
-        };
-        return (response, false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"APPEND") {
-        if args.len() != 3 {
-            return (wrong_args(&args[0]), false);
-        }
-        return match store.append_value(&args[1], &args[2]) {
-            Ok(len) => (resp_int(len), false),
-            Err(err) => (err, false),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"GETSET") {
-        if args.len() != 3 {
-            return (wrong_args(&args[0]), false);
-        }
-        let value = std::mem::take(&mut args[2]);
-        return match store.get_and_set(&args[1], value) {
-            Ok(Some(old)) => (resp_bulk(&old), false),
-            Ok(None) => (resp_null(), false),
-            Err(()) => (
-                resp_err("OOM command not allowed when used memory > 'maxmemory'"),
-                false,
-            ),
-        };
-    }
-
-    if cmd.eq_ignore_ascii_case(b"GETDEL") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        let parsed = store.parse_key(&args[1]);
-        let now_opt = if store.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        let mut shard = store.shards[parsed.shard_idx].write();
-        if let Some(now) = now_opt {
-            store.purge_expired_locked(&mut shard, &parsed, now);
-        }
-        let removed = shard.remove(&parsed.canonical);
-        if let Some(entry) = removed {
-            let size = ShardedDb::entry_size(parsed.key_len, entry.value.len());
-            store.release_bytes(size);
-            store.maybe_record_total_used();
-            return (resp_bulk(&entry.value), false);
-        }
-        return (resp_null(), false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"GETEX") {
-        if args.len() < 2 {
-            return (wrong_args(&args[0]), false);
-        }
-        if args.len() > 2 {
-            return (resp_err("command not supported in sharded mode"), false);
-        }
-        let response = match store.get_value(&args[1]) {
-            Some(value) => resp_bulk(&value),
-            None => resp_null(),
-        };
-        return (response, false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-        if args.len() != 1 {
-            return (wrong_args(&args[0]), false);
-        }
-        let now_opt = if store.has_ttl.load(Ordering::Relaxed) {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        let mut total = 0usize;
-        for shard_lock in &store.shards {
-            let shard = shard_lock.read();
-            total += match now_opt {
-                Some(now) => shard
-                    .values()
-                    .filter(|e| !e.expiry.is_some_and(|d| now >= d))
-                    .count(),
-                None => shard.len(),
+            return match store.msetnx_atomic(pairs) {
+                Ok(true) => (resp_int(1), false),
+                Ok(false) => (resp_int(0), false),
+                Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
             };
         }
-        return (resp_int(total as i64), false);
-    }
-
-    if cmd.eq_ignore_ascii_case(b"SELECT") {
-        if args.len() != 2 {
-            return (wrong_args(&args[0]), false);
+        b"SETNX" => {
+            if args.len() != 3 { return (wrong_args(&args[0]), false); }
+            let value = std::mem::take(&mut args[2]);
+            return match store.put_value_if_absent(&args[1], value) {
+                Ok(true) => (resp_int(1), false),
+                Ok(false) => (resp_int(0), false),
+                Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+            };
         }
-        let idx = match parse_i64_arg(&args[1]) {
-            Ok(v) => v,
-            Err(err) => return (err, false),
-        };
-        if idx == 0 {
-            return (resp_ok(), false);
+        b"INCR" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            return match store.apply_integer_delta(&args[1], 1, "increment would overflow") {
+                Ok(next) => (resp_int(next), false),
+                Err(err) => (err, false),
+            };
         }
-        return (resp_err("ERR DB index is out of range"), false);
-    }
+        b"INCRBY" => {
+            if args.len() != 3 { return (wrong_args(&args[0]), false); }
+            let by = match parse_i64_arg(&args[2]) {
+                Ok(v) => v,
+                Err(err) => return (err, false),
+            };
+            return match store.apply_integer_delta(&args[1], by, "increment would overflow") {
+                Ok(next) => (resp_int(next), false),
+                Err(err) => (err, false),
+            };
+        }
+        b"DECR" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            return match store.apply_integer_delta(&args[1], -1, "decrement would overflow") {
+                Ok(next) => (resp_int(next), false),
+                Err(err) => (err, false),
+            };
+        }
+        b"DECRBY" => {
+            if args.len() != 3 { return (wrong_args(&args[0]), false); }
+            let by = match parse_i64_arg(&args[2]) {
+                Ok(v) => v,
+                Err(err) => return (err, false),
+            };
+            let delta = match by.checked_neg() {
+                Some(v) => v,
+                None => return (resp_err("decrement would overflow"), false),
+            };
+            return match store.apply_integer_delta(&args[1], delta, "decrement would overflow") {
+                Ok(next) => (resp_int(next), false),
+                Err(err) => (err, false),
+            };
+        }
+        b"STRLEN" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            match store.get_value(&args[1]) {
+                Some(value) => resp_int(value.len() as i64),
+                None => resp_int(0),
+            }
+        }
+        b"TYPE" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            if store.get_value(&args[1]).is_some() {
+                resp_bulk(b"string")
+            } else {
+                resp_bulk(b"none")
+            }
+        }
+        b"APPEND" => {
+            if args.len() != 3 { return (wrong_args(&args[0]), false); }
+            return match store.append_value(&args[1], &args[2]) {
+                Ok(len) => (resp_int(len), false),
+                Err(err) => (err, false),
+            };
+        }
+        b"GETSET" => {
+            if args.len() != 3 { return (wrong_args(&args[0]), false); }
+            let value = std::mem::take(&mut args[2]);
+            return match store.get_and_set(&args[1], value) {
+                Ok(Some(old)) => (resp_bulk(&old), false),
+                Ok(None) => (resp_null(), false),
+                Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+            };
+        }
+        b"GETDEL" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            let parsed = store.parse_key(&args[1]);
+            let now_opt = store.now_if_ttl();
+            let mut shard = store.shards[parsed.shard_idx].write();
+            if let Some(now) = now_opt {
+                store.purge_expired_locked(&mut shard, &parsed, now);
+            }
+            let removed = shard.remove(&parsed.canonical);
+            match removed {
+                Some(entry) => {
+                    let size = ShardedDb::entry_size(parsed.key_len, entry.value.len());
+                    store.release_bytes(size);
+                    store.maybe_record_total_used();
+                    resp_bulk(&entry.value)
+                }
+                None => resp_null(),
+            }
+        }
+        b"GETEX" => {
+            if args.len() < 2 { return (wrong_args(&args[0]), false); }
+            if args.len() > 2 {
+                return (resp_err("command not supported in sharded mode"), false);
+            }
+            match store.get_value(&args[1]) {
+                Some(value) => resp_bulk(&value),
+                None => resp_null(),
+            }
+        }
+        b"DBSIZE" => {
+            if args.len() != 1 { return (wrong_args(&args[0]), false); }
+            let now_opt = store.now_if_ttl();
+            let mut total = 0usize;
+            for shard_lock in &store.shards {
+                let shard = shard_lock.read();
+                total += match now_opt {
+                    Some(now) => shard.values().filter(|e| !e.expiry.is_some_and(|d| now >= d)).count(),
+                    None => shard.len(),
+                };
+            }
+            resp_int(total as i64)
+        }
+        b"SELECT" => {
+            if args.len() != 2 { return (wrong_args(&args[0]), false); }
+            let idx = match parse_i64_arg(&args[1]) {
+                Ok(v) => v,
+                Err(err) => return (err, false),
+            };
+            if idx == 0 { resp_ok() } else { resp_err("ERR DB index is out of range") }
+        }
+        b"HELLO" | b"DEL" => resp_err("command not supported in sharded mode"),
 
-    if cmd.eq_ignore_ascii_case(b"HELLO") {
-        return (resp_err("command not supported in sharded mode"), false);
-    }
-
-    (resp_err("command not supported in sharded mode"), false)
+        _ => resp_err("command not supported in sharded mode"),
+    };
+    (resp, false)
 }
 
 #[cfg(test)]

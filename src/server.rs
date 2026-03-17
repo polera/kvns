@@ -50,6 +50,34 @@ pub(crate) async fn handle_connection(
     // allocation per request, and inner Vec<u8> slots are reused when capacity allows.
     let mut args: Vec<Vec<u8>> = Vec::with_capacity(8);
 
+    /// Dispatch one parsed command, write the response, and conditionally flush.
+    /// Returns `Err(())` to signal the connection should be closed.
+    macro_rules! handle_command {
+        ($args:expr, $backend:expr, $conn:expr, $hub:expr, $pubsub_rx:expr,
+         $reader:expr, $writer:expr) => {{
+            let (response, quit) = match $backend {
+                Backend::Classic(store) => {
+                    dispatch_classic(&$args, store, $conn, $hub).await
+                }
+                Backend::Sharded(store) => dispatch_sharded_sync(&mut $args, store),
+            };
+            // Pick up the receiver if SUBSCRIBE just created the channel.
+            if $pubsub_rx.is_none() {
+                *$pubsub_rx = $conn.pubsub_rx_slot.take();
+            }
+            if $writer.write_all(&response).await.is_err() {
+                break;
+            }
+            if quit {
+                let _ = $writer.flush().await;
+                break;
+            }
+            if $reader.buffer().is_empty() && $writer.flush().await.is_err() {
+                break;
+            }
+        }};
+    }
+
     loop {
         // When the connection is in pub-sub mode we must interleave incoming
         // commands with push messages arriving on the pub-sub channel.
@@ -60,26 +88,8 @@ pub(crate) async fn handle_connection(
                         Ok(false) => break,
                         Ok(true) if args.is_empty() => continue,
                         Ok(true) => {
-                            let (response, quit) = match &backend {
-                                Backend::Classic(store) => {
-                                    dispatch_classic(&args, store, &mut conn, &hub).await
-                                }
-                                Backend::Sharded(store) => dispatch_sharded_sync(&mut args, store),
-                            };
-                            // Pick up the receiver if SUBSCRIBE just created the channel.
-                            if pubsub_rx.is_none() {
-                                pubsub_rx = conn.pubsub_rx_slot.take();
-                            }
-                            if writer.write_all(&response).await.is_err() {
-                                break;
-                            }
-                            if quit {
-                                let _ = writer.flush().await;
-                                break;
-                            }
-                            if reader.buffer().is_empty() && writer.flush().await.is_err() {
-                                break;
-                            }
+                            handle_command!(args, &backend, &mut conn, &hub, &mut pubsub_rx,
+                                            reader, writer);
                         }
                         Err(e) => {
                             debug!(error = %e, "parse error, closing connection");
@@ -109,27 +119,8 @@ pub(crate) async fn handle_connection(
                 Ok(false) => break,
                 Ok(true) if args.is_empty() => continue,
                 Ok(true) => {
-                    let (response, quit) = match &backend {
-                        Backend::Classic(store) => {
-                            dispatch_classic(&args, store, &mut conn, &hub).await
-                        }
-                        Backend::Sharded(store) => dispatch_sharded_sync(&mut args, store),
-                    };
-                    // Pick up the receiver if SUBSCRIBE just created the channel.
-                    if pubsub_rx.is_none() {
-                        pubsub_rx = conn.pubsub_rx_slot.take();
-                    }
-                    if writer.write_all(&response).await.is_err() {
-                        break;
-                    }
-                    if quit {
-                        let _ = writer.flush().await;
-                        break;
-                    }
-                    // Only flush when the read buffer is drained: pipelined commands share a flush.
-                    if reader.buffer().is_empty() && writer.flush().await.is_err() {
-                        break;
-                    }
+                    handle_command!(args, &backend, &mut conn, &hub, &mut pubsub_rx,
+                                    reader, writer);
                 }
                 Err(e) => {
                     debug!(error = %e, "parse error, closing connection");

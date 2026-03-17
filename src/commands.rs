@@ -858,14 +858,7 @@ async fn cmd_getset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let (ns, key) = parse_ns_key(&args[1]);
     let new_value = args[2].clone();
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     let old = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => resp_null(),
         Some(entry) => match entry.value.as_string() {
@@ -939,71 +932,32 @@ async fn cmd_getex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         return response;
     }
     let opt = String::from_utf8_lossy(&args[2]).to_ascii_uppercase();
-    let new_expiry: Option<Option<Instant>> = match opt.as_str() {
-        "PERSIST" => Some(None),
-        "EX" => {
-            if args.len() < 4 {
-                return resp_err("syntax error");
-            }
-            match std::str::from_utf8(&args[3])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                None => return resp_err("invalid expire time"),
-                Some(n) => Some(Some(Instant::now() + Duration::from_secs(n))),
-            }
+
+    // Helper: convert a unix timestamp to an Instant.
+    let unix_to_instant = |target: SystemTime| -> Instant {
+        match target.duration_since(SystemTime::now()) {
+            Ok(d) => Instant::now() + d,
+            Err(_) => Instant::now(),
         }
-        "PX" => {
-            if args.len() < 4 {
-                return resp_err("syntax error");
-            }
-            match std::str::from_utf8(&args[3])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                None => return resp_err("invalid expire time"),
-                Some(n) => Some(Some(Instant::now() + Duration::from_millis(n))),
-            }
+    };
+
+    let new_expiry: Option<Option<Instant>> = if opt == "PERSIST" {
+        Some(None)
+    } else {
+        if args.len() < 4 {
+            return resp_err("syntax error");
         }
-        "EXAT" => {
-            if args.len() < 4 {
-                return resp_err("syntax error");
-            }
-            match std::str::from_utf8(&args[3])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                None => return resp_err("invalid expire time"),
-                Some(unix_secs) => {
-                    let target = SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs);
-                    let deadline = match target.duration_since(SystemTime::now()) {
-                        Ok(d) => Some(Instant::now() + d),
-                        Err(_) => Some(Instant::now()),
-                    };
-                    Some(deadline)
-                }
-            }
+        let amount: u64 = match std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n,
+            None => return resp_err("invalid expire time"),
+        };
+        match opt.as_str() {
+            "EX" => Some(Some(Instant::now() + Duration::from_secs(amount))),
+            "PX" => Some(Some(Instant::now() + Duration::from_millis(amount))),
+            "EXAT" => Some(Some(unix_to_instant(SystemTime::UNIX_EPOCH + Duration::from_secs(amount)))),
+            "PXAT" => Some(Some(unix_to_instant(SystemTime::UNIX_EPOCH + Duration::from_millis(amount)))),
+            _ => return resp_err("syntax error"),
         }
-        "PXAT" => {
-            if args.len() < 4 {
-                return resp_err("syntax error");
-            }
-            match std::str::from_utf8(&args[3])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                None => return resp_err("invalid expire time"),
-                Some(unix_ms) => {
-                    let target = SystemTime::UNIX_EPOCH + Duration::from_millis(unix_ms);
-                    let deadline = match target.duration_since(SystemTime::now()) {
-                        Ok(d) => Some(Instant::now() + d),
-                        Err(_) => Some(Instant::now()),
-                    };
-                    Some(deadline)
-                }
-            }
-        }
-        _ => return resp_err("syntax error"),
     };
 
     if let Some(new_exp) = new_expiry
@@ -1026,14 +980,7 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let (ns, key) = parse_ns_key(&args[1]);
     let append_data = args[2].clone();
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     let existing_len: usize = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
         Some(e) => match e.value.as_string() {
@@ -1095,21 +1042,18 @@ async fn cmd_strlen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     resp
 }
 
-pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
-    if args.len() != 2 {
-        return wrong_args(&args[0]);
-    }
-    let (ns, key) = parse_ns_key(&args[1]);
+/// Shared helper for INCR, INCRBY, DECR, DECRBY — reads the current integer
+/// value, applies `delta`, stores the result, and returns a RESP integer.
+async fn apply_integer_op(
+    ns: &str,
+    key: &str,
+    store: &Store,
+    delta: i64,
+    overflow_msg: &str,
+) -> std::borrow::Cow<'static, [u8]> {
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
-    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+    db.purge_if_expired(ns, key);
+    let current: i64 = match db.entries.get::<str>(ns).and_then(|m| m.get::<str>(key)) {
         None => 0,
         Some(entry) => match entry.value.as_string() {
             None => return resp_wrongtype(),
@@ -1119,18 +1063,26 @@ pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
             },
         },
     };
-    let next = match current.checked_add(1) {
+    let next = match current.checked_add(delta) {
         Some(n) => n,
-        None => return resp_err("increment would overflow"),
+        None => return resp_err(overflow_msg),
     };
     let new_value = i64_to_bytes(next);
-    if !check_oom(&mut db, &ns, &key, new_value.len()) {
+    if !check_oom(&mut db, ns, key, new_value.len()) {
         return resp_err("OOM command not allowed when used memory > 'maxmemory'");
     }
-    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
+    let m = db.put_deferred(ns, key, Entry::new(new_value, None));
     drop(db);
     m.emit();
     resp_int(next)
+}
+
+pub(crate) async fn cmd_incr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
+    if args.len() != 2 {
+        return wrong_args(&args[0]);
+    }
+    let (ns, key) = parse_ns_key(&args[1]);
+    apply_integer_op(&ns, &key, store, 1, "increment would overflow").await
 }
 
 async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1138,44 +1090,11 @@ async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let by: i64 = match std::str::from_utf8(&args[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
+    let by: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
         None => return resp_err("value is not an integer or out of range"),
     };
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
-    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => 0,
-        Some(entry) => match entry.value.as_string() {
-            None => return resp_wrongtype(),
-            Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => return resp_err("value is not an integer or out of range"),
-            },
-        },
-    };
-    let next = match current.checked_add(by) {
-        Some(n) => n,
-        None => return resp_err("increment would overflow"),
-    };
-    let new_value = i64_to_bytes(next);
-    if !check_oom(&mut db, &ns, &key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
-    }
-    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
-    drop(db);
-    m.emit();
-    resp_int(next)
+    apply_integer_op(&ns, &key, store, by, "increment would overflow").await
 }
 
 async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1183,37 +1102,7 @@ async fn cmd_decr(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
-    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => 0,
-        Some(entry) => match entry.value.as_string() {
-            None => return resp_wrongtype(),
-            Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => return resp_err("value is not an integer or out of range"),
-            },
-        },
-    };
-    let next = match current.checked_sub(1) {
-        Some(n) => n,
-        None => return resp_err("decrement would overflow"),
-    };
-    let new_value = i64_to_bytes(next);
-    if !check_oom(&mut db, &ns, &key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
-    }
-    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
-    drop(db);
-    m.emit();
-    resp_int(next)
+    apply_integer_op(&ns, &key, store, -1, "decrement would overflow").await
 }
 
 async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1221,44 +1110,11 @@ async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         return wrong_args(&args[0]);
     }
     let (ns, key) = parse_ns_key(&args[1]);
-    let by: i64 = match std::str::from_utf8(&args[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
+    let by: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
         None => return resp_err("value is not an integer or out of range"),
     };
-    let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
-    let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-        None => 0,
-        Some(entry) => match entry.value.as_string() {
-            None => return resp_wrongtype(),
-            Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => return resp_err("value is not an integer or out of range"),
-            },
-        },
-    };
-    let next = match current.checked_sub(by) {
-        Some(n) => n,
-        None => return resp_err("decrement would overflow"),
-    };
-    let new_value = i64_to_bytes(next);
-    if !check_oom(&mut db, &ns, &key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
-    }
-    let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
-    drop(db);
-    m.emit();
-    resp_int(next)
+    apply_integer_op(&ns, &key, store, by.wrapping_neg(), "decrement would overflow").await
 }
 
 async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -1274,14 +1130,7 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
         None => return resp_err("value is not a valid float"),
     };
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     let current: f64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0.0,
         Some(entry) => match entry.value.as_string() {
@@ -1321,14 +1170,7 @@ async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
     };
     let replacement = args[3].clone();
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     let existing: Vec<u8> = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => vec![],
         Some(entry) => match entry.value.as_string() {
@@ -1551,9 +1393,7 @@ async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let new_items = &args[2..];
     let mut db = store.write().await;
     // Expire under the same lock so the existence check and push are atomic.
-    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_some_and(|e| e.is_expired()) {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     let existing_byte_len = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => return resp_int(0),
         Some(e) => match &e.value {
@@ -1595,9 +1435,7 @@ async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let new_items = &args[2..];
     let mut db = store.write().await;
     // Expire under the same lock so the existence check and push are atomic.
-    if db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())).is_some_and(|e| e.is_expired()) {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     let existing_byte_len = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => return resp_int(0),
         Some(e) => match &e.value {
@@ -2375,14 +2213,7 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         .collect();
     let mut db = store.write().await;
 
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
 
     let (existing_byte_len, oom_net, is_new_key): (usize, usize, bool) =
         match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
@@ -2720,14 +2551,7 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         None => return resp_err("value is not an integer or out of range"),
     };
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
 
     let current: i64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0,
@@ -2783,14 +2607,7 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'
         None => return resp_err("value is not a valid float"),
     };
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
 
     let current: f64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0.0,
@@ -2935,14 +2752,7 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     let (ns, key) = parse_ns_key(&args[1]);
     let members = &args[2..];
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
 
     let (existing_byte_len, oom_net, is_new_key): (usize, usize, bool) =
         match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
@@ -3782,14 +3592,7 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
 
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
     // Validate type
     if let Some(e) = db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref()))
         && e.value.as_zset().is_none()
@@ -4706,14 +4509,7 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
     };
     let member = args[3].clone();
     let mut db = store.write().await;
-    if db
-        .entries
-        .get::<str>(ns.as_ref())
-        .and_then(|m| m.get::<str>(key.as_ref()))
-        .is_some_and(|e| e.is_expired())
-    {
-        db.delete(&ns, &key);
-    }
+    db.purge_if_expired(&ns, &key);
 
     let current_score: f64 = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => 0.0,
