@@ -59,66 +59,58 @@ impl Value {
     }
 
     pub(crate) fn as_string(&self) -> Option<&[u8]> {
-        if let Value::String(b) = self {
-            Some(b)
-        } else {
-            None
+        match self {
+            Value::String(b) => Some(b),
+            _ => None,
         }
     }
 
     pub(crate) fn as_string_mut(&mut self) -> Option<&mut Vec<u8>> {
-        if let Value::String(b) = self {
-            Some(b)
-        } else {
-            None
+        match self {
+            Value::String(b) => Some(b),
+            _ => None,
         }
     }
 
     pub(crate) fn as_hash(&self) -> Option<&HashMap<Vec<u8>, Vec<u8>>> {
-        if let Value::Hash(m) = self {
-            Some(m)
-        } else {
-            None
+        match self {
+            Value::Hash(m) => Some(m),
+            _ => None,
         }
     }
 
     pub(crate) fn as_hash_mut(&mut self) -> Option<&mut HashMap<Vec<u8>, Vec<u8>>> {
-        if let Value::Hash(m) = self {
-            Some(m)
-        } else {
-            None
+        match self {
+            Value::Hash(m) => Some(m),
+            _ => None,
         }
     }
 
     pub(crate) fn as_set(&self) -> Option<&HashSet<Vec<u8>>> {
-        if let Value::Set(s) = self {
-            Some(s)
-        } else {
-            None
+        match self {
+            Value::Set(s) => Some(s),
+            _ => None,
         }
     }
 
     pub(crate) fn as_set_mut(&mut self) -> Option<&mut HashSet<Vec<u8>>> {
-        if let Value::Set(s) = self {
-            Some(s)
-        } else {
-            None
+        match self {
+            Value::Set(s) => Some(s),
+            _ => None,
         }
     }
 
     pub(crate) fn as_zset(&self) -> Option<&ZSetData> {
-        if let Value::ZSet(v) = self {
-            Some(v)
-        } else {
-            None
+        match self {
+            Value::ZSet(v) => Some(v),
+            _ => None,
         }
     }
 
     pub(crate) fn as_zset_mut(&mut self) -> Option<&mut ZSetData> {
-        if let Value::ZSet(v) = self {
-            Some(v)
-        } else {
-            None
+        match self {
+            Value::ZSet(v) => Some(v),
+            _ => None,
         }
     }
 
@@ -253,6 +245,18 @@ impl Db {
             ear_pending: HashSet::new(),
             write_version: 0,
             key_versions: HashMap::new(),
+        }
+    }
+
+    /// Remove the entry if it exists and is expired. No-op otherwise.
+    pub(crate) fn purge_if_expired(&mut self, ns: &str, key: &str) {
+        let expired = self
+            .entries
+            .get(ns)
+            .and_then(|m| m.get(key))
+            .is_some_and(|e| e.is_expired());
+        if expired {
+            self.delete(ns, key);
         }
     }
 

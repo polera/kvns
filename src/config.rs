@@ -88,6 +88,14 @@ impl Default for Config {
 }
 
 impl Config {
+    fn env_parse<T: std::str::FromStr>(var: &str, default: T, validate: impl Fn(&T) -> bool) -> T {
+        std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v| validate(v))
+            .unwrap_or(default)
+    }
+
     pub fn from_env() -> Self {
         let mut cfg = Self::from_vars(
             std::env::var("KVNS_PORT").ok().as_deref(),
@@ -106,36 +114,11 @@ impl Config {
             .as_deref()
             .and_then(Self::parse_bool)
             .unwrap_or(cfg.sharded_mode);
-        cfg.shard_count = std::env::var("KVNS_SHARD_COUNT")
-            .ok()
-            .as_deref()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or(cfg.shard_count);
-        cfg.max_clients = std::env::var("KVNS_MAX_CLIENTS")
-            .ok()
-            .as_deref()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or(cfg.max_clients);
-        cfg.max_resp_args = std::env::var("KVNS_MAX_RESP_ARGS")
-            .ok()
-            .as_deref()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or(cfg.max_resp_args);
-        cfg.max_resp_bulk_len = std::env::var("KVNS_MAX_RESP_BULK_LEN")
-            .ok()
-            .as_deref()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or(cfg.max_resp_bulk_len);
-        cfg.max_resp_inline_len = std::env::var("KVNS_MAX_RESP_INLINE_LEN")
-            .ok()
-            .as_deref()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or(cfg.max_resp_inline_len);
+        cfg.shard_count = Self::env_parse("KVNS_SHARD_COUNT", cfg.shard_count, |v| *v > 0);
+        cfg.max_clients = Self::env_parse("KVNS_MAX_CLIENTS", cfg.max_clients, |v| *v > 0);
+        cfg.max_resp_args = Self::env_parse("KVNS_MAX_RESP_ARGS", cfg.max_resp_args, |v| *v > 0);
+        cfg.max_resp_bulk_len = Self::env_parse("KVNS_MAX_RESP_BULK_LEN", cfg.max_resp_bulk_len, |v| *v > 0);
+        cfg.max_resp_inline_len = Self::env_parse("KVNS_MAX_RESP_INLINE_LEN", cfg.max_resp_inline_len, |v| *v > 0);
         cfg
     }
 
