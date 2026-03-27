@@ -22,7 +22,8 @@ build:
 	$(CARGO_ENV) cargo build --tests
 
 release:
-	$(CARGO_ENV) cargo build --tests --release
+	$(CARGO_ENV) cargo build --release
+	cp target/release/kvns .
 
 check:
 	$(CARGO_ENV) cargo check --tests
