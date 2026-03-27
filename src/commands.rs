@@ -549,10 +549,10 @@ pub(crate) fn i64_to_bytes(n: i64) -> Vec<u8> {
 // ── OOM helper ────────────────────────────────────────────────────────────────
 
 fn check_oom_net(db: &mut Db, ns: &str, net: usize) -> bool {
-    if db.used_bytes.saturating_add(net) > db.memory_limit {
-        if !db.evict_for_write(ns, net) {
-            return false;
-        }
+    if db.used_bytes.saturating_add(net) > db.memory_limit
+        && !db.evict_for_write(ns, net)
+    {
+        return false;
     }
     true
 }
@@ -2022,7 +2022,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let (resp, expired) = {
     let db = store.read().await;
-    let result = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+    match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => (resp_null(), false),
         Some(entry) if entry.is_expired() => (resp_null(), true),
         Some(entry) => match &entry.value {
@@ -2077,8 +2077,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             }
             _ => (resp_wrongtype(), false),
         },
-    };
-    result
+    }
     };
     if expired {
         cleanup_expired_key(store, &ns, &key).await;
@@ -6300,6 +6299,7 @@ async fn cmd_publish(
 }
 
 /// Encode a PubSubMessage into RESP bytes to be written to a subscriber's socket.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn encode_pubsub_message(msg: &PubSubMessage, _resp_version: u8) -> Vec<u8> {
     let cap = match msg {
         PubSubMessage::Message { channel, data } => 32 + channel.len() + data.len(),
@@ -6372,10 +6372,10 @@ pub(crate) async fn dispatch(
     }
 
     // ── MULTI queuing: queue all commands except EXEC/DISCARD/MULTI ──────────
-    if conn.multi_state.is_some()
+    if let Some(multi) = conn.multi_state.as_mut()
         && !matches!(cmd, b"EXEC" | b"DISCARD" | b"MULTI" | b"WATCH" | b"UNWATCH")
     {
-        conn.multi_state.as_mut().unwrap().queued.push(args.to_vec());
+        multi.queued.push(args.to_vec());
         return (std::borrow::Cow::Borrowed(b"+QUEUED\r\n"), false);
     }
 

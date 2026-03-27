@@ -135,7 +135,7 @@ impl ShardedDb {
     /// metrics registry on every command.
     fn maybe_record_total_used(&self) {
         let n = self.write_gen.fetch_add(1, Ordering::Relaxed);
-        if n % GAUGE_EMIT_STRIDE == 0 {
+        if n.is_multiple_of(GAUGE_EMIT_STRIDE) {
             metrics::gauge!("kvns_memory_used_bytes_total")
                 .set(self.used_bytes.load(Ordering::Relaxed) as f64);
         }
@@ -688,7 +688,7 @@ pub(crate) fn dispatch(
             for shard_lock in &store.shards {
                 let shard = shard_lock.read();
                 total += match now_opt {
-                    Some(now) => shard.values().filter(|e| !e.expiry.is_some_and(|d| now >= d)).count(),
+                    Some(now) => shard.values().filter(|e| e.expiry.is_none_or(|d| now < d)).count(),
                     None => shard.len(),
                 };
             }

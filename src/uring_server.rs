@@ -9,7 +9,6 @@
 //! `tokio_uring::start` with a dedicated io_uring ring. SO_REUSEPORT distributes
 //! incoming connections across rings at the kernel level.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -17,9 +16,9 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_uring::net::TcpStream;
 use tracing::debug;
 
-use crate::commands::{ConnState, dispatch as dispatch_classic, encode_pubsub_message};
+use crate::commands::{ConnState, dispatch as dispatch_classic};
 use crate::pubsub::{PubSubHub, PubSubMessage};
-use crate::resp::{RespLimits, parse_resp_sync};
+use crate::resp::parse_resp_sync;
 use crate::server::{Backend, ServerLimits};
 use crate::sharded::dispatch as dispatch_sharded_sync;
 
@@ -46,7 +45,7 @@ pub(crate) fn make_listener(addr: &str) -> std::io::Result<tokio_uring::net::Tcp
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     let std_listener: std::net::TcpListener = socket.into();
-    tokio_uring::net::TcpListener::from_std(std_listener)
+    Ok(tokio_uring::net::TcpListener::from_std(std_listener))
 }
 
 /// Per-connection handler using io_uring owned-buffer I/O.
@@ -67,8 +66,6 @@ pub(crate) async fn handle_connection(
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let mut conn = ConnState::new(client_id);
     let mut pubsub_rx: Option<mpsc::UnboundedReceiver<PubSubMessage>> = None;
-
-    let _ = stream.set_nodelay(true);
 
     // Accumulation buffer. `head` is the index of the first unprocessed byte.
     // We compact (drain or clear) only when head crosses half the buffer length,

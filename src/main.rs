@@ -226,16 +226,23 @@ fn main() {
             let (backend, hub, client_limiter, limits, _classic_store, _persist_path) = state;
             tokio_uring::start(async move {
                 let listener = uring_server::make_listener(&addr_w).expect("failed to bind");
+                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to install SIGTERM handler");
                 loop {
-                    match listener.accept().await {
-                        Ok((stream, _peer)) => {
-                            let permit = match Arc::clone(&client_limiter).try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => continue,
-                            };
-                            tokio_uring::spawn(uring_server::handle_connection(stream, backend.clone(), limits, permit, hub.clone()));
+                    tokio::select! {
+                        result = listener.accept() => {
+                            match result {
+                                Ok((stream, _peer)) => {
+                                    let permit = match Arc::clone(&client_limiter).try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                    tokio_uring::spawn(uring_server::handle_connection(stream, backend.clone(), limits, permit, hub.clone()));
+                                }
+                                Err(e) => { error!(?e, "worker accept error"); break; }
+                            }
                         }
-                        Err(_) => break,
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = sigterm.recv() => break,
                     }
                 }
             });

@@ -10,6 +10,7 @@ use crate::config::{
 pub(crate) struct RespLimits {
     pub max_array_len: usize,
     pub max_bulk_len: usize,
+    #[allow(dead_code)]
     pub max_inline_len: usize,
 }
 
@@ -27,11 +28,13 @@ fn invalid_data(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
+#[allow(dead_code)]
 fn parse_i64(bytes: &[u8], err_msg: &'static str) -> std::io::Result<i64> {
     let s = std::str::from_utf8(bytes).map_err(|_| invalid_data(err_msg))?;
     s.parse::<i64>().map_err(|_| invalid_data(err_msg))
 }
 
+#[allow(dead_code)]
 fn parse_bulk_len(hdr: &[u8]) -> std::io::Result<i64> {
     let body = hdr
         .strip_prefix(b"$")
@@ -39,6 +42,7 @@ fn parse_bulk_len(hdr: &[u8]) -> std::io::Result<i64> {
     parse_i64(body, "bad len")
 }
 
+#[allow(dead_code)]
 async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &'a mut Vec<u8>,
@@ -91,6 +95,7 @@ async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
 /// `out` is cleared and refilled on every call; inner `Vec<u8>` allocations are
 /// reused across calls (the same `out` should be passed on every iteration of
 /// the connection loop).
+#[allow(dead_code)]
 pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limits: RespLimits,
@@ -220,6 +225,7 @@ fn reuse_slot(out: &mut Vec<Vec<u8>>, idx: usize, data: &[u8]) {
 
 /// Resize slot `idx` of `out` to exactly `len` bytes and return a mutable reference.
 /// Reuses the existing Vec allocation when capacity allows.
+#[allow(dead_code)]
 fn reuse_slot_uninit(out: &mut Vec<Vec<u8>>, idx: usize, len: usize) -> &mut [u8] {
     if idx < out.len() {
         let slot = &mut out[idx];
@@ -233,6 +239,7 @@ fn reuse_slot_uninit(out: &mut Vec<Vec<u8>>, idx: usize, len: usize) -> &mut [u8
 }
 
 /// Read exactly `n` RESP bulk strings into `out` (reusing existing slots).
+#[allow(dead_code)]
 async fn read_bulk_strings_into<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     n: usize,

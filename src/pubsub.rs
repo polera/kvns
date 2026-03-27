@@ -6,6 +6,7 @@ use tokio::sync::{RwLock, mpsc};
 // ── Message types ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) enum PubSubMessage {
     /// Regular channel message: ["message", channel, data]
     Message { channel: String, data: Arc<[u8]> },

@@ -31,6 +31,7 @@ impl EvictionPolicy {
     }
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub host: String,

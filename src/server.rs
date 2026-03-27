@@ -1,18 +1,27 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
-use tokio::sync::OwnedSemaphorePermit;
-use tokio::sync::mpsc;
-use tracing::debug;
-
-use crate::commands::{ConnState, dispatch as dispatch_classic, encode_pubsub_message};
-use crate::pubsub::{PubSubHub, PubSubMessage};
-use crate::resp::{RespLimits, parse_resp_with_limits};
-use crate::sharded::{ShardedStore, dispatch as dispatch_sharded_sync};
+use crate::resp::RespLimits;
+use crate::sharded::ShardedStore;
 use crate::store::Store;
 
-static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(target_os = "linux"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_os = "linux"))]
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+#[cfg(not(target_os = "linux"))]
+use tokio::net::TcpStream;
+#[cfg(not(target_os = "linux"))]
+use tokio::sync::OwnedSemaphorePermit;
+#[cfg(not(target_os = "linux"))]
+use tokio::sync::mpsc;
+#[cfg(not(target_os = "linux"))]
+use tracing::debug;
+#[cfg(not(target_os = "linux"))]
+use crate::commands::{ConnState, dispatch as dispatch_classic, encode_pubsub_message};
+#[cfg(not(target_os = "linux"))]
+use crate::pubsub::{PubSubHub, PubSubMessage};
+#[cfg(not(target_os = "linux"))]
+use crate::resp::parse_resp_with_limits;
+#[cfg(not(target_os = "linux"))]
+use crate::sharded::dispatch as dispatch_sharded_sync;
 
 #[derive(Clone)]
 pub(crate) enum Backend {
@@ -25,6 +34,10 @@ pub(crate) struct ServerLimits {
     pub resp: RespLimits,
 }
 
+#[cfg(not(target_os = "linux"))]
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn handle_connection(
     stream: TcpStream,
     backend: Backend,
