@@ -137,6 +137,8 @@ fn main() {
     init_tracing();
 
     let config = config::Config::from_env();
+    // Apply before anything constructs an Entry (including snapshot load).
+    store::set_shared_values(config.shared_values);
     let addr = config.listen_addr();
 
     // Number of worker threads = available hardware parallelism.
@@ -263,6 +265,8 @@ async fn main() {
     init_tracing();
 
     let config = config::Config::from_env();
+    // Apply before anything constructs an Entry (including snapshot load).
+    store::set_shared_values(config.shared_values);
     install_metrics(&config);
     let (backend, classic_store) = build_backend(&config);
 

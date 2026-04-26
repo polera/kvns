@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, error, info};
 
-use crate::store::{Db, Entry, Store, Value, ZEntry, ZSetData};
+use crate::store::{Db, Entry, Store, Value, ValueCell, ZEntry, ZSetData};
 
 // ── Serializable mirror types ─────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ fn entry_to_persisted(entry: &Entry) -> PersistedEntry {
             .map(|d| d.as_millis() as u64)
     });
     PersistedEntry {
-        value: PersistedValue::from(&entry.value),
+        value: PersistedValue::from(&*entry.value),
         hits: entry.hits.load(Ordering::Relaxed),
         expiry_unix_ms,
     }
@@ -142,7 +142,7 @@ fn persisted_to_entry(p: PersistedEntry) -> Option<Entry> {
         }
     };
     Some(Entry {
-        value: Value::from(p.value),
+        value: ValueCell::new(Value::from(p.value)),
         hits: AtomicU64::new(p.hits),
         expiry,
     })
@@ -361,7 +361,7 @@ mod tests {
         db.entries.entry("default".to_owned()).or_default().insert(
             "dead".to_owned(),
             Entry {
-                value: Value::String(b"v".to_vec()),
+                value: ValueCell::new(Value::String(b"v".to_vec())),
                 hits: AtomicU64::new(0),
                 expiry: Some(Instant::now() - Duration::from_secs(1)),
             },
@@ -408,7 +408,7 @@ mod tests {
             "default",
             "myhash",
             Entry {
-                value: Value::Hash(hm),
+                value: ValueCell::new(Value::Hash(hm)),
                 hits: AtomicU64::new(0),
                 expiry: None,
             },
@@ -438,7 +438,7 @@ mod tests {
             "default",
             "myset",
             Entry {
-                value: Value::Set(s),
+                value: ValueCell::new(Value::Set(s)),
                 hits: AtomicU64::new(0),
                 expiry: None,
             },
@@ -475,7 +475,7 @@ mod tests {
             "default",
             "myzset",
             Entry {
-                value: Value::ZSet(ZSetData { sorted, index }),
+                value: ValueCell::new(Value::ZSet(ZSetData { sorted, index })),
                 hits: AtomicU64::new(0),
                 expiry: None,
             },

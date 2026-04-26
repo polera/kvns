@@ -61,13 +61,13 @@ run:
 	$(CARGO_ENV) cargo run
 
 benchmark:
-	./scripts/benchmark_kvns_vs_dragonfly.sh
+	./scripts/benchmark_kvns.sh
 
 benchmark-sharded:
-	BENCH_SHARDED_MODE=1 ./scripts/benchmark_kvns_vs_dragonfly.sh
+	BENCH_SHARDED_MODE=1 ./scripts/benchmark_kvns.sh
 
 benchmark-compare:
-	BENCH_COMPARE_BOTH=1 ./scripts/benchmark_kvns_vs_dragonfly.sh
+	BENCH_COMPARE_BOTH=1 ./scripts/benchmark_kvns.sh
 
 podman-build:
 	$(PODMAN) build -f Dockerfile -t $(IMAGE) .

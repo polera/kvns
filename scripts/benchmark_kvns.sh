@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compares local kvns results against published Dragonfly README benchmark values.
-# Baselines captured from:
-# https://github.com/dragonflydb/dragonfly#benchmarks
-# (reference date: 2026-02-23)
+# Runs memtier benchmark profiles against kvns and prints a summary.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -33,20 +30,6 @@ mkdir -p "$BENCH_DIR"
 
 echo "Building release binary..."
 cargo build --release >/dev/null
-
-# Dragonfly baselines from README benchmark section.
-DF_DIRECT_SET_OPS="183704.03"
-DF_DIRECT_GET_OPS="195476.19"
-DF_DIRECT_SET_LAT="0.340"
-DF_DIRECT_GET_LAT="0.320"
-DF_PIPE_SET_OPS="3800807.81"
-DF_PIPE_GET_OPS="4383297.17"
-DF_PIPE_SET_LAT="0.223"
-DF_PIPE_GET_LAT="0.193"
-
-pct_of() {
-  awk -v a="$1" -v b="$2" 'BEGIN { if (b == 0) { print "n/a"; } else { printf "%.2f%%", (a / b) * 100 } }'
-}
 
 ratio_to() {
   awk -v a="$1" -v b="$2" 'BEGIN { if (b == 0) { print "n/a"; } else { printf "%.2fx", a / b } }'
@@ -163,15 +146,15 @@ print_mode_summary() {
 
   echo
   echo "${mode_name} summary"
-  printf "%-26s %14s %14s %14s\n" "Metric" "kvns" "dragonfly" "kvns vs df"
-  printf "%-26s %14s %14s %14s\n" "direct SET ops/sec" "$DIRECT_SET_OPS" "$DF_DIRECT_SET_OPS" "$(pct_of "$DIRECT_SET_OPS" "$DF_DIRECT_SET_OPS")"
-  printf "%-26s %14s %14s %14s\n" "direct GET ops/sec" "$DIRECT_GET_OPS" "$DF_DIRECT_GET_OPS" "$(pct_of "$DIRECT_GET_OPS" "$DF_DIRECT_GET_OPS")"
-  printf "%-26s %14s %14s %14s\n" "direct SET avg ms" "$DIRECT_SET_LAT" "$DF_DIRECT_SET_LAT" "$(ratio_to "$DIRECT_SET_LAT" "$DF_DIRECT_SET_LAT")"
-  printf "%-26s %14s %14s %14s\n" "direct GET avg ms" "$DIRECT_GET_LAT" "$DF_DIRECT_GET_LAT" "$(ratio_to "$DIRECT_GET_LAT" "$DF_DIRECT_GET_LAT")"
-  printf "%-26s %14s %14s %14s\n" "pipeline SET ops/sec" "$PIPE_SET_OPS" "$DF_PIPE_SET_OPS" "$(pct_of "$PIPE_SET_OPS" "$DF_PIPE_SET_OPS")"
-  printf "%-26s %14s %14s %14s\n" "pipeline GET ops/sec" "$PIPE_GET_OPS" "$DF_PIPE_GET_OPS" "$(pct_of "$PIPE_GET_OPS" "$DF_PIPE_GET_OPS")"
-  printf "%-26s %14s %14s %14s\n" "pipeline SET avg ms" "$PIPE_SET_LAT" "$DF_PIPE_SET_LAT" "$(ratio_to "$PIPE_SET_LAT" "$DF_PIPE_SET_LAT")"
-  printf "%-26s %14s %14s %14s\n" "pipeline GET avg ms" "$PIPE_GET_LAT" "$DF_PIPE_GET_LAT" "$(ratio_to "$PIPE_GET_LAT" "$DF_PIPE_GET_LAT")"
+  printf "%-26s %14s\n" "Metric" "kvns"
+  printf "%-26s %14s\n" "direct SET ops/sec" "$DIRECT_SET_OPS"
+  printf "%-26s %14s\n" "direct GET ops/sec" "$DIRECT_GET_OPS"
+  printf "%-26s %14s\n" "direct SET avg ms" "$DIRECT_SET_LAT"
+  printf "%-26s %14s\n" "direct GET avg ms" "$DIRECT_GET_LAT"
+  printf "%-26s %14s\n" "pipeline SET ops/sec" "$PIPE_SET_OPS"
+  printf "%-26s %14s\n" "pipeline GET ops/sec" "$PIPE_GET_OPS"
+  printf "%-26s %14s\n" "pipeline SET avg ms" "$PIPE_SET_LAT"
+  printf "%-26s %14s\n" "pipeline GET avg ms" "$PIPE_GET_LAT"
 }
 
 print_compare_summary() {

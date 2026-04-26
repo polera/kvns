@@ -329,6 +329,46 @@ pub(crate) fn resp_wrongtype() -> Cow<'static, [u8]> {
     Cow::Borrowed(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
 }
 
+// Pre-formatted "-ERR <msg>\r\n" responses for frequently-returned errors.
+// Each returns a borrowed `Cow`, avoiding the `format!` allocation in
+// `resp_err`.  Keep these in sync with the message text used elsewhere.
+#[inline]
+pub(crate) fn resp_err_oom() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR OOM command not allowed when used memory > 'maxmemory'\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_not_integer() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR value is not an integer or out of range\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_not_float() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR value is not a valid float\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_syntax() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR syntax error\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_no_such_key() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR no such key\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_invalid_expire_time() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR invalid expire time\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_min_or_max_not_float() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR min or max is not a float\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_invalid_lex_range() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR invalid lex range\r\n")
+}
+#[inline]
+pub(crate) fn resp_err_unknown_subcommand() -> Cow<'static, [u8]> {
+    Cow::Borrowed(b"-ERR unknown subcommand\r\n")
+}
+
 pub(crate) fn append_array_header(out: &mut Vec<u8>, len: usize) {
     let mut buf = itoa::Buffer::new();
     out.push(b'*');
@@ -367,6 +407,20 @@ pub(crate) fn resp_array(items: &[Vec<u8>]) -> Cow<'static, [u8]> {
     let capacity = 16 + items.iter().map(|b| b.len() + 16).sum::<usize>();
     let mut out = Vec::with_capacity(capacity);
     append_array_header(&mut out, items.len());
+    for item in items {
+        append_bulk(&mut out, item);
+    }
+    Cow::Owned(out)
+}
+
+/// Build a RESP array response from an iterator of byte slices, avoiding an
+/// intermediate `Vec<Vec<u8>>` materialization at the call site.
+pub(crate) fn build_array<'a, I>(count: usize, items: I) -> Cow<'static, [u8]>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut out = Vec::with_capacity(16 + count * 24);
+    append_array_header(&mut out, count);
     for item in items {
         append_bulk(&mut out, item);
     }

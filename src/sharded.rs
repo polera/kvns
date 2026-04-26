@@ -12,8 +12,9 @@ use std::hash::BuildHasher;
 
 use crate::commands::i64_to_bytes;
 use crate::resp::{
-    append_array_header, append_bulk, append_null, resp_bulk, resp_err, resp_int, resp_null,
-    resp_ok, resp_pong, wrong_args,
+    append_array_header, append_bulk, append_null, resp_bulk, resp_err,
+    resp_err_invalid_expire_time, resp_err_not_integer, resp_err_oom, resp_err_syntax, resp_int,
+    resp_null, resp_ok, resp_pong, wrong_args,
 };
 
 #[derive(Clone)]
@@ -250,7 +251,7 @@ impl ShardedDb {
                 .and_then(|s| s.parse::<i64>().ok())
             {
                 Some(n) => n,
-                None => return Err(resp_err("value is not an integer or out of range")),
+                None => return Err(resp_err_not_integer()),
             },
         };
 
@@ -290,67 +291,68 @@ impl ShardedDb {
     /// Insert `value` only if the key is absent (or expired). Returns `Ok(true)` on
     /// success, `Ok(false)` if the key already exists, `Err(())` on OOM.
     fn put_value_if_absent(&self, raw_key: &[u8], value: Vec<u8>) -> Result<bool, ()> {
+        use std::collections::hash_map::Entry;
+
         let parsed = self.parse_key(raw_key);
         let now_opt = self.now_if_ttl();
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
             self.purge_expired_locked(&mut shard, &parsed, now);
         }
-        if shard.contains_key(&parsed.canonical) {
-            return Ok(false);
+        match shard.entry(parsed.canonical) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(vacant) => {
+                let new_size = Self::entry_size(parsed.key_len, value.len());
+                if !self.reserve_bytes(new_size) {
+                    return Err(());
+                }
+                vacant.insert(ShardedEntry {
+                    value,
+                    expiry: None,
+                });
+                self.maybe_record_total_used();
+                Ok(true)
+            }
         }
-        let new_size = Self::entry_size(parsed.key_len, value.len());
-        if !self.reserve_bytes(new_size) {
-            return Err(());
-        }
-        shard.insert(
-            parsed.canonical,
-            ShardedEntry {
-                value,
-                expiry: None,
-            },
-        );
-        self.maybe_record_total_used();
-        Ok(true)
     }
 
     /// Append `suffix` to the existing value (defaulting to empty). Returns the
     /// new length on success, or `Err(bytes)` on OOM where `bytes` is an error response.
     fn append_value(&self, raw_key: &[u8], suffix: &[u8]) -> Result<i64, Cow<'static, [u8]>> {
+        use std::collections::hash_map::Entry;
+
         let parsed = self.parse_key(raw_key);
         let now_opt = self.now_if_ttl();
         let mut shard = self.shards[parsed.shard_idx].write();
         if let Some(now) = now_opt {
             self.purge_expired_locked(&mut shard, &parsed, now);
         }
-        if let Some(entry) = shard.get_mut(&parsed.canonical) {
-            if !self.reserve_bytes(suffix.len()) {
-                return Err(resp_err(
-                    "OOM command not allowed when used memory > 'maxmemory'",
-                ));
+        match shard.entry(parsed.canonical) {
+            Entry::Occupied(mut occupied) => {
+                if !self.reserve_bytes(suffix.len()) {
+                    return Err(resp_err_oom());
+                }
+                let entry = occupied.get_mut();
+                entry.value.extend_from_slice(suffix);
+                entry.expiry = None;
+                let len = entry.value.len() as i64;
+                self.maybe_record_total_used();
+                Ok(len)
             }
-            entry.value.extend_from_slice(suffix);
-            entry.expiry = None;
-            let len = entry.value.len() as i64;
-            self.maybe_record_total_used();
-            return Ok(len);
+            Entry::Vacant(vacant) => {
+                let new_size = Self::entry_size(parsed.key_len, suffix.len());
+                if !self.reserve_bytes(new_size) {
+                    return Err(resp_err_oom());
+                }
+                let len = suffix.len() as i64;
+                vacant.insert(ShardedEntry {
+                    value: suffix.to_vec(),
+                    expiry: None,
+                });
+                self.maybe_record_total_used();
+                Ok(len)
+            }
         }
-        let new_size = Self::entry_size(parsed.key_len, suffix.len());
-        if !self.reserve_bytes(new_size) {
-            return Err(resp_err(
-                "OOM command not allowed when used memory > 'maxmemory'",
-            ));
-        }
-        let len = suffix.len() as i64;
-        shard.insert(
-            parsed.canonical,
-            ShardedEntry {
-                value: suffix.to_vec(),
-                expiry: None,
-            },
-        );
-        self.maybe_record_total_used();
-        Ok(len)
     }
 
     /// Atomically replace the value, returning the old value (if any). Returns
@@ -466,14 +468,14 @@ fn set_ttl_from_args(args: &[Vec<u8>]) -> Result<Option<Duration>, Cow<'static, 
         .and_then(|s| s.parse::<u64>().ok())
     {
         Some(v) => v,
-        None => return Err(resp_err("invalid expire time")),
+        None => return Err(resp_err_invalid_expire_time()),
     };
     if args[3].eq_ignore_ascii_case(b"PX") {
         Ok(Some(Duration::from_millis(amount)))
     } else if args[3].eq_ignore_ascii_case(b"EX") {
         Ok(Some(Duration::from_secs(amount)))
     } else {
-        Err(resp_err("syntax error"))
+        Err(resp_err_syntax())
     }
 }
 
@@ -481,7 +483,7 @@ fn parse_i64_arg(raw: &[u8]) -> Result<i64, Cow<'static, [u8]>> {
     std::str::from_utf8(raw)
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-        .ok_or_else(|| resp_err("value is not an integer or out of range"))
+        .ok_or_else(|| resp_err_not_integer())
 }
 
 /// Dispatch a RESP command against the sharded store.
@@ -517,7 +519,7 @@ pub(crate) fn dispatch(
             if store.put_value(&args[1], value, ttl).is_ok() {
                 resp_ok()
             } else {
-                resp_err("OOM command not allowed when used memory > 'maxmemory'")
+                resp_err_oom()
             }
         }
         b"GET" => {
@@ -548,7 +550,7 @@ pub(crate) fn dispatch(
             while i + 1 < args.len() {
                 let value = std::mem::take(&mut args[i + 1]);
                 if store.put_value(&args[i], value, None).is_err() {
-                    return (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false);
+                    return (resp_err_oom(), false);
                 }
                 i += 2;
             }
@@ -569,7 +571,7 @@ pub(crate) fn dispatch(
             return match store.msetnx_atomic(pairs) {
                 Ok(true) => (resp_int(1), false),
                 Ok(false) => (resp_int(0), false),
-                Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+                Err(()) => (resp_err_oom(), false),
             };
         }
         b"SETNX" => {
@@ -578,7 +580,7 @@ pub(crate) fn dispatch(
             return match store.put_value_if_absent(&args[1], value) {
                 Ok(true) => (resp_int(1), false),
                 Ok(false) => (resp_int(0), false),
-                Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+                Err(()) => (resp_err_oom(), false),
             };
         }
         b"INCR" => {
@@ -649,7 +651,7 @@ pub(crate) fn dispatch(
             return match store.get_and_set(&args[1], value) {
                 Ok(Some(old)) => (resp_bulk(&old), false),
                 Ok(None) => (resp_null(), false),
-                Err(()) => (resp_err("OOM command not allowed when used memory > 'maxmemory'"), false),
+                Err(()) => (resp_err_oom(), false),
             };
         }
         b"GETDEL" => {

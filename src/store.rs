@@ -1,7 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A sorted set with O(1) member lookup and O(log n) rank queries.
@@ -125,8 +126,83 @@ impl Value {
     }
 }
 
+/// Container for [`Value`] inside an [`Entry`].  Chosen at startup via
+/// [`set_shared_values`] based on the user's workload:
+///
+/// - `Inline`: the value is stored directly in the entry.  Cheapest possible
+///   writes — no Arc allocation — but snapshotting (e.g. the periodic
+///   persistence flush) must deep-copy every byte under the read lock.
+/// - `Shared`: the value is wrapped in an `Arc`.  Each write allocates one
+///   16-byte Arc header, but snapshots only bump refcounts, keeping the
+///   persist-time tail latency bounded regardless of store size.
+///
+/// Both variants deref to `&Value`, so read-side code is variant-agnostic.
+/// Mutation goes through [`ValueCell::as_mut`], which performs `Arc::make_mut`
+/// in the `Shared` case to preserve copy-on-write semantics.
+pub(crate) enum ValueCell {
+    Inline(Value),
+    Shared(Arc<Value>),
+}
+
+/// When true, new entries wrap their value in `Arc`; when false, values are
+/// stored inline.  Set once at startup from config — read uncontended on
+/// every write.
+static SHARED_VALUES: AtomicBool = AtomicBool::new(true);
+
+/// Toggle the variant picked by [`ValueCell::new`].  Call once at startup
+/// after parsing config; later changes affect only subsequent constructions.
+pub(crate) fn set_shared_values(enabled: bool) {
+    SHARED_VALUES.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn shared_values_enabled() -> bool {
+    SHARED_VALUES.load(Ordering::Relaxed)
+}
+
+impl ValueCell {
+    /// Construct based on the process-wide sharing flag.
+    pub(crate) fn new(value: Value) -> Self {
+        if shared_values_enabled() {
+            Self::Shared(Arc::new(value))
+        } else {
+            Self::Inline(value)
+        }
+    }
+
+    /// Mutable access to the underlying value.  In the `Shared` variant this
+    /// is `Arc::make_mut`, cloning the payload only when the Arc is held
+    /// elsewhere (e.g. a persistence snapshot is in flight).
+    pub(crate) fn as_mut(&mut self) -> &mut Value {
+        match self {
+            Self::Inline(v) => v,
+            Self::Shared(a) => Arc::make_mut(a),
+        }
+    }
+}
+
+impl Deref for ValueCell {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        match self {
+            Self::Inline(v) => v,
+            Self::Shared(a) => a,
+        }
+    }
+}
+
+impl Clone for ValueCell {
+    fn clone(&self) -> Self {
+        match self {
+            // Deep clone of inline values matches the pre-Arc behaviour.
+            Self::Inline(v) => Self::Inline(v.clone()),
+            // Shared clone is a pointer bump — the persist-snapshot fast path.
+            Self::Shared(a) => Self::Shared(Arc::clone(a)),
+        }
+    }
+}
+
 pub(crate) struct Entry {
-    pub(crate) value: Value,
+    pub(crate) value: ValueCell,
     /// Hit counter for LRU/MRU eviction.  Stored as an atomic so read commands
     /// can increment it while holding only a read lock on the store.
     pub(crate) hits: AtomicU64,
@@ -146,10 +222,16 @@ impl Clone for Entry {
 impl Entry {
     pub(crate) fn new(value: Vec<u8>, ttl: Option<Duration>) -> Self {
         Self {
-            value: Value::String(value),
+            value: ValueCell::new(Value::String(value)),
             hits: AtomicU64::new(0),
             expiry: ttl.map(|d| Instant::now() + d),
         }
+    }
+
+    /// Mutable access to the underlying value; performs copy-on-write if the
+    /// value is currently shared with a persistence snapshot.
+    pub(crate) fn value_mut(&mut self) -> &mut Value {
+        self.value.as_mut()
     }
 
     pub(crate) fn is_expired(&self) -> bool {
@@ -335,11 +417,14 @@ impl Db {
         if self.used_bytes < threshold_bytes {
             return false;
         }
-        // 4. Evict in rounds using reservoir sampling to avoid O(n) clone.
+        // 4. Evict in rounds.  Candidate buffer lives across rounds to amortise
+        //    allocation; keys are still owned because we need `&mut self` to
+        //    call `delete_deferred` after borrowing from `self.entries`.
         const EVICTION_SAMPLE_SIZE: usize = 32;
         const MAX_ROUNDS: usize = 20;
         let mut total_count = 0u64;
         let mut rounds = 0;
+        let mut candidates: Vec<(String, u64, usize)> = Vec::with_capacity(EVICTION_SAMPLE_SIZE);
         while self.used_bytes.saturating_add(net_delta) > self.memory_limit && rounds < MAX_ROUNDS {
             let would_use = self.used_bytes.saturating_add(net_delta);
             if would_use <= self.memory_limit {
@@ -352,28 +437,25 @@ impl Db {
                 None => return false,
                 Some(m) => m,
             };
-            let mut candidates: Vec<(String, u64, usize)> = {
-                let it = ns_map.iter().map(|(k, e)| {
-                    (
-                        k.clone(),
-                        e.hits.load(Ordering::Relaxed),
-                        Self::entry_size(namespace, k, e.value.byte_len()),
-                    )
-                });
-                if ns_map.len() > EVICTION_SAMPLE_SIZE {
-                    it.take(EVICTION_SAMPLE_SIZE).collect()
-                } else {
-                    it.collect()
-                }
-            };
+            candidates.clear();
+            for (k, e) in ns_map.iter().take(EVICTION_SAMPLE_SIZE) {
+                candidates.push((
+                    k.clone(),
+                    e.hits.load(Ordering::Relaxed),
+                    Self::entry_size(namespace, k, e.value.byte_len()),
+                ));
+            }
             if candidates.is_empty() {
                 break;
             }
 
-            // 6. Sort sample by eviction order.
+            // 6. Sort sample by eviction order (sample is ≤ 32 items; plain sort
+            //    is fine).
             match policy {
-                EvictionPolicy::Lru => candidates.sort_by_key(|(_, hits, _)| *hits),
-                EvictionPolicy::Mru => candidates.sort_by_key(|(_, hits, _)| Reverse(*hits)),
+                EvictionPolicy::Lru => candidates.sort_unstable_by_key(|(_, hits, _)| *hits),
+                EvictionPolicy::Mru => {
+                    candidates.sort_unstable_by_key(|(_, hits, _)| Reverse(*hits))
+                }
                 EvictionPolicy::None | EvictionPolicy::ExpireAfterRead => unreachable!(),
             }
 
@@ -381,7 +463,7 @@ impl Db {
             // Use delete_deferred to avoid emitting Prometheus gauge updates on
             // every evicted key while the write lock is held; we emit once below.
             let mut freed = 0usize;
-            for (key, _, size) in candidates {
+            for (key, _, size) in candidates.drain(..) {
                 if freed >= overflow {
                     break;
                 }
@@ -601,12 +683,51 @@ mod tests {
     #[test]
     fn entry_elapsed_ttl_is_expired() {
         let e = Entry {
-            value: Value::String(b"v".to_vec()),
+            value: ValueCell::new(Value::String(b"v".to_vec())),
             hits: AtomicU64::new(0),
             expiry: Some(Instant::now() - Duration::from_secs(1)),
         };
         assert!(e.is_expired());
         assert_eq!(e.time_to_expiry_secs(), 0);
+    }
+
+    // ── ValueCell variant tests ──────────────────────────────────────────────
+    //
+    // Reads and mutations should behave identically regardless of the variant.
+    // Construct each variant explicitly (bypassing the global flag) so these
+    // tests don't race with other tests that flip `set_shared_values`.
+
+    #[test]
+    fn valuecell_inline_read_and_mutate() {
+        let mut cell = ValueCell::Inline(Value::String(b"hello".to_vec()));
+        assert_eq!(cell.as_string(), Some(b"hello".as_slice()));
+        cell.as_mut().as_string_mut().unwrap().extend_from_slice(b" world");
+        assert_eq!(cell.as_string(), Some(b"hello world".as_slice()));
+    }
+
+    #[test]
+    fn valuecell_shared_read_and_mutate() {
+        let mut cell = ValueCell::Shared(Arc::new(Value::String(b"hello".to_vec())));
+        assert_eq!(cell.as_string(), Some(b"hello".as_slice()));
+        cell.as_mut().as_string_mut().unwrap().extend_from_slice(b" world");
+        assert_eq!(cell.as_string(), Some(b"hello world".as_slice()));
+    }
+
+    #[test]
+    fn valuecell_shared_make_mut_is_cow() {
+        // Two Entries sharing the same Arc — mutating one must not observably
+        // affect the other.  This is the property that lets the persistence
+        // snapshot safely hold a pointer while writers keep mutating.
+        let arc = Arc::new(Value::String(b"orig".to_vec()));
+        let snapshot_side = ValueCell::Shared(Arc::clone(&arc));
+        let mut writer_side = ValueCell::Shared(arc);
+        writer_side
+            .as_mut()
+            .as_string_mut()
+            .unwrap()
+            .extend_from_slice(b"-modified");
+        assert_eq!(writer_side.as_string(), Some(b"orig-modified".as_slice()));
+        assert_eq!(snapshot_side.as_string(), Some(b"orig".as_slice()));
     }
 
     // ── Eviction tests ────────────────────────────────────────────────────────
@@ -824,7 +945,7 @@ mod tests {
     fn mark_ear_does_not_mark_expired_key() {
         let mut db = Db::new(1000);
         let expired = Entry {
-            value: Value::String(b"v".to_vec()),
+            value: ValueCell::new(Value::String(b"v".to_vec())),
             hits: AtomicU64::new(0),
             expiry: Some(Instant::now() - Duration::from_secs(1)),
         };

@@ -10,11 +10,13 @@ use tracing::debug;
 use crate::pubsub::{PubSubHub, PubSubMessage};
 
 use crate::resp::{
-    append_array_header, append_bulk, append_int, append_null, resp_array, resp_bulk, resp_err,
-    resp_int, resp_map, resp_null, resp_null_array, resp_ok, resp_pong, resp_usize, resp_verbatim,
-    resp_wrongtype, wrong_args,
+    append_array_header, append_bulk, append_int, append_null, build_array, resp_array, resp_bulk,
+    resp_err, resp_err_invalid_expire_time, resp_err_invalid_lex_range,
+    resp_err_min_or_max_not_float, resp_err_no_such_key, resp_err_not_float, resp_err_not_integer,
+    resp_err_oom, resp_err_syntax, resp_err_unknown_subcommand, resp_int, resp_map, resp_null,
+    resp_null_array, resp_ok, resp_pong, resp_usize, resp_verbatim, resp_wrongtype, wrong_args,
 };
-use crate::store::{Db, Entry, Store, StoreMetrics, Value, ZEntry, ZSetData};
+use crate::store::{Db, Entry, Store, StoreMetrics, Value, ValueCell, ZEntry, ZSetData};
 
 // ── Connection state ──────────────────────────────────────────────────────────
 
@@ -633,7 +635,7 @@ pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
     let ttl = if args.len() == 5 {
         let amount: u64 = match String::from_utf8_lossy(&args[4]).parse() {
             Ok(v) => v,
-            Err(_) => return resp_err("invalid expire time"),
+            Err(_) => return resp_err_invalid_expire_time(),
         };
         Some(if args[3].eq_ignore_ascii_case(b"PX") {
             Duration::from_millis(amount)
@@ -655,7 +657,7 @@ pub(crate) async fn cmd_set(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
     if db.used_bytes.saturating_add(net_delta) > db.memory_limit
         && !db.evict_for_write(&ns, net_delta)
     {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), entry);
     drop(db);
@@ -783,7 +785,7 @@ async fn cmd_mset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         let (ns, key) = parse_ns_key(&args[i]);
         let value = args[i + 1].clone();
         if !check_oom(&mut db, &ns, &key, value.len()) {
-            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+            return resp_err_oom();
         }
         metric_updates.push(db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(value, None)));
         i += 2;
@@ -819,7 +821,7 @@ async fn cmd_msetnx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     }
     for (ns, key, value) in pairs {
         if !check_oom(&mut db, &ns, &key, value.len()) {
-            return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+            return resp_err_oom();
         }
         metric_updates.push(db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(value, None)));
     }
@@ -843,7 +845,7 @@ async fn cmd_setnx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         return resp_int(0);
     }
     if !check_oom(&mut db, &ns, &key, value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(value, None));
     drop(db);
@@ -867,7 +869,7 @@ async fn cmd_getset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         },
     };
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value, None));
     drop(db);
@@ -945,18 +947,18 @@ async fn cmd_getex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         Some(None)
     } else {
         if args.len() < 4 {
-            return resp_err("syntax error");
+            return resp_err_syntax();
         }
         let amount: u64 = match std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
-            None => return resp_err("invalid expire time"),
+            None => return resp_err_invalid_expire_time(),
         };
         match opt.as_str() {
             "EX" => Some(Some(Instant::now() + Duration::from_secs(amount))),
             "PX" => Some(Some(Instant::now() + Duration::from_millis(amount))),
             "EXAT" => Some(Some(unix_to_instant(SystemTime::UNIX_EPOCH + Duration::from_secs(amount)))),
             "PXAT" => Some(Some(unix_to_instant(SystemTime::UNIX_EPOCH + Duration::from_millis(amount)))),
-            _ => return resp_err("syntax error"),
+            _ => return resp_err_syntax(),
         }
     };
 
@@ -990,7 +992,7 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     };
     let new_len = existing_len + append_data.len();
     if !check_oom_net(&mut db, &ns, append_data.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let entry = db
         .entries
@@ -998,7 +1000,7 @@ async fn cmd_append(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry::new(vec![], None));
-    match entry.value.as_string_mut() {
+    match entry.value_mut().as_string_mut() {
         None => return resp_wrongtype(),
         Some(b) => b.extend_from_slice(&append_data),
     }
@@ -1059,7 +1061,7 @@ async fn apply_integer_op(
             None => return resp_wrongtype(),
             Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
-                None => return resp_err("value is not an integer or out of range"),
+                None => return resp_err_not_integer(),
             },
         },
     };
@@ -1069,7 +1071,7 @@ async fn apply_integer_op(
     };
     let new_value = i64_to_bytes(next);
     if !check_oom(&mut db, ns, key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let m = db.put_deferred(ns, key, Entry::new(new_value, None));
     drop(db);
@@ -1092,7 +1094,7 @@ async fn cmd_incrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let (ns, key) = parse_ns_key(&args[1]);
     let by: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     apply_integer_op(&ns, &key, store, by, "increment would overflow").await
 }
@@ -1112,7 +1114,7 @@ async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let (ns, key) = parse_ns_key(&args[1]);
     let by: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     apply_integer_op(&ns, &key, store, by.wrapping_neg(), "decrement would overflow").await
 }
@@ -1127,7 +1129,7 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not a valid float"),
+        None => return resp_err_not_float(),
     };
     let mut db = store.write().await;
     db.purge_if_expired(&ns, &key);
@@ -1137,7 +1139,7 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
             None => return resp_wrongtype(),
             Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
-                None => return resp_err("value is not a valid float"),
+                None => return resp_err_not_float(),
             },
         },
     };
@@ -1148,7 +1150,7 @@ async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
     let mut new_value = Vec::with_capacity(24);
     { use std::io::Write; write!(new_value, "{}", next).unwrap(); }
     if !check_oom(&mut db, &ns, &key, new_value.len()) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_value.clone(), None));
     drop(db);
@@ -1166,7 +1168,7 @@ async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let replacement = args[3].clone();
     let mut db = store.write().await;
@@ -1186,7 +1188,7 @@ async fn cmd_setrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
     new_val[offset..offset + replacement.len()].copy_from_slice(&replacement);
     let new_len = new_val.len();
     if !check_oom(&mut db, &ns, &key, new_len) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let m = db.put_deferred(ns.as_ref(), key.as_ref(), Entry::new(new_val, None));
     drop(db);
@@ -1204,14 +1206,14 @@ async fn cmd_getrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let end_i: i64 = match std::str::from_utf8(&args[3])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
@@ -1269,7 +1271,7 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> std::borrow::C
 
     let (existing_byte_len, is_new_key) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => (0usize, true),
-        Some(e) => match &e.value {
+        Some(e) => match &*e.value {
             Value::List(l) => (l.iter().map(|v| v.len()).sum(), false),
             _ => return resp_wrongtype(),
         },
@@ -1286,7 +1288,7 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> std::borrow::C
     if db.used_bytes.saturating_add(net_delta) > db.memory_limit
         && !db.evict_for_write(&ns, net_delta)
     {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
 
     let entry = db
@@ -1295,11 +1297,11 @@ pub(crate) async fn cmd_lpush(args: &[Vec<u8>], store: &Store) -> std::borrow::C
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::List(VecDeque::new()),
+            value: ValueCell::new(Value::List(VecDeque::new())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
-    let list = match &mut entry.value {
+    let list = match entry.value_mut() {
         Value::List(l) => l,
         _ => unreachable!(),
     };
@@ -1332,7 +1334,7 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
 
     let (existing_byte_len, is_new_key) = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => (0usize, true),
-        Some(e) => match &e.value {
+        Some(e) => match &*e.value {
             Value::List(l) => (l.iter().map(|v| v.len()).sum(), false),
             _ => return resp_wrongtype(),
         },
@@ -1349,7 +1351,7 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
     if db.used_bytes.saturating_add(net_delta) > db.memory_limit
         && !db.evict_for_write(&ns, net_delta)
     {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
 
     let entry = db
@@ -1358,11 +1360,11 @@ async fn cmd_rpush(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::List(VecDeque::new()),
+            value: ValueCell::new(Value::List(VecDeque::new())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
-    let list = match &mut entry.value {
+    let list = match entry.value_mut() {
         Value::List(l) => l,
         _ => unreachable!(),
     };
@@ -1396,7 +1398,7 @@ async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     db.purge_if_expired(&ns, &key);
     let existing_byte_len = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => return resp_int(0),
-        Some(e) => match &e.value {
+        Some(e) => match &*e.value {
             Value::List(l) => l.iter().map(|v| v.len()).sum::<usize>(),
             _ => return resp_wrongtype(),
         },
@@ -1405,11 +1407,11 @@ async fn cmd_lpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let net_delta = Db::entry_size(&ns, &key, existing_byte_len + added_byte_len)
         .saturating_sub(Db::entry_size(&ns, &key, existing_byte_len));
     if db.used_bytes.saturating_add(net_delta) > db.memory_limit && !db.evict_for_write(&ns, net_delta) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let entry = db.entries.entry(ns.clone().into_owned()).or_default().entry(key.clone().into_owned())
-        .or_insert_with(|| Entry { value: Value::List(VecDeque::new()), hits: AtomicU64::new(0), expiry: None });
-    let list = match &mut entry.value { Value::List(l) => l, _ => unreachable!() };
+        .or_insert_with(|| Entry { value: ValueCell::new(Value::List(VecDeque::new())), hits: AtomicU64::new(0), expiry: None });
+    let list = match entry.value_mut() { Value::List(l) => l, _ => unreachable!() };
     for item in new_items.iter() { list.push_front(item.clone()); }
     let len = list.len();
     db.used_bytes = db.used_bytes.saturating_add(net_delta);
@@ -1438,7 +1440,7 @@ async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     db.purge_if_expired(&ns, &key);
     let existing_byte_len = match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => return resp_int(0),
-        Some(e) => match &e.value {
+        Some(e) => match &*e.value {
             Value::List(l) => l.iter().map(|v| v.len()).sum::<usize>(),
             _ => return resp_wrongtype(),
         },
@@ -1447,11 +1449,11 @@ async fn cmd_rpushx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let net_delta = Db::entry_size(&ns, &key, existing_byte_len + added_byte_len)
         .saturating_sub(Db::entry_size(&ns, &key, existing_byte_len));
     if db.used_bytes.saturating_add(net_delta) > db.memory_limit && !db.evict_for_write(&ns, net_delta) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
     let entry = db.entries.entry(ns.clone().into_owned()).or_default().entry(key.clone().into_owned())
-        .or_insert_with(|| Entry { value: Value::List(VecDeque::new()), hits: AtomicU64::new(0), expiry: None });
-    let list = match &mut entry.value { Value::List(l) => l, _ => unreachable!() };
+        .or_insert_with(|| Entry { value: ValueCell::new(Value::List(VecDeque::new())), hits: AtomicU64::new(0), expiry: None });
+    let list = match entry.value_mut() { Value::List(l) => l, _ => unreachable!() };
     for item in new_items.iter() { list.push_back(item.clone()); }
     let len = list.len();
     db.used_bytes = db.used_bytes.saturating_add(net_delta);
@@ -1480,7 +1482,7 @@ async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             .and_then(|s| s.parse().ok())
         {
             Some(n) => Some(n),
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         None
@@ -1509,7 +1511,7 @@ async fn cmd_lpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let outcome = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => LPopResult::Null,
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 if let Some(c) = count {
                     let popped: Vec<Vec<u8>> = (0..c).filter_map(|_| list.pop_front()).collect();
@@ -1567,7 +1569,7 @@ async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             .and_then(|s| s.parse().ok())
         {
             Some(n) => Some(n),
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         None
@@ -1595,7 +1597,7 @@ async fn cmd_rpop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let outcome = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => RPopResult::Null,
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 if let Some(c) = count {
                     let popped: Vec<Vec<u8>> = (0..c).filter_map(|_| list.pop_back()).collect();
@@ -1652,7 +1654,7 @@ async fn cmd_llen(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_int(0), false),
             Some(entry) if entry.is_expired() => (resp_int(0), true),
-            Some(entry) => match &entry.value {
+            Some(entry) => match &*entry.value {
                 Value::List(l) => (resp_usize(l.len()), false),
                 _ => (resp_wrongtype(), false),
             },
@@ -1674,21 +1676,21 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let stop_i: i64 = match std::str::from_utf8(&args[3])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
         match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_array(&[]), false, false, false),
             Some(entry) if entry.is_expired() => (resp_array(&[]), true, false, false),
-            Some(entry) => match &entry.value {
+            Some(entry) => match &*entry.value {
                 Value::List(list) => {
                     let len = list.len() as i64;
                     let start = if start_i < 0 {
@@ -1704,13 +1706,20 @@ async fn cmd_lrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
                     if start > stop || list.is_empty() {
                         (resp_array(&[]), false, false, false)
                     } else {
-                        let items: Vec<Vec<u8>> = list
-                            .iter()
-                            .skip(start)
-                            .take(stop - start + 1)
-                            .cloned()
-                            .collect();
-                        (resp_array(&items), false, true, db.is_ear_namespace(&ns))
+                        let count = stop - start + 1;
+                        // Write directly into the response buffer — avoids the
+                        // intermediate Vec<Vec<u8>> materialization.
+                        let mut out = Vec::with_capacity(16 + count * 24);
+                        append_array_header(&mut out, count);
+                        for item in list.iter().skip(start).take(count) {
+                            append_bulk(&mut out, item);
+                        }
+                        (
+                            std::borrow::Cow::Owned(out),
+                            false,
+                            true,
+                            db.is_ear_namespace(&ns),
+                        )
                     }
                 }
                 _ => (resp_wrongtype(), false, false, false),
@@ -1736,14 +1745,14 @@ async fn cmd_lindex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let (resp, expired, mark, is_ear) = {
         let db = store.read().await;
         match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
             None => (resp_null(), false, false, false),
             Some(entry) if entry.is_expired() => (resp_null(), true, false, false),
-            Some(entry) => match &entry.value {
+            Some(entry) => match &*entry.value {
                 Value::List(list) => {
                     let len = list.len() as i64;
                     let idx = if idx_i < 0 { len + idx_i } else { idx_i };
@@ -1781,7 +1790,7 @@ async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let new_val = args[3].clone();
     let mut db = store.write().await;
@@ -1792,11 +1801,11 @@ async fn cmd_lset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&ns, &key);
-        return resp_err("ERR no such key");
+        return resp_err_no_such_key();
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
-        None => (resp_err("ERR no such key"), false),
-        Some(entry) => match &mut entry.value {
+        None => (resp_err_no_such_key(), false),
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 let len = list.len() as i64;
                 let idx = if idx_i < 0 { len + idx_i } else { idx_i };
@@ -1826,7 +1835,7 @@ async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let element = args[3].clone();
     let mut db = store.write().await;
@@ -1841,7 +1850,7 @@ async fn cmd_lrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 let mut removed = 0i64;
                 if count_i == 0 {
@@ -1892,14 +1901,14 @@ async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let stop_i: i64 = match std::str::from_utf8(&args[3])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let mut db = store.write().await;
     if db
@@ -1913,7 +1922,7 @@ async fn cmd_ltrim(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_ok(), false),
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 let len = list.len() as i64;
                 let start = if start_i < 0 {
@@ -1968,7 +1977,7 @@ async fn cmd_linsert(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => match list.iter().position(|e| e == &pivot) {
                 None => (resp_int(-1), false),
                 Some(idx) => {
@@ -2004,7 +2013,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                     .and_then(|s| s.parse().ok())
                 {
                     Some(n) => n,
-                    None => return resp_err("value is not an integer or out of range"),
+                    None => return resp_err_not_integer(),
                 };
             }
             "COUNT" => {
@@ -2013,7 +2022,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
                     .and_then(|s| s.parse::<usize>().ok())
                 {
                     Some(n) => Some(n),
-                    None => return resp_err("value is not an integer or out of range"),
+                    None => return resp_err_not_integer(),
                 };
             }
             _ => {}
@@ -2025,7 +2034,7 @@ async fn cmd_lpos(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
         None => (resp_null(), false),
         Some(entry) if entry.is_expired() => (resp_null(), true),
-        Some(entry) => match &entry.value {
+        Some(entry) => match &*entry.value {
             Value::List(list) => {
                 let mut results: Vec<Vec<u8>> = Vec::new();
                 let mut match_count = 0i64;
@@ -2121,7 +2130,7 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         .and_then(|m| m.get_mut::<str>(src_key.as_ref()))
     {
         None => return resp_null(),
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 let el = if src_dir == "LEFT" {
                     list.pop_front()
@@ -2145,7 +2154,7 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         .get_mut::<str>(dst_ns.as_ref())
         .and_then(|m| m.get_mut::<str>(dst_key.as_ref()))
     {
-        Some(entry) => match &mut entry.value {
+        Some(entry) => match entry.value_mut() {
             Value::List(list) => {
                 if dst_dir == "LEFT" {
                     list.push_front(element);
@@ -2165,7 +2174,7 @@ async fn cmd_lmove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
             db.entries.entry(dst_ns.clone().into_owned()).or_default().insert(
                 dst_key.clone().into_owned(),
                 Entry {
-                    value: Value::List(new_list),
+                    value: ValueCell::new(Value::List(new_list)),
                     hits: AtomicU64::new(0),
                     expiry: None,
                 },
@@ -2236,7 +2245,7 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             },
         };
     if !check_oom_net(&mut db, &ns, oom_net) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
 
     let entry = db
@@ -2245,12 +2254,12 @@ async fn cmd_hset(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::Hash(HashMap::new()),
+            value: ValueCell::new(Value::Hash(HashMap::new())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
 
-    let hash = match entry.value.as_hash_mut() {
+    let hash = match entry.value_mut().as_hash_mut() {
         Some(h) => h,
         None => return resp_wrongtype(),
     };
@@ -2331,7 +2340,7 @@ async fn cmd_hdel(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_hash_mut() {
+        Some(entry) => match entry.value_mut().as_hash_mut() {
             None => return resp_wrongtype(),
             Some(h) => {
                 let mut removed = 0i64;
@@ -2397,12 +2406,12 @@ async fn cmd_hgetall(args: &[Vec<u8>], store: &Store, conn: &ConnState) -> std::
                             h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                         (resp_map(&pairs), false, true, is_ear)
                     } else {
-                        let mut flat: Vec<Vec<u8>> = Vec::with_capacity(h.len() * 2);
-                        for (k, v) in h {
-                            flat.push(k.clone());
-                            flat.push(v.clone());
-                        }
-                        (resp_array(&flat), false, true, is_ear)
+                        let resp = build_array(
+                            h.len() * 2,
+                            h.iter()
+                                .flat_map(|(k, v)| [k.as_slice(), v.as_slice()]),
+                        );
+                        (resp, false, true, is_ear)
                     }
                 }
             },
@@ -2431,8 +2440,8 @@ async fn cmd_hkeys(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
             Some(entry) => match entry.value.as_hash() {
                 None => (resp_wrongtype(), false, false, false),
                 Some(h) => {
-                    let keys: Vec<Vec<u8>> = h.keys().cloned().collect();
-                    (resp_array(&keys), false, true, db.is_ear_namespace(&ns))
+                    let resp = build_array(h.len(), h.keys().map(|k| k.as_slice()));
+                    (resp, false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2460,8 +2469,8 @@ async fn cmd_hvals(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
             Some(entry) => match entry.value.as_hash() {
                 None => (resp_wrongtype(), false, false, false),
                 Some(h) => {
-                    let vals: Vec<Vec<u8>> = h.values().cloned().collect();
-                    (resp_array(&vals), false, true, db.is_ear_namespace(&ns))
+                    let resp = build_array(h.len(), h.values().map(|v| v.as_slice()));
+                    (resp, false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2547,7 +2556,7 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let mut db = store.write().await;
     db.purge_if_expired(&ns, &key);
@@ -2578,11 +2587,11 @@ async fn cmd_hincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::Hash(HashMap::new()),
+            value: ValueCell::new(Value::Hash(HashMap::new())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
-    match entry.value.as_hash_mut() {
+    match entry.value_mut().as_hash_mut() {
         Some(h) => {
             h.insert(field, new_val);
         }
@@ -2603,7 +2612,7 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not a valid float"),
+        None => return resp_err_not_float(),
     };
     let mut db = store.write().await;
     db.purge_if_expired(&ns, &key);
@@ -2634,11 +2643,11 @@ async fn cmd_hincrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::Hash(HashMap::new()),
+            value: ValueCell::new(Value::Hash(HashMap::new())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
-    match entry.value.as_hash_mut() {
+    match entry.value_mut().as_hash_mut() {
         Some(h) => {
             h.insert(field, new_val.clone());
         }
@@ -2659,7 +2668,7 @@ async fn cmd_hrandfield(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'st
             .and_then(|s| s.parse().ok())
         {
             Some(n) => Some(n),
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         None
@@ -2773,7 +2782,7 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             },
         };
     if !check_oom_net(&mut db, &ns, oom_net) {
-        return resp_err("OOM command not allowed when used memory > 'maxmemory'");
+        return resp_err_oom();
     }
 
     let entry = db
@@ -2782,11 +2791,11 @@ async fn cmd_sadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::Set(HashSet::new()),
+            value: ValueCell::new(Value::Set(HashSet::new())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
-    let set = match entry.value.as_set_mut() {
+    let set = match entry.value_mut().as_set_mut() {
         Some(s) => s,
         None => return resp_wrongtype(),
     };
@@ -2834,7 +2843,7 @@ async fn cmd_srem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_set_mut() {
+        Some(entry) => match entry.value_mut().as_set_mut() {
             None => return resp_wrongtype(),
             Some(s) => {
                 let mut removed = 0i64;
@@ -2866,9 +2875,11 @@ async fn cmd_smembers(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
             Some(entry) => match entry.value.as_set() {
                 None => (resp_wrongtype(), false, false, false),
                 Some(s) => {
-                    let mut members: Vec<Vec<u8>> = s.iter().cloned().collect();
-                    members.sort();
-                    (resp_array(&members), false, true, db.is_ear_namespace(&ns))
+                    // Sort references, not owned bytes — avoids cloning payloads.
+                    let mut members: Vec<&[u8]> = s.iter().map(Vec::as_slice).collect();
+                    members.sort_unstable();
+                    let resp = build_array(members.len(), members.iter().copied());
+                    (resp, false, true, db.is_ear_namespace(&ns))
                 }
             },
         }
@@ -2990,9 +3001,10 @@ async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         return wrong_args(&args[0]);
     }
     let mut expired: Vec<(String, String)> = Vec::new();
-    let result = {
+    let resp = {
         let db = store.read().await;
-        let mut acc: HashSet<Vec<u8>> = HashSet::new();
+        // Accumulate references into the store; no member bytes are cloned.
+        let mut acc: HashSet<&[u8]> = HashSet::new();
         for raw_key in &args[1..] {
             let (ns, key) = parse_ns_key(raw_key);
             match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
@@ -3004,124 +3016,105 @@ async fn cmd_sunion(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
                     None => return resp_wrongtype(),
                     Some(s) => {
                         for member in s {
-                            acc.insert(member.clone());
+                            acc.insert(member.as_slice());
                         }
                     }
                 },
             }
         }
-        acc
+        let mut members: Vec<&[u8]> = acc.into_iter().collect();
+        members.sort_unstable();
+        build_array(members.len(), members.iter().copied())
     };
     for (ns, key) in &expired {
         cleanup_expired_key(store, ns, key).await;
     }
-    let mut members: Vec<Vec<u8>> = result.into_iter().collect();
-    members.sort();
-    resp_array(&members)
+    resp
 }
 
 async fn cmd_sinter(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    // Read pass: clone sets and collect expired keys.
-    let mut expired: Vec<(String, String)> = Vec::new();
-    let sets_owned: Vec<HashSet<Vec<u8>>> = {
-        let db = store.read().await;
-        let mut acc: Vec<HashSet<Vec<u8>>> = Vec::new();
-        for raw_key in &args[1..] {
-            let (ns, key) = parse_ns_key(raw_key);
-            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-                None => return resp_array(&[]),
-                Some(entry) if entry.is_expired() => {
-                    expired.push((ns.into_owned(), key.into_owned()));
-                    // An expired key contributes no members, so intersection is empty.
-                    return resp_array(&[]);
-                }
-                Some(entry) => match entry.value.as_set() {
-                    None => return resp_wrongtype(),
-                    Some(s) => acc.push(s.clone()),
-                },
-            }
+    // Single read lock for the entire intersection computation — references
+    // into the store remain valid for the duration of the function.
+    let db = store.read().await;
+    let mut sets: Vec<&HashSet<Vec<u8>>> = Vec::with_capacity(args.len() - 1);
+    for raw_key in &args[1..] {
+        let (ns, key) = parse_ns_key(raw_key);
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            // Missing or expired key means empty intersection.
+            None => return resp_array(&[]),
+            Some(entry) if entry.is_expired() => return resp_array(&[]),
+            Some(entry) => match entry.value.as_set() {
+                None => return resp_wrongtype(),
+                Some(s) => sets.push(s),
+            },
         }
-        acc
-    };
-    for (ns, key) in &expired {
-        cleanup_expired_key(store, ns, key).await;
     }
-    if sets_owned.is_empty() {
+    if sets.is_empty() {
         return resp_array(&[]);
     }
-    let (smallest_idx, smallest) = sets_owned
+    let (smallest_idx, smallest) = sets
         .iter()
         .enumerate()
         .min_by_key(|(_, s)| s.len())
-        .unwrap_or_else(|| unreachable!("sets_owned is non-empty, guarded above"));
-    let mut result: HashSet<Vec<u8>> = HashSet::new();
+        .unwrap_or_else(|| unreachable!("sets is non-empty, guarded above"));
+    let mut members: Vec<&[u8]> = Vec::new();
     for member in smallest.iter() {
-        if sets_owned
+        if sets
             .iter()
             .enumerate()
             .all(|(idx, s)| idx == smallest_idx || s.contains(member))
         {
-            result.insert(member.clone());
+            members.push(member.as_slice());
         }
     }
-    let mut members: Vec<Vec<u8>> = result.into_iter().collect();
-    members.sort();
-    resp_array(&members)
+    members.sort_unstable();
+    build_array(members.len(), members.iter().copied())
 }
 
 async fn cmd_sdiff(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
     if args.len() < 2 {
         return wrong_args(&args[0]);
     }
-    let mut expired: Vec<(String, String)> = Vec::new();
-    // None in the vec means "key missing or expired" for non-first slots.
-    let sets_owned: Vec<Option<HashSet<Vec<u8>>>> = {
-        let db = store.read().await;
-        let mut acc: Vec<Option<HashSet<Vec<u8>>>> = Vec::new();
-        for (idx, raw_key) in args[1..].iter().enumerate() {
-            let (ns, key) = parse_ns_key(raw_key);
-            match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
-                None => {
-                    if idx == 0 {
-                        return resp_array(&[]);
-                    }
-                    acc.push(None);
+    let db = store.read().await;
+    // None means "key missing or expired" for non-first slots.
+    let mut sets: Vec<Option<&HashSet<Vec<u8>>>> = Vec::with_capacity(args.len() - 1);
+    for (idx, raw_key) in args[1..].iter().enumerate() {
+        let (ns, key) = parse_ns_key(raw_key);
+        match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
+            None => {
+                if idx == 0 {
+                    return resp_array(&[]);
                 }
-                Some(entry) if entry.is_expired() => {
-                    expired.push((ns.into_owned(), key.into_owned()));
-                    if idx == 0 {
-                        return resp_array(&[]);
-                    }
-                    acc.push(None);
-                }
-                Some(entry) => match entry.value.as_set() {
-                    None => return resp_wrongtype(),
-                    Some(s) => acc.push(Some(s.clone())),
-                },
+                sets.push(None);
             }
+            Some(entry) if entry.is_expired() => {
+                if idx == 0 {
+                    return resp_array(&[]);
+                }
+                sets.push(None);
+            }
+            Some(entry) => match entry.value.as_set() {
+                None => return resp_wrongtype(),
+                Some(s) => sets.push(Some(s)),
+            },
         }
-        acc
-    };
-    for (ns, key) in &expired {
-        cleanup_expired_key(store, ns, key).await;
     }
-    if sets_owned.is_empty() || sets_owned[0].is_none() {
+    if sets.is_empty() || sets[0].is_none() {
         return resp_array(&[]);
     }
-    let first = sets_owned[0].as_ref().unwrap_or_else(|| unreachable!("guarded above"));
-    let mut result: HashSet<Vec<u8>> = HashSet::new();
+    let first = sets[0].unwrap_or_else(|| unreachable!("guarded above"));
+    let mut members: Vec<&[u8]> = Vec::new();
     for member in first {
-        let present_elsewhere = sets_owned[1..].iter().flatten().any(|s| s.contains(member));
+        let present_elsewhere = sets[1..].iter().flatten().any(|s| s.contains(member));
         if !present_elsewhere {
-            result.insert(member.clone());
+            members.push(member.as_slice());
         }
     }
-    let mut members: Vec<Vec<u8>> = result.into_iter().collect();
-    members.sort();
-    resp_array(&members)
+    members.sort_unstable();
+    build_array(members.len(), members.iter().copied())
 }
 
 async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -3156,7 +3149,7 @@ async fn cmd_sunionstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
     }
     let count = result.len();
     let entry = Entry {
-        value: Value::Set(result),
+        value: ValueCell::new(Value::Set(result)),
         hits: AtomicU64::new(0),
         expiry: None,
     };
@@ -3223,7 +3216,7 @@ async fn cmd_sinterstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
         dst_ns.as_ref(),
         dst_key.as_ref(),
         Entry {
-            value: Value::Set(result),
+            value: ValueCell::new(Value::Set(result)),
             hits: AtomicU64::new(0),
             expiry: None,
         },
@@ -3283,7 +3276,7 @@ async fn cmd_sdiffstore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'st
         dst_ns.as_ref(),
         dst_key.as_ref(),
         Entry {
-            value: Value::Set(result),
+            value: ValueCell::new(Value::Set(result)),
             hits: AtomicU64::new(0),
             expiry: None,
         },
@@ -3328,7 +3321,7 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         .and_then(|m| m.get_mut::<str>(src_key.as_ref()))
     {
         None => return resp_int(0),
-        Some(entry) => match entry.value.as_set_mut() {
+        Some(entry) => match entry.value_mut().as_set_mut() {
             None => return resp_wrongtype(),
             Some(s) => s.remove(member.as_slice()),
         },
@@ -3344,7 +3337,7 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
         .get_mut::<str>(dst_ns.as_ref())
         .and_then(|m| m.get_mut::<str>(dst_key.as_ref()))
     {
-        Some(entry) => match entry.value.as_set_mut() {
+        Some(entry) => match entry.value_mut().as_set_mut() {
             Some(s) => {
                 s.insert(member);
             }
@@ -3356,7 +3349,7 @@ async fn cmd_smove(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static,
             db.entries.entry(dst_ns.clone().into_owned()).or_default().insert(
                 dst_key.clone().into_owned(),
                 Entry {
-                    value: Value::Set(s),
+                    value: ValueCell::new(Value::Set(s)),
                     hits: AtomicU64::new(0),
                     expiry: None,
                 },
@@ -3399,7 +3392,7 @@ async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             .and_then(|s| s.parse().ok())
         {
             Some(n) => Some(n),
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         None
@@ -3422,7 +3415,7 @@ async fn cmd_spop(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
 
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (if count.is_some() { resp_array(&[]) } else { resp_null() }, false),
-        Some(entry) => match entry.value.as_set_mut() {
+        Some(entry) => match entry.value_mut().as_set_mut() {
             None => return resp_wrongtype(),
             Some(s) => {
                 if let Some(c) = count {
@@ -3463,7 +3456,7 @@ async fn cmd_srandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
             .and_then(|s| s.parse().ok())
         {
             Some(n) => Some(n),
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         None
@@ -3641,11 +3634,11 @@ async fn cmd_zadd(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
             .or_default()
             .entry(key.clone().into_owned())
             .or_insert_with(|| Entry {
-                value: Value::ZSet(ZSetData::default()),
+                value: ValueCell::new(Value::ZSet(ZSetData::default())),
                 hits: AtomicU64::new(0),
                 expiry: None,
             });
-        let zset = match entry.value.as_zset_mut() {
+        let zset = match entry.value_mut().as_zset_mut() {
             Some(z) => z,
             None => return resp_wrongtype(),
         };
@@ -3743,7 +3736,7 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
             i += 1;
         } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 >= args.len() {
-                return resp_err("syntax error");
+                return resp_err_syntax();
             }
             limit_offset = std::str::from_utf8(&args[i + 1])
                 .ok()
@@ -3779,11 +3772,11 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
                         };
                         let min = match parse_lex_bound(min_raw) {
                             Some(b) => b,
-                            None => return resp_err("invalid lex range"),
+                            None => return resp_err_invalid_lex_range(),
                         };
                         let max = match parse_lex_bound(max_raw) {
                             Some(b) => b,
-                            None => return resp_err("invalid lex range"),
+                            None => return resp_err_invalid_lex_range(),
                         };
                         if rev {
                             for e in data.sorted.iter().rev() {
@@ -3830,11 +3823,11 @@ async fn cmd_zrange(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
                         };
                         let (min_score, min_excl) = match parse_score_bound(min_raw) {
                             Some(b) => b,
-                            None => return resp_err("min or max is not a float"),
+                            None => return resp_err_min_or_max_not_float(),
                         };
                         let (max_score, max_excl) = match parse_score_bound(max_raw) {
                             Some(b) => b,
-                            None => return resp_err("min or max is not a float"),
+                            None => return resp_err_min_or_max_not_float(),
                         };
                         if rev {
                             for e in data.sorted.iter().rev() {
@@ -3980,11 +3973,11 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<
 
     let (min_score, min_excl) = match parse_score_bound(min_raw) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
     let (max_score, max_excl) = match parse_score_bound(max_raw) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
 
     let mut withscores = false;
@@ -3998,7 +3991,7 @@ async fn cmd_zrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<
             i += 1;
         } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 >= args.len() {
-                return resp_err("syntax error");
+                return resp_err_syntax();
             }
             limit_offset = std::str::from_utf8(&args[i + 1])
                 .ok()
@@ -4076,11 +4069,11 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
 
     let (min_score, min_excl) = match parse_score_bound(min_raw) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
     let (max_score, max_excl) = match parse_score_bound(max_raw) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
 
     let mut withscores = false;
@@ -4094,7 +4087,7 @@ async fn cmd_zrevrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
             i += 1;
         } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 >= args.len() {
-                return resp_err("syntax error");
+                return resp_err_syntax();
             }
             limit_offset = std::str::from_utf8(&args[i + 1])
                 .ok()
@@ -4393,7 +4386,7 @@ async fn cmd_zrem(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, 
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_zset_mut() {
+        Some(entry) => match entry.value_mut().as_zset_mut() {
             None => return resp_wrongtype(),
             Some(data) => {
                 let before = data.len();
@@ -4450,11 +4443,11 @@ async fn cmd_zcount(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
     let (ns, key) = parse_ns_key(&args[1]);
     let (min_score, min_excl) = match parse_score_bound(&args[2]) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
     let (max_score, max_excl) = match parse_score_bound(&args[3]) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
     let mut db = store.write().await;
     if db
@@ -4525,11 +4518,11 @@ async fn cmd_zincrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         .or_default()
         .entry(key.clone().into_owned())
         .or_insert_with(|| Entry {
-            value: Value::ZSet(ZSetData::default()),
+            value: ValueCell::new(Value::ZSet(ZSetData::default())),
             hits: AtomicU64::new(0),
             expiry: None,
         });
-    match entry.value.as_zset_mut() {
+    match entry.value_mut().as_zset_mut() {
         Some(data) => {
             zset_insert_or_update(data, new_score, member);
         }
@@ -4546,11 +4539,11 @@ async fn cmd_zrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
     let (ns, key) = parse_ns_key(&args[1]);
     let min = match parse_lex_bound(&args[2]) {
         Some(b) => b,
-        None => return resp_err("invalid lex range"),
+        None => return resp_err_invalid_lex_range(),
     };
     let max = match parse_lex_bound(&args[3]) {
         Some(b) => b,
-        None => return resp_err("invalid lex range"),
+        None => return resp_err_invalid_lex_range(),
     };
 
     let mut limit_offset: usize = 0;
@@ -4617,11 +4610,11 @@ async fn cmd_zlexcount(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'sta
     let (ns, key) = parse_ns_key(&args[1]);
     let min = match parse_lex_bound(&args[2]) {
         Some(b) => b,
-        None => return resp_err("invalid lex range"),
+        None => return resp_err_invalid_lex_range(),
     };
     let max = match parse_lex_bound(&args[3]) {
         Some(b) => b,
-        None => return resp_err("invalid lex range"),
+        None => return resp_err_invalid_lex_range(),
     };
     let mut db = store.write().await;
     if db
@@ -4659,14 +4652,14 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let stop_i: i64 = match std::str::from_utf8(&args[3])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let mut db = store.write().await;
     if db
@@ -4680,7 +4673,7 @@ async fn cmd_zremrangebyrank(args: &[Vec<u8>], store: &Store) -> std::borrow::Co
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_zset_mut() {
+        Some(entry) => match entry.value_mut().as_zset_mut() {
             None => return resp_wrongtype(),
             Some(data) => {
                 let len = data.sorted.len() as i64;
@@ -4722,11 +4715,11 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
     let (ns, key) = parse_ns_key(&args[1]);
     let (min_score, min_excl) = match parse_score_bound(&args[2]) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
     let (max_score, max_excl) = match parse_score_bound(&args[3]) {
         Some(b) => b,
-        None => return resp_err("min or max is not a float"),
+        None => return resp_err_min_or_max_not_float(),
     };
     let mut db = store.write().await;
     if db
@@ -4740,7 +4733,7 @@ async fn cmd_zremrangebyscore(args: &[Vec<u8>], store: &Store) -> std::borrow::C
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_zset_mut() {
+        Some(entry) => match entry.value_mut().as_zset_mut() {
             None => return resp_wrongtype(),
             Some(data) => {
                 let before = data.len();
@@ -4782,11 +4775,11 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
     let (ns, key) = parse_ns_key(&args[1]);
     let min = match parse_lex_bound(&args[2]) {
         Some(b) => b,
-        None => return resp_err("invalid lex range"),
+        None => return resp_err_invalid_lex_range(),
     };
     let max = match parse_lex_bound(&args[3]) {
         Some(b) => b,
-        None => return resp_err("invalid lex range"),
+        None => return resp_err_invalid_lex_range(),
     };
     let mut db = store.write().await;
     if db
@@ -4800,7 +4793,7 @@ async fn cmd_zremrangebylex(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_int(0), false),
-        Some(entry) => match entry.value.as_zset_mut() {
+        Some(entry) => match entry.value_mut().as_zset_mut() {
             None => return resp_wrongtype(),
             Some(data) => {
                 let before = data.len();
@@ -4838,7 +4831,7 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
             .and_then(|s| s.parse().ok())
         {
             Some(n) => n,
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         1
@@ -4856,7 +4849,7 @@ async fn cmd_zpopmin(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_array(&[]), false),
-        Some(entry) => match entry.value.as_zset_mut() {
+        Some(entry) => match entry.value_mut().as_zset_mut() {
             None => return resp_wrongtype(),
             Some(data) => {
                 let mut result: Vec<Vec<u8>> = Vec::new();
@@ -4891,7 +4884,7 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
             .and_then(|s| s.parse().ok())
         {
             Some(n) => n,
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         1
@@ -4909,7 +4902,7 @@ async fn cmd_zpopmax(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
     }
     let (resp, modified) = match db.entries.get_mut::<str>(ns.as_ref()).and_then(|m| m.get_mut::<str>(key.as_ref())) {
         None => (resp_array(&[]), false),
-        Some(entry) => match entry.value.as_zset_mut() {
+        Some(entry) => match entry.value_mut().as_zset_mut() {
             None => return resp_wrongtype(),
             Some(data) => {
                 let mut result: Vec<Vec<u8>> = Vec::new();
@@ -4944,7 +4937,7 @@ async fn cmd_zrandmember(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'s
             .and_then(|s| s.parse().ok())
         {
             Some(n) => Some(n),
-            None => return resp_err("value is not an integer or out of range"),
+            None => return resp_err_not_integer(),
         }
     } else {
         None
@@ -5136,7 +5129,7 @@ async fn cmd_expire(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let condition = args
         .get(3)
@@ -5192,7 +5185,7 @@ async fn cmd_expireat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let condition = args
         .get(3)
@@ -5252,7 +5245,7 @@ async fn cmd_pexpire(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stati
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let condition = args
         .get(3)
@@ -5308,7 +5301,7 @@ async fn cmd_pexpireat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'sta
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     let condition = args
         .get(3)
@@ -5483,11 +5476,11 @@ async fn cmd_rename(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
-        return resp_err("ERR no such key");
+        return resp_err_no_such_key();
     }
 
     let entry = match db.delete(&src_ns, &src_key) {
-        None => return resp_err("ERR no such key"),
+        None => return resp_err_no_such_key(),
         Some(e) => e,
     };
     let m = db.put_deferred(dst_ns.as_ref(), dst_key.as_ref(), entry);
@@ -5511,7 +5504,7 @@ async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
         .is_some_and(|e| e.is_expired())
     {
         db.delete(&src_ns, &src_key);
-        return resp_err("ERR no such key");
+        return resp_err_no_such_key();
     }
     if db
         .entries
@@ -5519,7 +5512,7 @@ async fn cmd_renamenx(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'stat
         .and_then(|m| m.get::<str>(src_key.as_ref()))
         .is_none()
     {
-        return resp_err("ERR no such key");
+        return resp_err_no_such_key();
     }
 
     if db
@@ -5773,7 +5766,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
             match db.entries.get::<str>(ns.as_ref()).and_then(|m| m.get::<str>(key.as_ref())) {
                 None => resp_null(),
                 Some(entry) => {
-                    let enc = match &entry.value {
+                    let enc = match &*entry.value {
                         Value::String(_) => "embstr",
                         Value::List(_) => "listpack",
                         Value::Hash(_) => "listpack",
@@ -5807,7 +5800,7 @@ async fn cmd_object(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
             ];
             resp_array(&help)
         }
-        _ => resp_err("unknown subcommand"),
+        _ => resp_err_unknown_subcommand(),
     }
 }
 
@@ -5885,7 +5878,7 @@ async fn cmd_select(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'stati
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => return resp_err("value is not an integer or out of range"),
+        None => return resp_err_not_integer(),
     };
     if db_idx == 0 {
         resp_ok()
@@ -5945,7 +5938,7 @@ async fn cmd_config(args: &[Vec<u8>], _store: &Store) -> std::borrow::Cow<'stati
         "SET" => resp_ok(),
         "RESETSTAT" => resp_ok(),
         "REWRITE" => resp_ok(),
-        _ => resp_err("unknown subcommand"),
+        _ => resp_err_unknown_subcommand(),
     }
 }
 
@@ -6005,7 +5998,7 @@ async fn cmd_client(args: &[Vec<u8>], _store: &Store, conn: &mut ConnState) -> s
         "REPLY" => resp_ok(),
         "UNPAUSE" => resp_ok(),
         "PAUSE" => resp_ok(),
-        _ => resp_err("unknown subcommand"),
+        _ => resp_err_unknown_subcommand(),
     }
 }
 

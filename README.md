@@ -156,6 +156,7 @@ All settings are read from environment variables at startup.
 | `KVNS_METRICS_PORT` | `9090` | Metrics listener port |
 | `KVNS_PERSIST_PATH` | *(unset)* | Persistence file path; persistence is disabled if unset |
 | `KVNS_PERSIST_INTERVAL` | `300` | Seconds between automatic flushes |
+| `KVNS_SHARED_VALUES` | `true` | When `true`, entry values are stored via `Arc` so persistence snapshots clone pointers instead of payload bytes. See [Value sharing](#value-sharing). |
 | `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `lru`, `mru`, or `none` |
 | `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0-1.0) at which eviction starts |
 | `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lru,ns2:mru` |
@@ -223,6 +224,17 @@ When `KVNS_PERSIST_PATH` is set, kvns periodically snapshots the full store to d
 - On clean shutdown (`SIGINT`/`SIGTERM`), kvns flushes immediately
 - Parent directories for `KVNS_PERSIST_PATH` are created automatically
 
+### Value sharing
+
+The periodic persistence flush needs a consistent snapshot of the store. By default (`KVNS_SHARED_VALUES=true`), entry values are held via `Arc` so the snapshot step is a pointer-bump rather than a deep byte copy. In exchange each write allocates a small Arc header.
+
+| `KVNS_SHARED_VALUES` | Write throughput | Max latency during snapshot |
+| --- | --- | --- |
+| `true` *(default)* | ~3–5% lower | Roughly flat regardless of store size |
+| `false` | Baseline | Spikes proportional to store size while the snapshot clones |
+
+Set `KVNS_SHARED_VALUES=false` when persistence is disabled or when raw write throughput matters more than snapshot-time tail latency. The flag is read once at startup; changing it requires a restart.
+
 ## Metrics
 
 kvns exposes Prometheus metrics at `http://<KVNS_METRICS_HOST>:<KVNS_METRICS_PORT>/metrics`.
@@ -270,7 +282,7 @@ make fmt-check
 
 ## Benchmarking
 
-Run benchmark profiles aligned with Dragonfly's published benchmark patterns and print a comparison report:
+Run benchmark profiles against kvns:
 
 ```sh
 make benchmark
@@ -290,9 +302,7 @@ make benchmark-compare
 
 Notes:
 
-- Benchmark script path: `scripts/benchmark_kvns_vs_dragonfly.sh`
 - Output artifacts are written under `/tmp/kvns-bench-*` (or `BENCH_DIR` if set)
-- Dragonfly baseline numbers are sourced from `https://github.com/dragonflydb/dragonfly#benchmarks` (as of February 23, 2026)
 
 ## Benchmark results
 
@@ -303,48 +313,46 @@ Notes:
 | **Machine** | Apple M4 (10-core) |
 | **RAM** | 16 GiB |
 | **OS** | macOS 26.3 |
+| **Profile length** | 60 s per memtier profile |
+| **Bench command** | `./scripts/benchmark_kvns.sh` |
 
-### kvns classic vs Dragonfly
-
-| Metric | kvns | Dragonfly | kvns vs df |
-| --- | ---: | ---: | ---: |
-| Direct SET ops/sec | 201,631 | 183,704 | 109.76% |
-| Direct GET ops/sec | 221,999 | 195,476 | 113.57% |
-| Direct SET avg ms | 0.793 | 0.340 | 2.33x slower |
-| Direct GET avg ms | 0.721 | 0.320 | 2.25x slower |
-| Pipeline SET ops/sec | 842,460 | 3,800,808 | 22.17% |
-| Pipeline GET ops/sec | 2,006,908 | 4,383,297 | 45.79% |
-| Pipeline SET avg ms | 8.544 | 0.223 | 38.31x slower |
-| Pipeline GET avg ms | 3.584 | 0.193 | 18.57x slower |
-
-### kvns sharded vs Dragonfly
-
-| Metric | kvns sharded | Dragonfly | kvns vs df |
-| --- | ---: | ---: | ---: |
-| Direct SET ops/sec | 221,381 | 183,704 | 120.51% |
-| Direct GET ops/sec | 221,370 | 195,476 | 113.25% |
-| Direct SET avg ms | 0.723 | 0.340 | 2.13x slower |
-| Direct GET avg ms | 0.723 | 0.320 | 2.26x slower |
-| Pipeline SET ops/sec | 2,563,445 | 3,800,808 | 67.44% |
-| Pipeline GET ops/sec | 3,937,683 | 4,383,297 | 89.83% |
-| Pipeline SET avg ms | 2.821 | 0.223 | 12.65x slower |
-| Pipeline GET avg ms | 1.844 | 0.193 | 9.55x slower |
+Numbers are single-run samples on a development laptop and move ±10% run-to-run with thermal/load state; treat them as order-of-magnitude.
 
 ### Classic vs sharded
 
 | Metric | Classic | Sharded | Sharded / Classic |
 | --- | ---: | ---: | ---: |
-| Direct SET ops/sec | 201,631 | 221,381 | 1.10x |
-| Direct GET ops/sec | 221,999 | 221,370 | 1.00x |
-| Pipeline SET ops/sec | 842,460 | 2,563,445 | 3.04x |
-| Pipeline GET ops/sec | 2,006,908 | 3,937,683 | 1.96x |
-| Direct SET avg ms | 0.793 | 0.723 | 1.10x |
-| Direct GET avg ms | 0.721 | 0.723 | 1.00x |
-| Pipeline SET avg ms | 8.544 | 2.821 | 3.03x |
-| Pipeline GET avg ms | 3.584 | 1.844 | 1.94x |
+| Direct SET ops/sec | 137,392 | 164,079 | 1.19x |
+| Direct GET ops/sec | 163,713 | 164,336 | 1.00x |
+| Pipeline SET ops/sec | 432,061 | 2,307,804 | 5.34x |
+| Pipeline GET ops/sec | 1,434,068 | 3,191,423 | 2.23x |
+| Direct SET avg ms | 1.164 | 0.975 | 1.19x |
+| Direct GET avg ms | 0.977 | 0.973 | 1.00x |
+| Pipeline SET avg ms | 16.660 | 3.106 | 5.36x |
+| Pipeline GET avg ms | 5.014 | 2.242 | 2.24x |
+
+### Value sharing trade-off
+
+`KVNS_SHARED_VALUES` (see [Value sharing](#value-sharing)) controls whether entry values are held via `Arc` so persistence snapshots clone pointers rather than bytes.  Throughput impact is small; the payoff is in tail latency during a snapshot.
+
+Classic mode, memtier direct profile (`-c 20 -t 8 -d 256 --test-time=60 --ratio 1:0 / 0:1`):
+
+| Config | Direct SET ops/sec | Direct GET ops/sec | Pipe SET ops/sec | Pipe GET ops/sec |
+| --- | ---: | ---: | ---: | ---: |
+| pre-changes baseline | 137,011 | 165,179 | 446,548 | 1,541,850 |
+| `KVNS_SHARED_VALUES=false` | 136,890 | 165,472 | 458,047 | 1,484,701 |
+| `KVNS_SHARED_VALUES=true` (default) | 137,392 | 163,713 | 432,061 | 1,434,068 |
+
+Persist-stall scenario (200k × 256-byte keys pre-loaded, `KVNS_PERSIST_INTERVAL=2`, `-c 50 -P 1`, so individual request stalls aren't masked by pipelining):
+
+| Config | SET ops/sec | p50 ms | p99 ms | **max ms** |
+| --- | ---: | ---: | ---: | ---: |
+| `KVNS_SHARED_VALUES=false` | 101,368 | 0.26 | 0.32 | **16.18** |
+| `KVNS_SHARED_VALUES=true`  | 101,420 | 0.26 | 0.32 | **6.94** |
+
+Same throughput either way; max latency during a snapshot flush drops by ~58% with shared values because the persist task deep-copies Arc refcounts instead of payload bytes.
 
 Key takeaways:
 
-- kvns classic **outperforms Dragonfly on direct (non-pipelined) throughput** (~10% faster SET, ~14% faster GET).
-- Sharded mode extends that lead on direct SET to **~21%** and improves pipeline throughput by **3x SET / 2x GET** over classic.
-- Sharded pipeline SET reaches **~67%** of Dragonfly's throughput; pipeline GET reaches **~90%**.
+- Sharded mode delivers a ~5x pipeline-SET and ~2x pipeline-GET speedup over classic, with modest gains on direct (non-pipelined) workloads.
+- `KVNS_SHARED_VALUES=true` costs about 0–3% direct throughput but cuts persist-snapshot max latency by more than half.
