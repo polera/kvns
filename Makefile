@@ -4,7 +4,7 @@
 	podman-build podman-run podman-compose-up podman-compose-down podman-compose-logs \
 	podman-login-ghcr podman-push-ghcr
 
-CARGO_ENV := source "$$HOME/.cargo/env" &&
+CARGO_ENV := (source "$$HOME/.cargo/env" || true) &&
 PODMAN ?= podman
 IMAGE ?= kvns:local
 COMPOSE_FILE ?= docker-compose.yaml
