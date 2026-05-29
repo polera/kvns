@@ -1116,7 +1116,11 @@ async fn cmd_decrby(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static
         Some(n) => n,
         None => return resp_err_not_integer(),
     };
-    apply_integer_op(&ns, &key, store, by.wrapping_neg(), "decrement would overflow").await
+    let delta = match by.checked_neg() {
+        Some(v) => v,
+        None => return resp_err("decrement would overflow"),
+    };
+    apply_integer_op(&ns, &key, store, delta, "decrement would overflow").await
 }
 
 async fn cmd_incrbyfloat(args: &[Vec<u8>], store: &Store) -> std::borrow::Cow<'static, [u8]> {
@@ -6306,14 +6310,14 @@ pub(crate) fn encode_pubsub_message(msg: &PubSubMessage, _resp_version: u8) -> V
             append_array_header(&mut buf, 3);
             append_bulk(&mut buf, b"message");
             append_bulk(&mut buf, channel.as_bytes());
-            append_bulk(&mut buf, &data);
+            append_bulk(&mut buf, data);
         }
         PubSubMessage::PMessage { pattern, channel, data } => {
             append_array_header(&mut buf, 4);
             append_bulk(&mut buf, b"pmessage");
             append_bulk(&mut buf, pattern.as_bytes());
             append_bulk(&mut buf, channel.as_bytes());
-            append_bulk(&mut buf, &data);
+            append_bulk(&mut buf, data);
         }
     }
     buf
@@ -7829,5 +7833,1714 @@ mod tests {
         dispatch(&args(&["SUBSCRIBE", "ch"]), &store, &mut conn, &hub).await;
         let (r, _) = dispatch(&args(&["SET", "k", "v"]), &store, &mut conn, &hub).await;
         assert!(r.starts_with(b"-ERR Command not allowed in pub/sub mode"));
+    }
+
+    // ── HDEL ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hdel_returns_count_of_deleted_fields() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "f1", "v1", "f2", "v2", "f3", "v3"]), &store).await;
+        // delete two existing fields and one missing — should return 2
+        let resp = cmd_hdel(&args(&["HDEL", "h", "f1", "f3", "nope"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 2);
+        // f2 should still be present
+        let resp = cmd_hget(&args(&["HGET", "h", "f2"]), &store).await;
+        assert_eq!(&*resp, b"$2\r\nv2\r\n");
+    }
+
+    #[tokio::test]
+    async fn hdel_missing_key_returns_0() {
+        let store = make_store();
+        let resp = cmd_hdel(&args(&["HDEL", "nokey", "f"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+    }
+
+    // ── HEXISTS ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hexists_returns_1_for_existing_field() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "field", "val"]), &store).await;
+        let resp = cmd_hexists(&args(&["HEXISTS", "h", "field"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 1);
+    }
+
+    #[tokio::test]
+    async fn hexists_returns_0_for_missing_field_and_missing_key() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "field", "val"]), &store).await;
+        // existing hash, missing field
+        let resp = cmd_hexists(&args(&["HEXISTS", "h", "nope"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+        // missing key entirely
+        let resp = cmd_hexists(&args(&["HEXISTS", "nokey", "f"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+    }
+
+    // ── HKEYS ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hkeys_returns_all_field_names() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "alpha", "1", "beta", "2", "gamma", "3"]), &store).await;
+        let resp = cmd_hkeys(&args(&["HKEYS", "h"]), &store).await;
+        let keys = parse_keys_resp(&resp);
+        assert_eq!(keys, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn hkeys_missing_key_returns_empty_array() {
+        let store = make_store();
+        let resp = cmd_hkeys(&args(&["HKEYS", "nokey"]), &store).await;
+        assert_eq!(&*resp, b"*0\r\n");
+    }
+
+    // ── HVALS ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hvals_returns_all_values() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "f1", "apple", "f2", "banana"]), &store).await;
+        let resp = cmd_hvals(&args(&["HVALS", "h"]), &store).await;
+        let vals = parse_keys_resp(&resp);
+        assert_eq!(vals, vec!["apple", "banana"]);
+    }
+
+    #[tokio::test]
+    async fn hvals_missing_key_returns_empty_array() {
+        let store = make_store();
+        let resp = cmd_hvals(&args(&["HVALS", "nokey"]), &store).await;
+        assert_eq!(&*resp, b"*0\r\n");
+    }
+
+    // ── HLEN ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hlen_returns_number_of_fields() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "a", "1", "b", "2", "c", "3"]), &store).await;
+        let resp = cmd_hlen(&args(&["HLEN", "h"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 3);
+    }
+
+    #[tokio::test]
+    async fn hlen_missing_key_returns_0() {
+        let store = make_store();
+        let resp = cmd_hlen(&args(&["HLEN", "nokey"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+    }
+
+    // ── HMGET ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hmget_returns_values_with_nulls_for_missing() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "f1", "val1", "f2", "val2"]), &store).await;
+        let resp = cmd_hmget(&args(&["HMGET", "h", "f1", "missing", "f2"]), &store).await;
+        // expect *3 array: val1, null bulk string, val2
+        assert!(resp.starts_with(b"*3\r\n"));
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("val1"));
+        assert!(s.contains("$-1\r\n"), "expected null bulk string for missing field");
+        assert!(s.contains("val2"));
+    }
+
+    #[tokio::test]
+    async fn hmget_missing_key_returns_all_nulls() {
+        let store = make_store();
+        let resp = cmd_hmget(&args(&["HMGET", "nokey", "f1", "f2"]), &store).await;
+        // *2 array of two null bulk strings
+        assert!(resp.starts_with(b"*2\r\n"));
+        // both entries should be $-1\r\n
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert_eq!(s.matches("$-1\r\n").count(), 2);
+    }
+
+    // ── HINCRBY ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hincrby_creates_field_and_increments() {
+        let store = make_store();
+        // field does not exist — should be created with value = increment
+        let resp = cmd_hincrby(&args(&["HINCRBY", "h", "counter", "5"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 5);
+        // increment again
+        let resp = cmd_hincrby(&args(&["HINCRBY", "h", "counter", "3"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 8);
+    }
+
+    #[tokio::test]
+    async fn hincrby_negative_increment() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "n", "10"]), &store).await;
+        let resp = cmd_hincrby(&args(&["HINCRBY", "h", "n", "-4"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 6);
+    }
+
+    // ── HINCRBYFLOAT ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hincrbyfloat_creates_field_and_increments() {
+        let store = make_store();
+        // field absent — created with value = increment
+        let resp = cmd_hincrbyfloat(&args(&["HINCRBYFLOAT", "h", "score", "1.5"]), &store).await;
+        let val: f64 = std::str::from_utf8(&resp[1..resp.len() - 2])
+            .unwrap()
+            .split("\r\n")
+            .nth(1)
+            .unwrap_or_else(|| {
+                // resp_bulk format: $N\r\nDATA\r\n — extract DATA portion
+                std::str::from_utf8(&resp).unwrap().split("\r\n").nth(1).unwrap()
+            })
+            .parse()
+            .unwrap_or_else(|_| {
+                // simpler parse: strip RESP bulk framing
+                let s = std::str::from_utf8(&resp).unwrap();
+                let data = s.split("\r\n").nth(1).unwrap();
+                data.parse().unwrap()
+            });
+        assert!((val - 1.5).abs() < 1e-9, "expected 1.5, got {val}");
+    }
+
+    #[tokio::test]
+    async fn hincrbyfloat_accumulates_on_existing_field() {
+        let store = make_store();
+        cmd_hset(&args(&["HSET", "h", "rate", "2.5"]), &store).await;
+        let resp = cmd_hincrbyfloat(&args(&["HINCRBYFLOAT", "h", "rate", "0.5"]), &store).await;
+        // result is a bulk string containing the new float value
+        let s = std::str::from_utf8(&resp).unwrap();
+        let data = s.split("\r\n").nth(1).unwrap();
+        let val: f64 = data.parse().unwrap();
+        assert!((val - 3.0).abs() < 1e-9, "expected 3.0, got {val}");
+    }
+
+    // ── GETSET ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn getset_absent_key_returns_null_and_stores_value() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (resp, _) = dispatch(&args(&["GETSET", "k", "hello"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$-1\r\n");
+        assert_eq!(
+            &*(cmd_get(&args(&["GET", "k"]), &store).await),
+            b"$5\r\nhello\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn getset_existing_key_returns_old_value_and_stores_new() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "old"]), &store).await;
+        let (resp, _) = dispatch(&args(&["GETSET", "k", "new"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$3\r\nold\r\n");
+        assert_eq!(
+            &*(cmd_get(&args(&["GET", "k"]), &store).await),
+            b"$3\r\nnew\r\n"
+        );
+    }
+
+    // ── GETDEL ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn getdel_existing_key_returns_value_and_removes_key() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "hello"]), &store).await;
+        let (resp, _) = dispatch(&args(&["GETDEL", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$5\r\nhello\r\n");
+        assert_eq!(&*(cmd_get(&args(&["GET", "k"]), &store).await), b"$-1\r\n");
+    }
+
+    #[tokio::test]
+    async fn getdel_absent_key_returns_null() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (resp, _) = dispatch(&args(&["GETDEL", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$-1\r\n");
+    }
+
+    // ── GETEX ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn getex_without_options_returns_value_and_leaves_ttl_unchanged() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v", "EX", "100"]), &store).await;
+        let (resp, _) = dispatch(&args(&["GETEX", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$1\r\nv\r\n");
+        let ttl = parse_int_resp(&cmd_ttl(&args(&["TTL", "k"]), &store).await);
+        assert!(ttl > 90 && ttl <= 100, "TTL should be unchanged: {ttl}");
+    }
+
+    #[tokio::test]
+    async fn getex_with_ex_option_sets_ttl() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        // Confirm no TTL initially.
+        assert_eq!(&*(cmd_ttl(&args(&["TTL", "k"]), &store).await), b":-1\r\n");
+        let (resp, _) =
+            dispatch(&args(&["GETEX", "k", "EX", "60"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$1\r\nv\r\n");
+        let ttl = parse_int_resp(&cmd_ttl(&args(&["TTL", "k"]), &store).await);
+        assert!(ttl > 50 && ttl <= 60, "expected TTL ~60, got {ttl}");
+    }
+
+    #[tokio::test]
+    async fn getex_with_persist_removes_ttl() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v", "EX", "100"]), &store).await;
+        let (resp, _) =
+            dispatch(&args(&["GETEX", "k", "PERSIST"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$1\r\nv\r\n");
+        assert_eq!(&*(cmd_ttl(&args(&["TTL", "k"]), &store).await), b":-1\r\n");
+    }
+
+    // ── DECR ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn decr_absent_key_creates_with_minus1() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (resp, _) = dispatch(&args(&["DECR", "counter"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b":-1\r\n");
+    }
+
+    #[tokio::test]
+    async fn decr_existing_value_decrements_by_1() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "counter", "10"]), &store).await;
+        let (resp, _) = dispatch(&args(&["DECR", "counter"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b":9\r\n");
+    }
+
+    // ── DECRBY ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn decrby_decrements_by_given_amount() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "20"]), &store).await;
+        let (resp, _) = dispatch(&args(&["DECRBY", "k", "7"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp), 13);
+    }
+
+    #[tokio::test]
+    async fn decrby_absent_key_creates_with_negative_amount() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (resp, _) = dispatch(&args(&["DECRBY", "k", "5"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp), -5);
+    }
+
+    // ── INCRBYFLOAT ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn incrbyfloat_absent_key_creates_with_amount() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (resp, _) =
+            dispatch(&args(&["INCRBYFLOAT", "f", "3.14"]), &store, &mut conn, &hub).await;
+        // Response is a bulk string containing the new value.
+        assert!(
+            resp.starts_with(b"$"),
+            "expected bulk string, got {:?}",
+            std::str::from_utf8(&resp)
+        );
+        assert!(resp.windows(4).any(|w| w == b"3.14"), "expected 3.14 in response");
+    }
+
+    #[tokio::test]
+    async fn incrbyfloat_existing_value_adds_amount() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "f", "10.5"]), &store).await;
+        let (resp, _) =
+            dispatch(&args(&["INCRBYFLOAT", "f", "0.1"]), &store, &mut conn, &hub).await;
+        assert!(resp.starts_with(b"$"), "expected bulk string");
+        let raw = std::str::from_utf8(&resp).unwrap();
+        // Bulk string format: $len\r\n<data>\r\n — data is the second field.
+        let value: f64 = raw
+            .split("\r\n")
+            .nth(1)
+            .unwrap()
+            .parse()
+            .expect("response body should be a float");
+        assert!((value - 10.6).abs() < 1e-9, "expected ~10.6, got {value}");
+    }
+
+    // ── SETRANGE ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn setrange_overwrites_bytes_at_offset() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "Hello World"]), &store).await;
+        let (resp, _) =
+            dispatch(&args(&["SETRANGE", "k", "6", "Redis"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp), 11);
+        assert_eq!(
+            &*(cmd_get(&args(&["GET", "k"]), &store).await),
+            b"$11\r\nHello Redis\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn setrange_zero_pads_when_offset_exceeds_length() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        // Key does not exist; writing "hi" at offset 5 should produce 7 bytes total.
+        let (resp, _) =
+            dispatch(&args(&["SETRANGE", "k", "5", "hi"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp), 7);
+        let got = cmd_get(&args(&["GET", "k"]), &store).await;
+        // Encoded as $7\r\n<5 zero bytes>hi\r\n
+        assert_eq!(&got[..4], b"$7\r\n");
+        assert_eq!(&got[4..9], b"\x00\x00\x00\x00\x00");
+        assert_eq!(&got[9..13], b"hi\r\n");
+    }
+
+    // ── GETRANGE ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn getrange_returns_substring() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "Hello, World!"]), &store).await;
+        let (resp, _) =
+            dispatch(&args(&["GETRANGE", "k", "0", "4"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$5\r\nHello\r\n");
+    }
+
+    #[tokio::test]
+    async fn getrange_negative_indices_count_from_end() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "Hello"]), &store).await;
+        // -3 to -1 = last three characters = "llo"
+        let (resp, _) =
+            dispatch(&args(&["GETRANGE", "k", "-3", "-1"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp, b"$3\r\nllo\r\n");
+    }
+
+    // ── MSETNX ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn msetnx_sets_all_keys_when_none_exist() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (resp, _) = dispatch(
+            &args(&["MSETNX", "k1", "v1", "k2", "v2"]),
+            &store,
+            &mut conn,
+            &hub,
+        )
+        .await;
+        assert_eq!(&*resp, b":1\r\n");
+        assert_eq!(
+            &*(cmd_get(&args(&["GET", "k1"]), &store).await),
+            b"$2\r\nv1\r\n"
+        );
+        assert_eq!(
+            &*(cmd_get(&args(&["GET", "k2"]), &store).await),
+            b"$2\r\nv2\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn msetnx_does_nothing_when_any_key_exists() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k1", "existing"]), &store).await;
+        let (resp, _) = dispatch(
+            &args(&["MSETNX", "k1", "new1", "k2", "new2"]),
+            &store,
+            &mut conn,
+            &hub,
+        )
+        .await;
+        assert_eq!(&*resp, b":0\r\n");
+        // k1 must be untouched; k2 must not have been created.
+        assert_eq!(
+            &*(cmd_get(&args(&["GET", "k1"]), &store).await),
+            b"$8\r\nexisting\r\n"
+        );
+        assert_eq!(&*(cmd_get(&args(&["GET", "k2"]), &store).await), b"$-1\r\n");
+    }
+
+    // ── ZREM ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrem_removes_members_and_returns_count() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        let resp = dispatch(&args(&["ZREM", "zs", "a", "c", "missing"]), &store, &mut conn, &hub).await;
+        // removes "a" and "c"; "missing" is a no-op => count 2
+        assert_eq!(parse_int_resp(&resp.0), 2);
+        // confirm "b" is still present and cardinality is 1
+        let card = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&card.0), 1);
+    }
+
+    // ── ZCARD ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zcard_returns_cardinality() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        let resp = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 3);
+    }
+
+    // ── ZCOUNT ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zcount_returns_members_in_score_range() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // inclusive range 1..=2 => "a" and "b"
+        let resp = dispatch(&args(&["ZCOUNT", "zs", "1", "2"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 2);
+        // exclusive lower bound (1,3] => only "b" and "c"
+        let resp2 = dispatch(&args(&["ZCOUNT", "zs", "(1", "3"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp2.0), 2);
+        // -inf to +inf => all 3
+        let resp3 = dispatch(&args(&["ZCOUNT", "zs", "-inf", "+inf"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp3.0), 3);
+    }
+
+    // ── ZINCRBY ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zincrby_increments_score_and_returns_new_value() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        let resp = dispatch(&args(&["ZINCRBY", "zs", "2", "b"]), &store, &mut conn, &hub).await;
+        // "b" had score 2, +2 => 4; returned as bulk string
+        assert!(resp.0.starts_with(b"$"), "expected bulk string, got {:?}", std::str::from_utf8(&resp.0));
+        let s = std::str::from_utf8(&resp.0).unwrap();
+        let score_str = s.split("\r\n").nth(1).unwrap();
+        let score: f64 = score_str.parse().unwrap();
+        assert!((score - 4.0).abs() < 1e-9, "expected 4.0, got {score}");
+    }
+
+    // ── ZRANGEBYSCORE ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrangebyscore_returns_members_in_score_range() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        let resp = dispatch(&args(&["ZRANGEBYSCORE", "zs", "1", "2"]), &store, &mut conn, &hub).await;
+        // expect array ["a", "b"]
+        assert!(resp.0.starts_with(b"*2\r\n"), "expected *2 array, got {:?}", std::str::from_utf8(&resp.0));
+        assert!(resp.0.windows(b"$1\r\na\r\n".len()).any(|w| w == b"$1\r\na\r\n"), "missing 'a'");
+        assert!(resp.0.windows(b"$1\r\nb\r\n".len()).any(|w| w == b"$1\r\nb\r\n"), "missing 'b'");
+        // WITHSCORES variant: 3 members x 2 entries each = 6 elements
+        let resp2 = dispatch(&args(&["ZRANGEBYSCORE", "zs", "-inf", "+inf", "WITHSCORES"]), &store, &mut conn, &hub).await;
+        assert!(resp2.0.starts_with(b"*6\r\n"), "expected *6 with scores, got {:?}", std::str::from_utf8(&resp2.0));
+    }
+
+    // ── ZREVRANGEBYSCORE ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrevrangebyscore_returns_members_in_reverse_score_order() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // ZREVRANGEBYSCORE key max min
+        let resp = dispatch(&args(&["ZREVRANGEBYSCORE", "zs", "3", "1"]), &store, &mut conn, &hub).await;
+        // expect *3 array; verify "c" appears before "a" in raw bytes
+        assert!(resp.0.starts_with(b"*3\r\n"), "expected *3 array, got {:?}", std::str::from_utf8(&resp.0));
+        let raw = std::str::from_utf8(&resp.0).unwrap();
+        let pos_c = raw.find("\r\nc\r\n").unwrap_or(usize::MAX);
+        let pos_a = raw.find("\r\na\r\n").unwrap_or(usize::MAX);
+        assert!(pos_c < pos_a, "expected c before a (high to low order)");
+    }
+
+    // ── ZREVRANGE ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrevrange_returns_range_in_reverse_order() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // ZREVRANGE key 0 -1 => all members, highest score first
+        let resp = dispatch(&args(&["ZREVRANGE", "zs", "0", "-1"]), &store, &mut conn, &hub).await;
+        assert!(resp.0.starts_with(b"*3\r\n"), "expected *3 array");
+        let raw = std::str::from_utf8(&resp.0).unwrap();
+        let pos_c = raw.find("\r\nc\r\n").unwrap_or(usize::MAX);
+        let pos_a = raw.find("\r\na\r\n").unwrap_or(usize::MAX);
+        assert!(pos_c < pos_a, "expected c before a in reverse range");
+    }
+
+    // ── ZRANK ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrank_returns_zero_based_rank() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // "a" has score 1 => rank 0 (lowest)
+        let resp = dispatch(&args(&["ZRANK", "zs", "a"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 0);
+        // "c" has score 3 => rank 2 (highest)
+        let resp2 = dispatch(&args(&["ZRANK", "zs", "c"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp2.0), 2);
+        // missing member => null
+        let resp3 = dispatch(&args(&["ZRANK", "zs", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp3.0, b"$-1\r\n");
+    }
+
+    // ── ZREVRANK ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrevrank_returns_reverse_rank() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // "c" has score 3 => revrank 0 (highest score = rank 0 in reverse)
+        let resp = dispatch(&args(&["ZREVRANK", "zs", "c"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 0);
+        // "a" has score 1 => revrank 2
+        let resp2 = dispatch(&args(&["ZREVRANK", "zs", "a"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp2.0), 2);
+        // missing member => null
+        let resp3 = dispatch(&args(&["ZREVRANK", "zs", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp3.0, b"$-1\r\n");
+    }
+
+    // ── ZSCORE ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zscore_returns_score_as_bulk_string() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        let resp = dispatch(&args(&["ZSCORE", "zs", "b"]), &store, &mut conn, &hub).await;
+        // score 2 => bulk string "2"
+        assert_eq!(&*resp.0, b"$1\r\n2\r\n");
+        // missing member => null
+        let resp2 = dispatch(&args(&["ZSCORE", "zs", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*resp2.0, b"$-1\r\n");
+    }
+
+    // ── ZMSCORE ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zmscore_returns_array_of_scores_with_nulls_for_missing() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        let resp = dispatch(&args(&["ZMSCORE", "zs", "a", "missing", "c"]), &store, &mut conn, &hub).await;
+        // expect *3 array: "1", null, "3"
+        assert!(resp.0.starts_with(b"*3\r\n"), "expected *3 array, got {:?}", std::str::from_utf8(&resp.0));
+        assert!(resp.0.windows(b"$1\r\n1\r\n".len()).any(|w| w == b"$1\r\n1\r\n"), "missing score for 'a'");
+        assert!(resp.0.windows(b"$-1\r\n".len()).any(|w| w == b"$-1\r\n"), "missing null for missing member");
+        assert!(resp.0.windows(b"$1\r\n3\r\n".len()).any(|w| w == b"$1\r\n3\r\n"), "missing score for 'c'");
+    }
+
+    // ── ZRANGEBYLEX ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrangebylex_returns_members_in_lex_range() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        // All members must have the same score for lex ordering to be meaningful
+        dispatch(&args(&["ZADD", "zs", "0", "a", "0", "b", "0", "c", "0", "d"]), &store, &mut conn, &hub).await;
+        // [a, (c] => "a", "b" (inclusive a, exclusive c)
+        let resp = dispatch(&args(&["ZRANGEBYLEX", "zs", "[a", "(c"]), &store, &mut conn, &hub).await;
+        assert!(resp.0.starts_with(b"*2\r\n"), "expected *2 array, got {:?}", std::str::from_utf8(&resp.0));
+        assert!(resp.0.windows(b"$1\r\na\r\n".len()).any(|w| w == b"$1\r\na\r\n"), "missing 'a'");
+        assert!(resp.0.windows(b"$1\r\nb\r\n".len()).any(|w| w == b"$1\r\nb\r\n"), "missing 'b'");
+        // - to + => all 4 members
+        let resp2 = dispatch(&args(&["ZRANGEBYLEX", "zs", "-", "+"]), &store, &mut conn, &hub).await;
+        assert!(resp2.0.starts_with(b"*4\r\n"), "expected *4 for unbounded range");
+    }
+
+    // ── ZLEXCOUNT ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zlexcount_returns_count_in_lex_range() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "0", "a", "0", "b", "0", "c", "0", "d"]), &store, &mut conn, &hub).await;
+        // [a, [c] => "a", "b", "c" => 3
+        let resp = dispatch(&args(&["ZLEXCOUNT", "zs", "[a", "[c"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 3);
+        // - to + => 4
+        let resp2 = dispatch(&args(&["ZLEXCOUNT", "zs", "-", "+"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp2.0), 4);
+    }
+
+    // ── ZREMRANGEBYRANK ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zremrangebyrank_removes_by_rank_range_and_returns_count() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // remove ranks 0..=1 => removes "a" and "b" (2 members)
+        let resp = dispatch(&args(&["ZREMRANGEBYRANK", "zs", "0", "1"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 2);
+        // only "c" should remain
+        let card = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&card.0), 1);
+    }
+
+    // ── ZREMRANGEBYSCORE ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zremrangebyscore_removes_by_score_range_and_returns_count() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // remove scores 1..=2 => removes "a" and "b"
+        let resp = dispatch(&args(&["ZREMRANGEBYSCORE", "zs", "1", "2"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 2);
+        let card = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&card.0), 1);
+    }
+
+    // ── ZREMRANGEBYLEX ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zremrangebylex_removes_by_lex_range_and_returns_count() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "0", "a", "0", "b", "0", "c", "0", "d"]), &store, &mut conn, &hub).await;
+        // remove [a, [b] => removes "a" and "b"
+        let resp = dispatch(&args(&["ZREMRANGEBYLEX", "zs", "[a", "[b"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&resp.0), 2);
+        let card = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&card.0), 2);
+    }
+
+    // ── ZPOPMIN ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zpopmin_removes_and_returns_lowest_score_member() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // ZPOPMIN without count => returns [member, score] for the lowest
+        let resp = dispatch(&args(&["ZPOPMIN", "zs"]), &store, &mut conn, &hub).await;
+        // expect *2 array: "a", "1"
+        assert!(resp.0.starts_with(b"*2\r\n"), "expected *2 array, got {:?}", std::str::from_utf8(&resp.0));
+        assert!(resp.0.windows(b"$1\r\na\r\n".len()).any(|w| w == b"$1\r\na\r\n"), "expected member 'a'");
+        // cardinality should now be 2
+        let card = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&card.0), 2);
+    }
+
+    // ── ZPOPMAX ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zpopmax_removes_and_returns_highest_score_member() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // ZPOPMAX without count => returns [member, score] for the highest
+        let resp = dispatch(&args(&["ZPOPMAX", "zs"]), &store, &mut conn, &hub).await;
+        // expect *2 array: "c", "3"
+        assert!(resp.0.starts_with(b"*2\r\n"), "expected *2 array, got {:?}", std::str::from_utf8(&resp.0));
+        assert!(resp.0.windows(b"$1\r\nc\r\n".len()).any(|w| w == b"$1\r\nc\r\n"), "expected member 'c'");
+        // cardinality should now be 2
+        let card = dispatch(&args(&["ZCARD", "zs"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&card.0), 2);
+    }
+
+    // ── ZRANDMEMBER ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zrandmember_returns_member_or_array() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        dispatch(&args(&["ZADD", "zs", "1", "a", "2", "b", "3", "c"]), &store, &mut conn, &hub).await;
+        // Without count => single bulk string (one of a/b/c)
+        let resp = dispatch(&args(&["ZRANDMEMBER", "zs"]), &store, &mut conn, &hub).await;
+        assert!(resp.0.starts_with(b"$"), "expected bulk string, got {:?}", std::str::from_utf8(&resp.0));
+        // With count 2 => array of 2 distinct members
+        let resp2 = dispatch(&args(&["ZRANDMEMBER", "zs", "2"]), &store, &mut conn, &hub).await;
+        assert!(resp2.0.starts_with(b"*2\r\n"), "expected *2 array, got {:?}", std::str::from_utf8(&resp2.0));
+        // Negative count allows repeats; -5 on a 3-member set => array of 5
+        let resp3 = dispatch(&args(&["ZRANDMEMBER", "zs", "-5"]), &store, &mut conn, &hub).await;
+        assert!(resp3.0.starts_with(b"*5\r\n"), "expected *5 array with repeats, got {:?}", std::str::from_utf8(&resp3.0));
+    }
+
+    // ── SREM ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn srem_removes_members_and_returns_count() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "a", "b", "c"]), &store).await;
+        let resp = cmd_srem(&args(&["SREM", "s", "a", "c"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 2);
+        let members = parse_keys_resp(&cmd_smembers(&args(&["SMEMBERS", "s"]), &store).await);
+        assert_eq!(members, vec!["b"]);
+    }
+
+    #[tokio::test]
+    async fn srem_missing_member_not_counted() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "a"]), &store).await;
+        // "x" is not in the set; only "a" is removed.
+        let resp = cmd_srem(&args(&["SREM", "s", "a", "x"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 1);
+        // Key missing entirely also returns 0.
+        let resp2 = cmd_srem(&args(&["SREM", "ghost", "a"]), &store).await;
+        assert_eq!(parse_int_resp(&resp2), 0);
+    }
+
+    // ── SCARD ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scard_returns_cardinality() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "a", "b", "c"]), &store).await;
+        let resp = cmd_scard(&args(&["SCARD", "s"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 3);
+    }
+
+    #[tokio::test]
+    async fn scard_missing_key_returns_0() {
+        let store = make_store();
+        let resp = cmd_scard(&args(&["SCARD", "nokey"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+    }
+
+    // ── SISMEMBER ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sismember_present_returns_1() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "hello"]), &store).await;
+        let resp = cmd_sismember(&args(&["SISMEMBER", "s", "hello"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 1);
+    }
+
+    #[tokio::test]
+    async fn sismember_absent_and_missing_key_return_0() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "hello"]), &store).await;
+        // Member not in set.
+        let resp = cmd_sismember(&args(&["SISMEMBER", "s", "world"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+        // Key does not exist at all.
+        let resp2 = cmd_sismember(&args(&["SISMEMBER", "ghost", "hello"]), &store).await;
+        assert_eq!(parse_int_resp(&resp2), 0);
+    }
+
+    // ── SMISMEMBER ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn smismember_returns_per_member_results() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "a", "b"]), &store).await;
+        let resp = cmd_smismember(&args(&["SMISMEMBER", "s", "a", "x", "b"]), &store).await;
+        // Expected: *3\r\n:1\r\n:0\r\n:1\r\n
+        assert_eq!(&*resp, b"*3\r\n:1\r\n:0\r\n:1\r\n");
+    }
+
+    #[tokio::test]
+    async fn smismember_missing_key_returns_all_zeros() {
+        let store = make_store();
+        let resp = cmd_smismember(&args(&["SMISMEMBER", "ghost", "a", "b"]), &store).await;
+        assert_eq!(&*resp, b"*2\r\n:0\r\n:0\r\n");
+    }
+
+    // ── SUNION ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sunion_combines_multiple_sets() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a", "b"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s2", "b", "c"]), &store).await;
+        let members =
+            parse_keys_resp(&cmd_sunion(&args(&["SUNION", "s1", "s2"]), &store).await);
+        assert_eq!(members, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn sunion_missing_key_treated_as_empty() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "x"]), &store).await;
+        let members =
+            parse_keys_resp(&cmd_sunion(&args(&["SUNION", "s1", "ghost"]), &store).await);
+        assert_eq!(members, vec!["x"]);
+    }
+
+    // ── SINTER ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sinter_returns_common_members() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a", "b", "c"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s2", "b", "c", "d"]), &store).await;
+        let members =
+            parse_keys_resp(&cmd_sinter(&args(&["SINTER", "s1", "s2"]), &store).await);
+        assert_eq!(members, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn sinter_missing_key_returns_empty() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a"]), &store).await;
+        let resp = cmd_sinter(&args(&["SINTER", "s1", "ghost"]), &store).await;
+        assert_eq!(&*resp, b"*0\r\n");
+    }
+
+    // ── SDIFF ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sdiff_returns_members_in_first_not_others() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a", "b", "c"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s2", "b"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s3", "c"]), &store).await;
+        let members =
+            parse_keys_resp(&cmd_sdiff(&args(&["SDIFF", "s1", "s2", "s3"]), &store).await);
+        assert_eq!(members, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn sdiff_missing_first_key_returns_empty() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s2", "a"]), &store).await;
+        let resp = cmd_sdiff(&args(&["SDIFF", "ghost", "s2"]), &store).await;
+        assert_eq!(&*resp, b"*0\r\n");
+    }
+
+    // ── SUNIONSTORE ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sunionstore_stores_union_and_returns_count() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a", "b"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s2", "b", "c"]), &store).await;
+        let resp =
+            cmd_sunionstore(&args(&["SUNIONSTORE", "dst", "s1", "s2"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 3);
+        let members =
+            parse_keys_resp(&cmd_smembers(&args(&["SMEMBERS", "dst"]), &store).await);
+        assert_eq!(members, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn sunionstore_overwrites_existing_destination() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "dst", "old"]), &store).await;
+        cmd_sadd(&args(&["SADD", "src", "new"]), &store).await;
+        cmd_sunionstore(&args(&["SUNIONSTORE", "dst", "src"]), &store).await;
+        let members =
+            parse_keys_resp(&cmd_smembers(&args(&["SMEMBERS", "dst"]), &store).await);
+        assert_eq!(members, vec!["new"]);
+    }
+
+    // ── SINTERSTORE ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sinterstore_stores_intersection_and_returns_count() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a", "b", "c"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s2", "b", "c", "d"]), &store).await;
+        let resp =
+            cmd_sinterstore(&args(&["SINTERSTORE", "dst", "s1", "s2"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 2);
+        let members =
+            parse_keys_resp(&cmd_smembers(&args(&["SMEMBERS", "dst"]), &store).await);
+        assert_eq!(members, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn sinterstore_missing_source_stores_empty_set() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a"]), &store).await;
+        let resp =
+            cmd_sinterstore(&args(&["SINTERSTORE", "dst", "s1", "ghost"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+        // dst exists but is an empty set; SCARD should return 0.
+        let card = cmd_scard(&args(&["SCARD", "dst"]), &store).await;
+        assert_eq!(parse_int_resp(&card), 0);
+    }
+
+    // ── SDIFFSTORE ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sdiffstore_stores_diff_and_returns_count() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s1", "a", "b", "c"]), &store).await;
+        cmd_sadd(&args(&["SADD", "s2", "b", "c"]), &store).await;
+        let resp =
+            cmd_sdiffstore(&args(&["SDIFFSTORE", "dst", "s1", "s2"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 1);
+        let members =
+            parse_keys_resp(&cmd_smembers(&args(&["SMEMBERS", "dst"]), &store).await);
+        assert_eq!(members, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn sdiffstore_missing_first_source_stores_empty_set() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s2", "a"]), &store).await;
+        let resp =
+            cmd_sdiffstore(&args(&["SDIFFSTORE", "dst", "ghost", "s2"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+        let card = cmd_scard(&args(&["SCARD", "dst"]), &store).await;
+        assert_eq!(parse_int_resp(&card), 0);
+    }
+
+    // ── SMOVE ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn smove_transfers_member_between_sets() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "src", "a", "b"]), &store).await;
+        cmd_sadd(&args(&["SADD", "dst", "c"]), &store).await;
+        let resp = cmd_smove(&args(&["SMOVE", "src", "dst", "a"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 1);
+        // "a" should now be in dst, not in src.
+        assert_eq!(
+            parse_int_resp(
+                &cmd_sismember(&args(&["SISMEMBER", "src", "a"]), &store).await
+            ),
+            0
+        );
+        assert_eq!(
+            parse_int_resp(
+                &cmd_sismember(&args(&["SISMEMBER", "dst", "a"]), &store).await
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn smove_returns_0_when_member_not_in_src() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "src", "a"]), &store).await;
+        let resp = cmd_smove(&args(&["SMOVE", "src", "dst", "x"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 0);
+        // dst should not have been created.
+        assert_eq!(
+            &*(cmd_scard(&args(&["SCARD", "dst"]), &store).await),
+            b":0\r\n"
+        );
+    }
+
+    // ── SPOP ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn spop_removes_and_returns_a_member() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "only"]), &store).await;
+        let resp = cmd_spop(&args(&["SPOP", "s"]), &store).await;
+        assert_eq!(&*resp, b"$4\r\nonly\r\n");
+        // Set should now be empty.
+        assert_eq!(
+            parse_int_resp(&cmd_scard(&args(&["SCARD", "s"]), &store).await),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn spop_with_count_removes_multiple_members() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "a", "b", "c"]), &store).await;
+        let resp = cmd_spop(&args(&["SPOP", "s", "2"]), &store).await;
+        // Should return an array of 2 members.
+        assert!(resp.starts_with(b"*2\r\n"));
+        // 1 member should remain.
+        assert_eq!(
+            parse_int_resp(&cmd_scard(&args(&["SCARD", "s"]), &store).await),
+            1
+        );
+    }
+
+    // ── SRANDMEMBER ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn srandmember_returns_member_without_removing() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "only"]), &store).await;
+        let resp = cmd_srandmember(&args(&["SRANDMEMBER", "s"]), &store).await;
+        assert_eq!(&*resp, b"$4\r\nonly\r\n");
+        // Member must still be present.
+        assert_eq!(
+            parse_int_resp(&cmd_scard(&args(&["SCARD", "s"]), &store).await),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn srandmember_with_positive_count_returns_distinct_subset() {
+        let store = make_store();
+        cmd_sadd(&args(&["SADD", "s", "a", "b", "c", "d"]), &store).await;
+        let resp = cmd_srandmember(&args(&["SRANDMEMBER", "s", "2"]), &store).await;
+        // Returns an array of 2 distinct members; set is unmodified.
+        assert!(resp.starts_with(b"*2\r\n"));
+        assert_eq!(
+            parse_int_resp(&cmd_scard(&args(&["SCARD", "s"]), &store).await),
+            4
+        );
+    }
+
+    // ── LPUSHX ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lpushx_pushes_when_key_exists() {
+        let store = make_store();
+        // Seed the list so LPUSHX is allowed.
+        cmd_lpush(&args(&["LPUSH", "lst", "a"]), &store).await;
+        let resp = cmd_lpushx(&args(&["LPUSHX", "lst", "b"]), &store).await;
+        // List is now ["b", "a"] -- length 2.
+        assert_eq!(parse_int_resp(&resp), 2);
+    }
+
+    #[tokio::test]
+    async fn lpushx_returns_zero_when_key_absent() {
+        let store = make_store();
+        let resp = cmd_lpushx(&args(&["LPUSHX", "ghost", "v"]), &store).await;
+        assert_eq!(&*resp, b":0\r\n");
+    }
+
+    // ── RPUSHX ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rpushx_appends_when_key_exists() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "lst", "x"]), &store).await;
+        let resp = cmd_rpushx(&args(&["RPUSHX", "lst", "y"]), &store).await;
+        // List is now ["x", "y"] -- length 2.
+        assert_eq!(parse_int_resp(&resp), 2);
+    }
+
+    #[tokio::test]
+    async fn rpushx_returns_zero_when_key_absent() {
+        let store = make_store();
+        let resp = cmd_rpushx(&args(&["RPUSHX", "ghost", "v"]), &store).await;
+        assert_eq!(&*resp, b":0\r\n");
+    }
+
+    // ── LPOP ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lpop_returns_head_element() {
+        let store = make_store();
+        // RPUSH preserves insertion order: list is ["a", "b", "c"].
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        let resp = cmd_lpop(&args(&["LPOP", "l"]), &store).await;
+        assert_eq!(&*resp, b"$1\r\na\r\n");
+    }
+
+    #[tokio::test]
+    async fn lpop_with_count_returns_array() {
+        let store = make_store();
+        // List: ["a", "b", "c"]
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        let resp = cmd_lpop(&args(&["LPOP", "l", "2"]), &store).await;
+        // Expect *2 array containing "a" then "b".
+        assert!(resp.starts_with(b"*2\r\n"), "expected 2-element array");
+        assert!(resp.windows(7).any(|w| w == b"$1\r\na\r\n"), "expected 'a'");
+        assert!(resp.windows(7).any(|w| w == b"$1\r\nb\r\n"), "expected 'b'");
+    }
+
+    #[tokio::test]
+    async fn lpop_missing_key_returns_null() {
+        let store = make_store();
+        let resp = cmd_lpop(&args(&["LPOP", "ghost"]), &store).await;
+        assert_eq!(&*resp, b"$-1\r\n");
+    }
+
+    // ── LLEN ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn llen_returns_list_length() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        let resp = cmd_llen(&args(&["LLEN", "l"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 3);
+    }
+
+    #[tokio::test]
+    async fn llen_missing_key_returns_zero() {
+        let store = make_store();
+        let resp = cmd_llen(&args(&["LLEN", "ghost"]), &store).await;
+        assert_eq!(&*resp, b":0\r\n");
+    }
+
+    // ── LRANGE ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lrange_returns_subrange() {
+        let store = make_store();
+        // List: ["a", "b", "c", "d"]
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c", "d"]), &store).await;
+        let resp = cmd_lrange(&args(&["LRANGE", "l", "1", "2"]), &store).await;
+        // Expect ["b", "c"]
+        assert!(resp.starts_with(b"*2\r\n"));
+        assert!(resp.windows(7).any(|w| w == b"$1\r\nb\r\n"));
+        assert!(resp.windows(7).any(|w| w == b"$1\r\nc\r\n"));
+    }
+
+    #[tokio::test]
+    async fn lrange_negative_indices() {
+        let store = make_store();
+        // List: ["a", "b", "c"]
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        // -2..-1 selects the last two elements ["b", "c"].
+        let resp = cmd_lrange(&args(&["LRANGE", "l", "-2", "-1"]), &store).await;
+        assert!(resp.starts_with(b"*2\r\n"));
+        assert!(resp.windows(7).any(|w| w == b"$1\r\nb\r\n"));
+        assert!(resp.windows(7).any(|w| w == b"$1\r\nc\r\n"));
+    }
+
+    // ── LINDEX ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lindex_returns_element_at_index() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        let resp = cmd_lindex(&args(&["LINDEX", "l", "1"]), &store).await;
+        assert_eq!(&*resp, b"$1\r\nb\r\n");
+    }
+
+    #[tokio::test]
+    async fn lindex_negative_index_and_out_of_range() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        // -1 is the last element.
+        let resp = cmd_lindex(&args(&["LINDEX", "l", "-1"]), &store).await;
+        assert_eq!(&*resp, b"$1\r\nc\r\n");
+        // Index 10 is beyond the list -- null.
+        let resp_oor = cmd_lindex(&args(&["LINDEX", "l", "10"]), &store).await;
+        assert_eq!(&*resp_oor, b"$-1\r\n");
+    }
+
+    // ── LSET ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lset_updates_element_at_index() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        let resp = cmd_lset(&args(&["LSET", "l", "1", "B"]), &store).await;
+        assert_eq!(&*resp, b"+OK\r\n");
+        // Verify with LINDEX.
+        let check = cmd_lindex(&args(&["LINDEX", "l", "1"]), &store).await;
+        assert_eq!(&*check, b"$1\r\nB\r\n");
+    }
+
+    #[tokio::test]
+    async fn lset_out_of_range_returns_error() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "only"]), &store).await;
+        let resp = cmd_lset(&args(&["LSET", "l", "5", "v"]), &store).await;
+        assert!(resp.starts_with(b"-ERR"));
+    }
+
+    // ── LREM ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lrem_removes_from_head_when_count_positive() {
+        let store = make_store();
+        // List: ["x", "a", "x", "b", "x"]
+        cmd_rpush(&args(&["RPUSH", "l", "x", "a", "x", "b", "x"]), &store).await;
+        // Remove 2 occurrences of "x" scanning from head.
+        let resp = cmd_lrem(&args(&["LREM", "l", "2", "x"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 2);
+        // Remaining list length should be 3.
+        let len = cmd_llen(&args(&["LLEN", "l"]), &store).await;
+        assert_eq!(parse_int_resp(&len), 3);
+    }
+
+    #[tokio::test]
+    async fn lrem_count_zero_removes_all_occurrences() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "y", "y", "y"]), &store).await;
+        let resp = cmd_lrem(&args(&["LREM", "l", "0", "y"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 3);
+        let len = cmd_llen(&args(&["LLEN", "l"]), &store).await;
+        assert_eq!(parse_int_resp(&len), 0);
+    }
+
+    // ── LTRIM ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ltrim_shrinks_list_to_range() {
+        let store = make_store();
+        // List: ["a", "b", "c", "d", "e"]
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c", "d", "e"]), &store).await;
+        let resp = cmd_ltrim(&args(&["LTRIM", "l", "1", "3"]), &store).await;
+        assert_eq!(&*resp, b"+OK\r\n");
+        // List should now be ["b", "c", "d"].
+        let len = cmd_llen(&args(&["LLEN", "l"]), &store).await;
+        assert_eq!(parse_int_resp(&len), 3);
+        let first = cmd_lindex(&args(&["LINDEX", "l", "0"]), &store).await;
+        assert_eq!(&*first, b"$1\r\nb\r\n");
+    }
+
+    #[tokio::test]
+    async fn ltrim_out_of_bounds_clears_list() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b"]), &store).await;
+        // start > stop: list should be emptied.
+        cmd_ltrim(&args(&["LTRIM", "l", "5", "1"]), &store).await;
+        let len = cmd_llen(&args(&["LLEN", "l"]), &store).await;
+        assert_eq!(parse_int_resp(&len), 0);
+    }
+
+    // ── LINSERT ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn linsert_before_pivot() {
+        let store = make_store();
+        // List: ["a", "c"]
+        cmd_rpush(&args(&["RPUSH", "l", "a", "c"]), &store).await;
+        // Insert "b" BEFORE "c" -> ["a", "b", "c"]
+        let resp = cmd_linsert(&args(&["LINSERT", "l", "BEFORE", "c", "b"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), 3);
+        let middle = cmd_lindex(&args(&["LINDEX", "l", "1"]), &store).await;
+        assert_eq!(&*middle, b"$1\r\nb\r\n");
+    }
+
+    #[tokio::test]
+    async fn linsert_pivot_not_found_returns_minus_one() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b"]), &store).await;
+        let resp =
+            cmd_linsert(&args(&["LINSERT", "l", "BEFORE", "zzz", "x"]), &store).await;
+        assert_eq!(parse_int_resp(&resp), -1);
+    }
+
+    // ── LPOS ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lpos_returns_index_of_element() {
+        let store = make_store();
+        // List: ["a", "b", "c"]
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b", "c"]), &store).await;
+        // "b" is at index 1 -- returned as a bulk string containing "1".
+        let resp = cmd_lpos(&args(&["LPOS", "l", "b"]), &store).await;
+        assert_eq!(&*resp, b"$1\r\n1\r\n");
+    }
+
+    #[tokio::test]
+    async fn lpos_returns_null_when_element_absent() {
+        let store = make_store();
+        cmd_rpush(&args(&["RPUSH", "l", "a", "b"]), &store).await;
+        let resp = cmd_lpos(&args(&["LPOS", "l", "z"]), &store).await;
+        assert_eq!(&*resp, b"$-1\r\n");
+    }
+
+    // ── LMOVE ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lmove_left_right_transfers_element() {
+        let store = make_store();
+        // src list: ["a", "b", "c"]
+        cmd_rpush(&args(&["RPUSH", "src", "a", "b", "c"]), &store).await;
+        // Pop from LEFT of src, push to RIGHT of dst.
+        let resp =
+            cmd_lmove(&args(&["LMOVE", "src", "dst", "LEFT", "RIGHT"]), &store).await;
+        // Returned element should be "a".
+        assert_eq!(&*resp, b"$1\r\na\r\n");
+        // src should now have length 2.
+        let src_len = cmd_llen(&args(&["LLEN", "src"]), &store).await;
+        assert_eq!(parse_int_resp(&src_len), 2);
+        // dst should contain "a" at index 0.
+        let dst_el = cmd_lindex(&args(&["LINDEX", "dst", "0"]), &store).await;
+        assert_eq!(&*dst_el, b"$1\r\na\r\n");
+    }
+
+    #[tokio::test]
+    async fn lmove_returns_null_when_source_absent() {
+        let store = make_store();
+        let resp =
+            cmd_lmove(&args(&["LMOVE", "ghost", "dst", "LEFT", "RIGHT"]), &store).await;
+        assert_eq!(&*resp, b"$-1\r\n");
+    }
+
+    // ── GENERIC/SERVER commands ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn persist_removes_ttl() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v", "EX", "100"]), &store).await;
+        let (r, _) = dispatch(&args(&["PERSIST", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 1);
+        let (r2, _) = dispatch(&args(&["TTL", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r2), -1);
+    }
+
+    #[tokio::test]
+    async fn persist_missing_key_returns_0() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["PERSIST", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn pttl_returns_millis() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v", "PX", "10000"]), &store).await;
+        let (r, _) = dispatch(&args(&["PTTL", "k"]), &store, &mut conn, &hub).await;
+        let ms = parse_int_resp(&r);
+        assert!(ms > 0 && ms <= 10000);
+    }
+
+    #[tokio::test]
+    async fn pttl_missing_returns_minus2() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["PTTL", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), -2);
+    }
+
+    #[tokio::test]
+    async fn pttl_no_expiry_returns_minus1() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        let (r, _) = dispatch(&args(&["PTTL", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), -1);
+    }
+
+    #[tokio::test]
+    async fn pexpire_sets_ttl_in_ms() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        let (r, _) = dispatch(&args(&["PEXPIRE", "k", "5000"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 1);
+        let (r2, _) = dispatch(&args(&["PTTL", "k"]), &store, &mut conn, &hub).await;
+        assert!(parse_int_resp(&r2) > 0);
+    }
+
+    #[tokio::test]
+    async fn expireat_sets_absolute_ttl() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        let future_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let (r, _) = dispatch(&args(&["EXPIREAT", "k", &future_ts.to_string()]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 1);
+    }
+
+    #[tokio::test]
+    async fn pexpireat_sets_absolute_ttl_ms() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let (r, _) = dispatch(&args(&["PEXPIREAT", "k", &future_ms.to_string()]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 1);
+    }
+
+    #[tokio::test]
+    async fn expiretime_returns_unix_secs() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v", "EX", "3600"]), &store).await;
+        let (r, _) = dispatch(&args(&["EXPIRETIME", "k"]), &store, &mut conn, &hub).await;
+        assert!(parse_int_resp(&r) > 0);
+    }
+
+    #[tokio::test]
+    async fn expiretime_no_expiry_returns_minus1() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v"]), &store).await;
+        let (r, _) = dispatch(&args(&["EXPIRETIME", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), -1);
+    }
+
+    #[tokio::test]
+    async fn pexpiretime_returns_unix_ms() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "v", "PX", "60000"]), &store).await;
+        let (r, _) = dispatch(&args(&["PEXPIRETIME", "k"]), &store, &mut conn, &hub).await;
+        assert!(parse_int_resp(&r) > 0);
+    }
+
+    #[tokio::test]
+    async fn rename_renames_key() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "old", "val"]), &store).await;
+        let (r, _) = dispatch(&args(&["RENAME", "old", "new"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        let (r2, _) = dispatch(&args(&["GET", "new"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r2, b"$3\r\nval\r\n");
+    }
+
+    #[tokio::test]
+    async fn rename_missing_source_returns_error() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["RENAME", "missing", "dst"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"-ERR"));
+    }
+
+    #[tokio::test]
+    async fn renamenx_renames_when_dst_absent() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "val"]), &store).await;
+        let (r, _) = dispatch(&args(&["RENAMENX", "a", "b"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 1);
+    }
+
+    #[tokio::test]
+    async fn renamenx_returns_0_when_dst_exists() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "v1"]), &store).await;
+        cmd_set(&args(&["SET", "b", "v2"]), &store).await;
+        let (r, _) = dispatch(&args(&["RENAMENX", "a", "b"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_returns_all_keys() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "1"]), &store).await;
+        cmd_set(&args(&["SET", "b", "2"]), &store).await;
+        let (r, _) = dispatch(&args(&["SCAN", "0"]), &store, &mut conn, &hub).await;
+        let s = std::str::from_utf8(&r).unwrap();
+        assert!(s.contains("a"));
+        assert!(s.contains("b"));
+    }
+
+    #[tokio::test]
+    async fn copy_copies_value() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "src", "val"]), &store).await;
+        let (r, _) = dispatch(&args(&["COPY", "src", "dst"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 1);
+        let (r2, _) = dispatch(&args(&["GET", "dst"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r2, b"$3\r\nval\r\n");
+    }
+
+    #[tokio::test]
+    async fn copy_missing_src_returns_0() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["COPY", "missing", "dst"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn object_encoding_string() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "k", "val"]), &store).await;
+        let (r, _) = dispatch(&args(&["OBJECT", "ENCODING", "k"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"$6\r\nembstr\r\n");
+    }
+
+    #[tokio::test]
+    async fn touch_returns_existing_count() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "1"]), &store).await;
+        cmd_set(&args(&["SET", "b", "2"]), &store).await;
+        let (r, _) = dispatch(&args(&["TOUCH", "a", "b", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 2);
+    }
+
+    #[tokio::test]
+    async fn unlink_deletes_keys() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "1"]), &store).await;
+        cmd_set(&args(&["SET", "b", "2"]), &store).await;
+        let (r, _) = dispatch(&args(&["UNLINK", "a", "b", "missing"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r), 2);
+    }
+
+    #[tokio::test]
+    async fn flushdb_clears_all_keys() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "1"]), &store).await;
+        let (r, _) = dispatch(&args(&["FLUSHDB"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        let (r2, _) = dispatch(&args(&["DBSIZE"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r2), 0);
+    }
+
+    #[tokio::test]
+    async fn flushall_clears_all_keys() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        cmd_set(&args(&["SET", "a", "1"]), &store).await;
+        let (r, _) = dispatch(&args(&["FLUSHALL"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        let (r2, _) = dispatch(&args(&["DBSIZE"]), &store, &mut conn, &hub).await;
+        assert_eq!(parse_int_resp(&r2), 0);
+    }
+
+    #[tokio::test]
+    async fn select_0_ok_select_1_error() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["SELECT", "0"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        let (r2, _) = dispatch(&args(&["SELECT", "1"]), &store, &mut conn, &hub).await;
+        assert!(r2.starts_with(b"-ERR"));
+    }
+
+    #[tokio::test]
+    async fn hello_returns_response() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["HELLO"]), &store, &mut conn, &hub).await;
+        assert!(!r.starts_with(b"-ERR unknown"));
+    }
+
+    #[tokio::test]
+    async fn reset_returns_reset() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["RESET"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+RESET\r\n");
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_array() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["CONFIG", "GET", "maxmemory"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"*"));
+    }
+
+    #[tokio::test]
+    async fn config_set_returns_ok() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["CONFIG", "SET", "x", "y"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+    }
+
+    #[tokio::test]
+    async fn command_returns_ok() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["COMMAND"]), &store, &mut conn, &hub).await;
+        // COMMAND returns an array (possibly empty), not an error
+        assert!(!r.starts_with(b"-"), "COMMAND returned error: {:?}", std::str::from_utf8(&r));
+        assert!(r.starts_with(b"*"), "expected array for COMMAND");
+    }
+
+    #[tokio::test]
+    async fn info_returns_bulk_string() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["INFO"]), &store, &mut conn, &hub).await;
+        assert!(r.starts_with(b"$"));
+    }
+
+    #[tokio::test]
+    async fn wait_returns_0() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["WAIT", "0", "0"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b":0\r\n");
+    }
+
+    #[tokio::test]
+    async fn client_setname_and_getname() {
+        let store = make_store();
+        let mut conn = make_conn();
+        let hub = make_hub();
+        let (r, _) = dispatch(&args(&["CLIENT", "SETNAME", "myconn"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r, b"+OK\r\n");
+        let (r2, _) = dispatch(&args(&["CLIENT", "GETNAME"]), &store, &mut conn, &hub).await;
+        assert_eq!(&*r2, b"$6\r\nmyconn\r\n");
     }
 }

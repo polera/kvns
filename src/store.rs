@@ -521,36 +521,64 @@ impl Db {
         key: &str,
         entry: Entry,
     ) -> StoreMetrics {
-        let namespace = namespace.to_owned();
-        let key = key.to_owned();
         // A fresh write cancels any pending EAR eviction for this key.
-        self.ear_pending.remove(&(namespace.clone(), key.clone()));
-        let new_size = Self::entry_size(&namespace, &key, entry.value.byte_len());
-        let old_size = self
-            .entries
-            .get(&namespace)
-            .and_then(|ns| ns.get(&key))
-            .map(|e| Self::entry_size(&namespace, &key, e.value.byte_len()))
+        // `ear_pending` is empty unless an EAR namespace is configured, so skip
+        // the two String allocations the tuple lookup would otherwise cost on
+        // every write.
+        if !self.ear_pending.is_empty() {
+            self.ear_pending
+                .remove(&(namespace.to_owned(), key.to_owned()));
+        }
+
+        let new_size = Self::entry_size(namespace, key, entry.value.byte_len());
+
+        // Look the namespace's entry map up once (only allocating the namespace
+        // String on first use), then reuse it for the old-size delta, the
+        // insert, and the key count.
+        let ns_map = match self.entries.get_mut(namespace) {
+            Some(m) => m,
+            None => self.entries.entry(namespace.to_owned()).or_default(),
+        };
+        let old_size = ns_map
+            .get(key)
+            .map(|e| Self::entry_size(namespace, key, e.value.byte_len()))
             .unwrap_or(0);
+        // Overwrite in place when the key exists (no key allocation); only
+        // allocate the key String when inserting a new one.
+        match ns_map.get_mut(key) {
+            Some(slot) => *slot = entry,
+            None => {
+                ns_map.insert(key.to_owned(), entry);
+            }
+        }
+        let ns_keys = ns_map.len();
+
         self.used_bytes = self
             .used_bytes
             .saturating_sub(old_size)
             .saturating_add(new_size);
-        let nb = self.namespace_bytes.entry(namespace.clone()).or_insert(0);
+
+        let nb = match self.namespace_bytes.get_mut(namespace) {
+            Some(nb) => nb,
+            None => self.namespace_bytes.entry(namespace.to_owned()).or_insert(0),
+        };
         *nb = nb.saturating_sub(old_size).saturating_add(new_size);
         let ns_bytes = *nb;
+
         self.write_version += 1;
-        self.key_versions
-            .entry(namespace.clone())
-            .or_default()
-            .insert(key.clone(), self.write_version);
-        self.entries
-            .entry(namespace.clone())
-            .or_default()
-            .insert(key, entry);
-        let ns_keys = self.entries[&namespace].len();
+        let key_versions = match self.key_versions.get_mut(namespace) {
+            Some(kv) => kv,
+            None => self.key_versions.entry(namespace.to_owned()).or_default(),
+        };
+        match key_versions.get_mut(key) {
+            Some(v) => *v = self.write_version,
+            None => {
+                key_versions.insert(key.to_owned(), self.write_version);
+            }
+        }
+
         StoreMetrics {
-            namespace,
+            namespace: namespace.to_owned(),
             ns_keys,
             ns_bytes,
             total_bytes: self.used_bytes,
@@ -598,8 +626,12 @@ impl Db {
         namespace: &str,
         key: &str,
     ) -> (Option<Entry>, StoreMetrics) {
-        let ns_key = (namespace.to_owned(), key.to_owned());
-        self.ear_pending.remove(&ns_key);
+        // `ear_pending` is empty unless an EAR namespace is configured; skip the
+        // tuple allocation on every delete in the common case.
+        if !self.ear_pending.is_empty() {
+            self.ear_pending
+                .remove(&(namespace.to_owned(), key.to_owned()));
+        }
         self.write_version += 1;
         if let Some(m) = self.key_versions.get_mut(namespace) {
             m.remove(key);
