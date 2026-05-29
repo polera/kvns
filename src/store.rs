@@ -24,7 +24,7 @@ impl ZSetData {
     }
 }
 
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 
 use crate::config::EvictionPolicy;
 

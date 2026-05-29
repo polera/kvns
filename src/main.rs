@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tokio::sync::{RwLock, Semaphore};
+use parking_lot::RwLock;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -116,7 +117,7 @@ fn build_server_limits(config: &config::Config) -> server::ServerLimits {
 async fn shutdown_flush(persist_path: Option<&String>, classic_store: Option<&Arc<RwLock<store::Db>>>) {
     if let (Some(path), Some(store)) = (persist_path, classic_store) {
         info!(path = %path, "flushing store to disk on shutdown");
-        let snapshot = { let db = store.read().await; db.entries.clone() };
+        let snapshot = { let db = store.read(); db.entries.clone() };
         let shutdown_path = PathBuf::from(path);
         match tokio::task::spawn_blocking(move || persist::save_entries(&snapshot, &shutdown_path)).await {
             Ok(Ok(())) => info!(path = %path, "store flushed to disk"),

@@ -226,7 +226,7 @@ pub(crate) async fn run_periodic_flush(store: Store, path: PathBuf, interval_sec
         // serialisation, and file I/O all run inside spawn_blocking with no
         // lock held, keeping the async executor free.
         let entries_clone = {
-            let db = store.read().await;
+            let db = store.read();
             db.entries.clone()
         };
         let flush_path = path.clone();
