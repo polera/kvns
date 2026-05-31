@@ -225,10 +225,7 @@ pub(crate) async fn run_periodic_flush(store: Store, path: PathBuf, interval_sec
         // release the lock immediately.  The PersistedDb conversion, rkyv
         // serialisation, and file I/O all run inside spawn_blocking with no
         // lock held, keeping the async executor free.
-        let entries_clone = {
-            let db = store.read();
-            db.entries.clone()
-        };
+        let entries_clone = store.snapshot_entries();
         let flush_path = path.clone();
         match tokio::task::spawn_blocking(move || {
             let persisted = persisted_db_from_entries(&entries_clone);

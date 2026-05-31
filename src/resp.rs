@@ -1108,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_resp_double_fractional() {
-        assert_eq!(&*resp_double(3.14), b",3.14\r\n");
+        assert_eq!(&*resp_double(3.25), b",3.25\r\n");
         assert_eq!(&*resp_double(-2.5), b",-2.5\r\n");
     }
 
