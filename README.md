@@ -42,6 +42,7 @@ Command names are case-insensitive.
 | Family | Commands |
 | --- | --- |
 | Connection | `PING`, `QUIT`, `HELLO`, `RESET`, `SELECT` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
 | String | `SET`, `GET`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `GETSET`, `GETDEL`, `GETEX`, `APPEND`, `STRLEN`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `INCRBYFLOAT`, `SETRANGE`, `GETRANGE`, `SUBSTR` |
 | List | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LREM`, `LTRIM`, `LINSERT`, `LPOS`, `LMOVE` |
 | Hash | `HSET`, `HMSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HMGET`, `HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD` |
@@ -58,6 +59,7 @@ Compatibility notes:
 - `XADD` currently returns `ERR stream type not supported`.
 - Some server/introspection subcommands are compatibility shims and return static or empty responses.
 - `SELECT` only supports database index `0`.
+- Transactions (`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH`) are supported in classic mode. Commands are queued after `MULTI` and run on `EXEC`; a `WATCH`ed key modified before `EXEC` aborts the transaction (`EXEC` returns nil). A command that fails to queue aborts the transaction with `EXECABORT`.
 
 TTL and expiry return semantics match Redis-style integer responses:
 
@@ -160,7 +162,7 @@ All settings are read from environment variables at startup.
 | `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `lru`, `mru`, or `none` |
 | `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0-1.0) at which eviction starts |
 | `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lru,ns2:mru` |
-| `KVNS_SHARDED_MODE` | `false` | Enable experimental sharded lock backend (currently supports `PING`, `QUIT`, `SET`, `GET`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `INCR`, `INCRBY`, `DECR`, `DECRBY`) |
+| `KVNS_SHARDED_MODE` | `false` | Enable experimental sharded lock backend (currently supports `PING`, `QUIT`, `SELECT`, `DBSIZE`, `SET`, `GET`, `GETSET`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `APPEND`, `STRLEN`, `TYPE`, `INCR`, `INCRBY`, `DECR`, `DECRBY`) |
 | `KVNS_SHARD_COUNT` | `4 * CPU cores` | Number of lock shards when `KVNS_SHARDED_MODE=true` |
 | `KVNS_MAX_CLIENTS` | `10000` | Maximum concurrent client connections accepted |
 | `KVNS_MAX_RESP_ARGS` | `1024` | Maximum number of arguments/elements accepted in one RESP command |
@@ -190,6 +192,8 @@ Sharded mode notes:
 
 - `KVNS_SHARDED_MODE` is experimental and currently optimized for throughput-oriented string workloads.
 - Under concurrent writers, multi-key command atomicity may differ from classic mode.
+- Persistence is not available in sharded mode; `KVNS_PERSIST_PATH` is ignored.
+- Transactions (`MULTI`/`EXEC`/...) are classic-mode only.
 
 Memory limit behavior:
 
