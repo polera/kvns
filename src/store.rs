@@ -345,7 +345,9 @@ impl Db {
         }
     }
 
-    /// Builder-style setter for eviction configuration.
+    /// Builder-style setter for eviction configuration. Test-only; production
+    /// configures eviction per-shard via `StoreShards::with_eviction`.
+    #[cfg(test)]
     pub(crate) fn with_eviction(
         mut self,
         threshold: f64,
