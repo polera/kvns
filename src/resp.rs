@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+#[cfg(not(target_os = "linux"))]
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 use crate::config::{
@@ -28,13 +29,13 @@ fn invalid_data(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 fn parse_i64(bytes: &[u8], err_msg: &'static str) -> std::io::Result<i64> {
     let s = std::str::from_utf8(bytes).map_err(|_| invalid_data(err_msg))?;
     s.parse::<i64>().map_err(|_| invalid_data(err_msg))
 }
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 fn parse_bulk_len(hdr: &[u8]) -> std::io::Result<i64> {
     let body = hdr
         .strip_prefix(b"$")
@@ -42,7 +43,7 @@ fn parse_bulk_len(hdr: &[u8]) -> std::io::Result<i64> {
     parse_i64(body, "bad len")
 }
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &'a mut Vec<u8>,
@@ -95,7 +96,7 @@ async fn read_resp_line<'a, R: AsyncBufRead + Unpin>(
 /// `out` is cleared and refilled on every call; inner `Vec<u8>` allocations are
 /// reused across calls (the same `out` should be passed on every iteration of
 /// the connection loop).
-#[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn parse_resp_with_limits<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limits: RespLimits,
@@ -225,7 +226,7 @@ fn reuse_slot(out: &mut Vec<Vec<u8>>, idx: usize, data: &[u8]) {
 
 /// Resize slot `idx` of `out` to exactly `len` bytes and return a mutable reference.
 /// Reuses the existing Vec allocation when capacity allows.
-#[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 fn reuse_slot_uninit(out: &mut Vec<Vec<u8>>, idx: usize, len: usize) -> &mut [u8] {
     if idx < out.len() {
         let slot = &mut out[idx];
@@ -239,7 +240,7 @@ fn reuse_slot_uninit(out: &mut Vec<Vec<u8>>, idx: usize, len: usize) -> &mut [u8
 }
 
 /// Read exactly `n` RESP bulk strings into `out` (reusing existing slots).
-#[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 async fn read_bulk_strings_into<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     n: usize,
@@ -822,5 +823,487 @@ mod tests {
         // =9\r\ntxt:hello\r\n
         assert!(out.starts_with(b"=9\r\n"));
         assert!(out.ends_with(b"txt:hello\r\n"));
+    }
+
+    // ── Basic response builder tests ────────────────────────────────────────
+
+    #[test]
+    fn test_resp_ok() {
+        assert_eq!(&*resp_ok(), b"+OK\r\n");
+    }
+
+    #[test]
+    fn test_resp_pong() {
+        assert_eq!(&*resp_pong(), b"+PONG\r\n");
+    }
+
+    #[test]
+    fn test_resp_null() {
+        assert_eq!(&*resp_null(), b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_resp_int_positive() {
+        assert_eq!(&*resp_int(42), b":42\r\n");
+    }
+
+    #[test]
+    fn test_resp_int_negative() {
+        assert_eq!(&*resp_int(-7), b":-7\r\n");
+    }
+
+    #[test]
+    fn test_resp_int_zero() {
+        assert_eq!(&*resp_int(0), b":0\r\n");
+    }
+
+    #[test]
+    fn test_resp_usize_delegates_to_resp_int() {
+        assert_eq!(&*resp_usize(100), &*resp_int(100));
+        assert_eq!(&*resp_usize(0), &*resp_int(0));
+    }
+
+    #[test]
+    fn test_resp_err() {
+        assert_eq!(&*resp_err("something broke"), b"-ERR something broke\r\n");
+    }
+
+    #[test]
+    fn test_resp_wrongtype() {
+        let out = resp_wrongtype();
+        assert!(out.starts_with(b"-WRONGTYPE"));
+        assert!(out.ends_with(b"\r\n"));
+    }
+
+    // ── Pre-formatted error string tests ────────────────────────────────────
+
+    #[test]
+    fn test_resp_err_oom() {
+        let out = resp_err_oom();
+        assert!(out.starts_with(b"-ERR OOM"));
+        assert!(out.ends_with(b"\r\n"));
+        // Must be Cow::Borrowed
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_not_integer() {
+        let out = resp_err_not_integer();
+        assert_eq!(&*out, b"-ERR value is not an integer or out of range\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_not_float() {
+        let out = resp_err_not_float();
+        assert_eq!(&*out, b"-ERR value is not a valid float\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_syntax() {
+        let out = resp_err_syntax();
+        assert_eq!(&*out, b"-ERR syntax error\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_no_such_key() {
+        let out = resp_err_no_such_key();
+        assert_eq!(&*out, b"-ERR no such key\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_invalid_expire_time() {
+        let out = resp_err_invalid_expire_time();
+        assert_eq!(&*out, b"-ERR invalid expire time\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_min_or_max_not_float() {
+        let out = resp_err_min_or_max_not_float();
+        assert_eq!(&*out, b"-ERR min or max is not a float\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_invalid_lex_range() {
+        let out = resp_err_invalid_lex_range();
+        assert_eq!(&*out, b"-ERR invalid lex range\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_resp_err_unknown_subcommand() {
+        let out = resp_err_unknown_subcommand();
+        assert_eq!(&*out, b"-ERR unknown subcommand\r\n");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    // ── Vec mutation helper tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_append_array_header() {
+        let mut out = Vec::new();
+        append_array_header(&mut out, 3);
+        assert_eq!(&out, b"*3\r\n");
+    }
+
+    #[test]
+    fn test_append_int() {
+        let mut out = Vec::new();
+        append_int(&mut out, 99);
+        assert_eq!(&out, b":99\r\n");
+
+        out.clear();
+        append_int(&mut out, -1);
+        assert_eq!(&out, b":-1\r\n");
+    }
+
+    #[test]
+    fn test_append_null() {
+        let mut out = Vec::new();
+        append_null(&mut out);
+        assert_eq!(&out, b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_append_bulk() {
+        let mut out = Vec::new();
+        append_bulk(&mut out, b"hello");
+        assert_eq!(&out, b"$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_append_bulk_empty() {
+        let mut out = Vec::new();
+        append_bulk(&mut out, b"");
+        assert_eq!(&out, b"$0\r\n\r\n");
+    }
+
+    // ── Higher-level builder tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_resp_bulk() {
+        assert_eq!(&*resp_bulk(b"foo"), b"$3\r\nfoo\r\n");
+    }
+
+    #[test]
+    fn test_resp_bulk_empty() {
+        assert_eq!(&*resp_bulk(b""), b"$0\r\n\r\n");
+    }
+
+    #[test]
+    fn test_resp_array() {
+        let items = vec![b"foo".to_vec(), b"bar".to_vec()];
+        let out = resp_array(&items);
+        assert_eq!(&*out, b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    }
+
+    #[test]
+    fn test_resp_array_empty() {
+        let items: Vec<Vec<u8>> = vec![];
+        let out = resp_array(&items);
+        assert_eq!(&*out, b"*0\r\n");
+    }
+
+    #[test]
+    fn test_build_array() {
+        let slices: Vec<&[u8]> = vec![b"a", b"bb"];
+        let out = build_array(slices.len(), slices.iter().copied());
+        assert_eq!(&*out, b"*2\r\n$1\r\na\r\n$2\r\nbb\r\n");
+    }
+
+    #[test]
+    fn test_wrong_args() {
+        let out = wrong_args(b"SET");
+        assert_eq!(
+            &*out,
+            b"-ERR wrong number of arguments for SET\r\n"
+        );
+    }
+
+    // ── RESP3 type tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resp_big_number() {
+        assert_eq!(&*resp_big_number("12345678901234567890"), b"(12345678901234567890\r\n");
+    }
+
+    #[test]
+    fn test_resp_blob_error() {
+        let out = resp_blob_error("CUSTOM", "something failed");
+        // payload = "CUSTOM something failed" (len 23)
+        assert_eq!(
+            &*out,
+            b"!23\r\nCUSTOM something failed\r\n"
+        );
+    }
+
+    #[test]
+    fn test_resp_set_type() {
+        let items = vec![b"a".to_vec(), b"b".to_vec()];
+        let out = resp_set_type(&items);
+        assert_eq!(&*out, b"~2\r\n$1\r\na\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn test_resp_set_type_empty() {
+        let items: Vec<Vec<u8>> = vec![];
+        let out = resp_set_type(&items);
+        assert_eq!(&*out, b"~0\r\n");
+    }
+
+    #[test]
+    fn test_resp_push() {
+        let items = vec![b"message".to_vec(), b"hello".to_vec()];
+        let out = resp_push(&items);
+        assert_eq!(&*out, b">2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_resp_push_empty() {
+        let items: Vec<Vec<u8>> = vec![];
+        let out = resp_push(&items);
+        assert_eq!(&*out, b">0\r\n");
+    }
+
+    #[test]
+    fn test_resp_double_nan() {
+        assert_eq!(&*resp_double(f64::NAN), b",nan\r\n");
+    }
+
+    #[test]
+    fn test_resp_double_regular() {
+        assert_eq!(&*resp_double(2.5), b",2.5\r\n");
+    }
+
+    #[test]
+    fn test_resp_double_zero() {
+        assert_eq!(&*resp_double(0.0), b",0\r\n");
+    }
+
+    // Pin the Redis-style "trim integer-valued doubles" output. Redis formats
+    // doubles with Grisu (`fpconv_dtoa`), which emits a bare integer with no
+    // trailing `.0` — matched here by Rust's `f64::Display`. Guards against a
+    // regression to a formatter (e.g. `ryu`) that would emit `,1.0\r\n` and
+    // diverge from real Redis.
+    #[test]
+    fn test_resp_double_integer_valued_is_trimmed() {
+        assert_eq!(&*resp_double(1.0), b",1\r\n");
+        assert_eq!(&*resp_double(5.0), b",5\r\n");
+        assert_eq!(&*resp_double(-3.0), b",-3\r\n");
+        assert_eq!(&*resp_double(100.0), b",100\r\n");
+    }
+
+    #[test]
+    fn test_resp_double_negative_zero() {
+        // `f64::Display` preserves the sign of negative zero, so -0.0 serializes
+        // distinctly from +0.0. Pins current behavior (edge case).
+        assert_eq!(&*resp_double(-0.0), b",-0\r\n");
+        assert_eq!(&*resp_double(0.0), b",0\r\n");
+    }
+
+    #[test]
+    fn test_resp_double_fractional() {
+        assert_eq!(&*resp_double(3.25), b",3.25\r\n");
+        assert_eq!(&*resp_double(-2.5), b",-2.5\r\n");
+    }
+
+    // ── Sync parser helper tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_sync_read_line_crlf() {
+        let (line, consumed) = sync_read_line(b"hello\r\n").unwrap();
+        assert_eq!(line, b"hello");
+        assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn test_sync_read_line_lf_only() {
+        let (line, consumed) = sync_read_line(b"hello\n").unwrap();
+        assert_eq!(line, b"hello");
+        assert_eq!(consumed, 6);
+    }
+
+    #[test]
+    fn test_sync_read_line_no_newline() {
+        assert!(sync_read_line(b"hello").is_none());
+    }
+
+    #[test]
+    fn test_sync_read_line_empty() {
+        let (line, consumed) = sync_read_line(b"\r\n").unwrap();
+        assert_eq!(line, b"");
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn test_sync_parse_i64_valid() {
+        assert_eq!(sync_parse_i64(b"42"), Some(42));
+        assert_eq!(sync_parse_i64(b"-7"), Some(-7));
+        assert_eq!(sync_parse_i64(b"0"), Some(0));
+    }
+
+    #[test]
+    fn test_sync_parse_i64_invalid() {
+        assert!(sync_parse_i64(b"abc").is_none());
+        assert!(sync_parse_i64(b"").is_none());
+        assert!(sync_parse_i64(b"12.5").is_none());
+    }
+
+    // ── parse_resp_sync tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_resp_sync_array_command() {
+        let data = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"SET", b"foo", b"bar"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_inline() {
+        let data = b"PING\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"PING"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_incomplete() {
+        // Only partial array header, no bulk strings yet
+        let data = b"*3\r\n$3\r\nSET\r\n";
+        let mut out = Vec::new();
+        let result = parse_resp_sync(data, RespLimits::default(), &mut out).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_resp_sync_incomplete_no_newline() {
+        let data = b"PING";
+        let mut out = Vec::new();
+        let result = parse_resp_sync(data, RespLimits::default(), &mut out).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_null() {
+        let data = b"_\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_bool_true() {
+        let data = b"#t\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"1"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_bool_false() {
+        let data = b"#f\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"0"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_double() {
+        let data = b",3.14\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"3.14"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_big_number() {
+        let data = b"(42\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"42"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_set_type() {
+        let data = b"~2\r\n$1\r\na\r\n$1\r\nb\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"a", b"b"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_resp3_map_type() {
+        let data = b"%1\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert_eq!(out, vec![b"k", b"v"]);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_rejects_too_many_bulk_strings() {
+        let data = b"*2\r\n$4\r\nPING\r\n$4\r\nPONG\r\n";
+        let limits = RespLimits {
+            max_array_len: 1,
+            ..RespLimits::default()
+        };
+        let mut out = Vec::new();
+        let err = parse_resp_sync(data, limits, &mut out)
+            .expect_err("should reject oversized array");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_parse_resp_sync_null_array() {
+        let data = b"*-1\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_parse_resp_sync_empty_line() {
+        let data = b"\r\n";
+        let mut out = Vec::new();
+        let consumed = parse_resp_sync(data, RespLimits::default(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, data.len());
+        assert!(out.is_empty());
     }
 }

@@ -24,7 +24,10 @@ impl ZSetData {
     }
 }
 
-use tokio::sync::RwLock;
+use std::hash::{BuildHasher, Hash, Hasher};
+
+use ahash::RandomState;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::config::EvictionPolicy;
 
@@ -521,36 +524,64 @@ impl Db {
         key: &str,
         entry: Entry,
     ) -> StoreMetrics {
-        let namespace = namespace.to_owned();
-        let key = key.to_owned();
         // A fresh write cancels any pending EAR eviction for this key.
-        self.ear_pending.remove(&(namespace.clone(), key.clone()));
-        let new_size = Self::entry_size(&namespace, &key, entry.value.byte_len());
-        let old_size = self
-            .entries
-            .get(&namespace)
-            .and_then(|ns| ns.get(&key))
-            .map(|e| Self::entry_size(&namespace, &key, e.value.byte_len()))
+        // `ear_pending` is empty unless an EAR namespace is configured, so skip
+        // the two String allocations the tuple lookup would otherwise cost on
+        // every write.
+        if !self.ear_pending.is_empty() {
+            self.ear_pending
+                .remove(&(namespace.to_owned(), key.to_owned()));
+        }
+
+        let new_size = Self::entry_size(namespace, key, entry.value.byte_len());
+
+        // Look the namespace's entry map up once (only allocating the namespace
+        // String on first use), then reuse it for the old-size delta, the
+        // insert, and the key count.
+        let ns_map = match self.entries.get_mut(namespace) {
+            Some(m) => m,
+            None => self.entries.entry(namespace.to_owned()).or_default(),
+        };
+        let old_size = ns_map
+            .get(key)
+            .map(|e| Self::entry_size(namespace, key, e.value.byte_len()))
             .unwrap_or(0);
+        // Overwrite in place when the key exists (no key allocation); only
+        // allocate the key String when inserting a new one.
+        match ns_map.get_mut(key) {
+            Some(slot) => *slot = entry,
+            None => {
+                ns_map.insert(key.to_owned(), entry);
+            }
+        }
+        let ns_keys = ns_map.len();
+
         self.used_bytes = self
             .used_bytes
             .saturating_sub(old_size)
             .saturating_add(new_size);
-        let nb = self.namespace_bytes.entry(namespace.clone()).or_insert(0);
+
+        let nb = match self.namespace_bytes.get_mut(namespace) {
+            Some(nb) => nb,
+            None => self.namespace_bytes.entry(namespace.to_owned()).or_insert(0),
+        };
         *nb = nb.saturating_sub(old_size).saturating_add(new_size);
         let ns_bytes = *nb;
+
         self.write_version += 1;
-        self.key_versions
-            .entry(namespace.clone())
-            .or_default()
-            .insert(key.clone(), self.write_version);
-        self.entries
-            .entry(namespace.clone())
-            .or_default()
-            .insert(key, entry);
-        let ns_keys = self.entries[&namespace].len();
+        let key_versions = match self.key_versions.get_mut(namespace) {
+            Some(kv) => kv,
+            None => self.key_versions.entry(namespace.to_owned()).or_default(),
+        };
+        match key_versions.get_mut(key) {
+            Some(v) => *v = self.write_version,
+            None => {
+                key_versions.insert(key.to_owned(), self.write_version);
+            }
+        }
+
         StoreMetrics {
-            namespace,
+            namespace: namespace.to_owned(),
             ns_keys,
             ns_bytes,
             total_bytes: self.used_bytes,
@@ -598,8 +629,12 @@ impl Db {
         namespace: &str,
         key: &str,
     ) -> (Option<Entry>, StoreMetrics) {
-        let ns_key = (namespace.to_owned(), key.to_owned());
-        self.ear_pending.remove(&ns_key);
+        // `ear_pending` is empty unless an EAR namespace is configured; skip the
+        // tuple allocation on every delete in the common case.
+        if !self.ear_pending.is_empty() {
+            self.ear_pending
+                .remove(&(namespace.to_owned(), key.to_owned()));
+        }
         self.write_version += 1;
         if let Some(m) = self.key_versions.get_mut(namespace) {
             m.remove(key);
@@ -657,7 +692,138 @@ impl Db {
     }
 }
 
-pub(crate) type Store = Arc<RwLock<Db>>;
+/// The classic store, sharded into `N` independently-locked `Db` partitions.
+///
+/// A key's `(namespace, local_key)` hash selects exactly one shard, so
+/// single-key commands contend only with other commands touching the same
+/// shard — replacing the former single global write lock. Each shard is a full
+/// `Db` (all data types, WATCH versioning, EAR, eviction), so single-key
+/// command bodies operate on `&mut Db` exactly as before.
+///
+/// Memory limit is divided evenly across shards (`limit / N`). With even key
+/// distribution this approximates a global limit; eviction runs per shard.
+/// Multi-key and global commands (MSET, RENAME, KEYS, FLUSHDB, persistence,
+/// …) lock the relevant shards — or all of them, in index order to avoid
+/// deadlock — via [`StoreShards::write_all`] / [`StoreShards::read_all`].
+pub(crate) struct StoreShards {
+    shards: Box<[RwLock<Db>]>,
+    hasher: RandomState,
+}
+
+impl StoreShards {
+    pub(crate) fn new(memory_limit: usize, shard_count: usize) -> Self {
+        let n = shard_count.max(1);
+        // Split the global budget across shards; never zero.
+        let per_shard_limit = (memory_limit / n).max(1);
+        let shards = (0..n)
+            .map(|_| RwLock::new(Db::new(per_shard_limit)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            shards,
+            hasher: RandomState::new(),
+        }
+    }
+
+    /// Apply eviction configuration to every shard.
+    pub(crate) fn with_eviction(
+        self,
+        threshold: f64,
+        policy: EvictionPolicy,
+        namespace_policies: HashMap<String, EvictionPolicy>,
+    ) -> Self {
+        for shard in self.shards.iter() {
+            let mut db = shard.write();
+            db.eviction_threshold = threshold;
+            db.eviction_policy = policy.clone();
+            db.namespace_eviction_policies = namespace_policies.clone();
+        }
+        self
+    }
+
+    /// Which shard owns `(namespace, key)`. Mirrors the sharded backend's
+    /// hashing so distribution is uniform.
+    pub(crate) fn shard_index(&self, ns: &str, key: &str) -> usize {
+        let mut h = self.hasher.build_hasher();
+        ns.as_bytes().hash(&mut h);
+        key.as_bytes().hash(&mut h);
+        (h.finish() as usize) % self.shards.len()
+    }
+
+    /// Write-lock the single shard owning `(ns, key)`.
+    pub(crate) fn write_shard(&self, ns: impl AsRef<str>, key: impl AsRef<str>) -> RwLockWriteGuard<'_, Db> {
+        self.shards[self.shard_index(ns.as_ref(), key.as_ref())].write()
+    }
+
+    /// Read-lock the single shard owning `(ns, key)`.
+    pub(crate) fn read_shard(&self, ns: impl AsRef<str>, key: impl AsRef<str>) -> RwLockReadGuard<'_, Db> {
+        self.shards[self.shard_index(ns.as_ref(), key.as_ref())].read()
+    }
+
+    /// Write-lock every shard, in index order (deadlock-free). Use for multi-key
+    /// writes and global mutations (FLUSHDB, RENAME across shards, …).
+    pub(crate) fn write_all(&self) -> Vec<RwLockWriteGuard<'_, Db>> {
+        self.shards.iter().map(|s| s.write()).collect()
+    }
+
+    /// Read-lock every shard, in index order. Use for global reads (KEYS, SCAN,
+    /// DBSIZE, INFO, persistence snapshot, …).
+    pub(crate) fn read_all(&self) -> Vec<RwLockReadGuard<'_, Db>> {
+        self.shards.iter().map(|s| s.read()).collect()
+    }
+
+    /// WATCH/EXEC helper: current write-version of `(ns, key)` from its shard.
+    pub(crate) fn key_version(&self, ns: impl AsRef<str>, key: impl AsRef<str>) -> u64 {
+        let (ns, key) = (ns.as_ref(), key.as_ref());
+        self.read_shard(ns, key).key_version(ns, key)
+    }
+
+    /// Total bytes used across all shards.
+    pub(crate) fn used_bytes(&self) -> usize {
+        self.shards.iter().map(|s| s.read().used_bytes).sum()
+    }
+
+    /// Total non-expired keys across all shards.
+    pub(crate) fn total_keys(&self) -> usize {
+        self.shards.iter().map(|s| s.read().total_keys()).sum()
+    }
+
+    /// Merge every shard's entries into a single `namespace -> key -> Entry`
+    /// map (used for persistence snapshots). Acquires shards one at a time.
+    pub(crate) fn snapshot_entries(&self) -> HashMap<String, HashMap<String, Entry>> {
+        let mut out: HashMap<String, HashMap<String, Entry>> = HashMap::new();
+        for shard in self.shards.iter() {
+            let db = shard.read();
+            for (ns, ns_map) in &db.entries {
+                let dst = out.entry(ns.clone()).or_default();
+                for (key, entry) in ns_map {
+                    dst.insert(key.clone(), entry.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Distribute a flat `namespace -> key -> Entry` map (e.g. loaded from disk)
+    /// into the appropriate shards. Used at startup.
+    pub(crate) fn load_entries(&self, entries: HashMap<String, HashMap<String, Entry>>) {
+        for (ns, ns_map) in entries {
+            for (key, entry) in ns_map {
+                let mut db = self.write_shard(&ns, &key);
+                db.put(&ns, &key, entry);
+            }
+        }
+    }
+
+    /// Clear every shard (FLUSHALL / FLUSHDB).
+    pub(crate) fn flush_all(&self) {
+        for shard in self.shards.iter() {
+            shard.write().flush_all();
+        }
+    }
+}
+
+pub(crate) type Store = Arc<StoreShards>;
 
 #[cfg(test)]
 mod tests {

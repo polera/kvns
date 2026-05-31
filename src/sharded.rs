@@ -483,7 +483,7 @@ fn parse_i64_arg(raw: &[u8]) -> Result<i64, Cow<'static, [u8]>> {
     std::str::from_utf8(raw)
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-        .ok_or_else(|| resp_err_not_integer())
+        .ok_or_else(resp_err_not_integer)
 }
 
 /// Dispatch a RESP command against the sharded store.
@@ -850,5 +850,274 @@ mod tests {
         // Value is updated.
         let r3 = dispatch(&mut args(&["GET", "k"]), &store).0;
         assert_eq!(&*r3, b"$5\r\nnewer\r\n");
+    }
+
+    // ---- Untested commands ----
+
+    #[tokio::test]
+    async fn strlen_existing_and_missing() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let _ = dispatch(&mut args(&["SET", "k", "hello"]), &store);
+        assert_eq!(
+            &*(dispatch(&mut args(&["STRLEN", "k"]), &store).0),
+            b":5\r\n"
+        );
+        assert_eq!(
+            &*(dispatch(&mut args(&["STRLEN", "missing"]), &store).0),
+            b":0\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn type_existing_and_missing() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let _ = dispatch(&mut args(&["SET", "k", "v"]), &store);
+        assert_eq!(
+            &*(dispatch(&mut args(&["TYPE", "k"]), &store).0),
+            b"$6\r\nstring\r\n"
+        );
+        assert_eq!(
+            &*(dispatch(&mut args(&["TYPE", "missing"]), &store).0),
+            b"$4\r\nnone\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn getdel_returns_value_and_deletes() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let _ = dispatch(&mut args(&["SET", "k", "val"]), &store);
+        // GETDEL returns the value
+        assert_eq!(
+            &*(dispatch(&mut args(&["GETDEL", "k"]), &store).0),
+            b"$3\r\nval\r\n"
+        );
+        // Key is now gone
+        assert_eq!(
+            &*(dispatch(&mut args(&["GET", "k"]), &store).0),
+            b"$-1\r\n"
+        );
+        // GETDEL on missing key returns null
+        assert_eq!(
+            &*(dispatch(&mut args(&["GETDEL", "nokey"]), &store).0),
+            b"$-1\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dbsize_counts_keys() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        assert_eq!(
+            &*(dispatch(&mut args(&["DBSIZE"]), &store).0),
+            b":0\r\n"
+        );
+        let _ = dispatch(&mut args(&["SET", "a", "1"]), &store);
+        let _ = dispatch(&mut args(&["SET", "b", "2"]), &store);
+        let _ = dispatch(&mut args(&["SET", "c", "3"]), &store);
+        assert_eq!(
+            &*(dispatch(&mut args(&["DBSIZE"]), &store).0),
+            b":3\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_returns_pong() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let (resp, quit) = dispatch(&mut args(&["PING"]), &store);
+        assert_eq!(&*resp, b"+PONG\r\n");
+        assert!(!quit);
+    }
+
+    #[tokio::test]
+    async fn quit_returns_ok_and_signals_close() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let (resp, quit) = dispatch(&mut args(&["QUIT"]), &store);
+        assert_eq!(&*resp, b"+OK\r\n");
+        assert!(quit, "QUIT must set the close flag to true");
+    }
+
+    #[tokio::test]
+    async fn select_zero_ok_nonzero_error() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        assert_eq!(
+            &*(dispatch(&mut args(&["SELECT", "0"]), &store).0),
+            b"+OK\r\n"
+        );
+        let resp = dispatch(&mut args(&["SELECT", "1"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "SELECT 1 must return an error, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn getex_without_extra_args_acts_as_get() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let _ = dispatch(&mut args(&["SET", "k", "val"]), &store);
+        assert_eq!(
+            &*(dispatch(&mut args(&["GETEX", "k"]), &store).0),
+            b"$3\r\nval\r\n"
+        );
+        // Missing key
+        assert_eq!(
+            &*(dispatch(&mut args(&["GETEX", "missing"]), &store).0),
+            b"$-1\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn getex_with_extra_args_errors() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        let _ = dispatch(&mut args(&["SET", "k", "val"]), &store);
+        let resp = dispatch(&mut args(&["GETEX", "k", "EX", "100"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "GETEX with extra args must error in sharded mode"
+        );
+    }
+
+    // ---- Wrong-args edge cases ----
+
+    #[tokio::test]
+    async fn get_no_key_wrong_args() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let resp = dispatch(&mut args(&["GET"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR wrong number of arguments"),
+            "GET with no key: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_too_few_args_error() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        // SET with only command + key (missing value) → 2 args total
+        let resp = dispatch(&mut args(&["SET", "k"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "SET with 2 args should error: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn mget_no_keys_wrong_args() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let resp = dispatch(&mut args(&["MGET"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR wrong number of arguments"),
+            "MGET with no keys: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn mset_odd_args_wrong_args() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        // MSET with odd key-value count
+        let resp = dispatch(&mut args(&["MSET", "a", "1", "b"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR wrong number of arguments"),
+            "MSET with odd args: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn incr_too_many_args_wrong_args() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let resp = dispatch(&mut args(&["INCR", "k", "extra"]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR wrong number of arguments"),
+            "INCR with too many args: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn decrby_i64_min_overflow() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        // i64::MIN as string → checked_neg() overflows
+        let min_str = i64::MIN.to_string();
+        let resp = dispatch(&mut args(&["DECRBY", "k", &min_str]), &store).0;
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "DECRBY i64::MIN should overflow: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_invalid_ttl_option_syntax_error() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let resp = dispatch(&mut args(&["SET", "k", "v", "XX", "100"]), &store).0;
+        assert_eq!(&*resp, b"-ERR syntax error\r\n");
+    }
+
+    #[tokio::test]
+    async fn set_non_numeric_ttl_value() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let resp = dispatch(&mut args(&["SET", "k", "v", "PX", "abc"]), &store).0;
+        assert_eq!(&*resp, b"-ERR invalid expire time\r\n");
+    }
+
+    #[tokio::test]
+    async fn empty_command_error() {
+        let store = ShardedDb::new(1024 * 1024, 4);
+        let resp = dispatch(&mut args(&[]) as &mut [Vec<u8>], &store).0;
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "Empty command should error: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    // ---- OOM edge cases ----
+
+    #[tokio::test]
+    async fn set_oom_error() {
+        // Memory limit so small that SET will fail
+        let store = ShardedDb::new(1, 4);
+        let resp = dispatch(&mut args(&["SET", "k", "some_value"]), &store).0;
+        assert_eq!(
+            &*resp,
+            b"-ERR OOM command not allowed when used memory > 'maxmemory'\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_oom_error() {
+        // Memory limit so small that APPEND will fail
+        let store = ShardedDb::new(1, 4);
+        let resp = dispatch(&mut args(&["APPEND", "k", "some_value"]), &store).0;
+        assert_eq!(
+            &*resp,
+            b"-ERR OOM command not allowed when used memory > 'maxmemory'\r\n"
+        );
+    }
+
+    // ---- Namespace handling ----
+
+    #[tokio::test]
+    async fn namespace_prefix_isolates_keys() {
+        let store = ShardedDb::new(1024 * 1024, 8);
+        // Set bare key "k" and namespaced key "ns/k"
+        let _ = dispatch(&mut args(&["SET", "k", "bare"]), &store);
+        let _ = dispatch(&mut args(&["SET", "ns/k", "namespaced"]), &store);
+        // They are distinct
+        assert_eq!(
+            &*(dispatch(&mut args(&["GET", "k"]), &store).0),
+            b"$4\r\nbare\r\n"
+        );
+        assert_eq!(
+            &*(dispatch(&mut args(&["GET", "ns/k"]), &store).0),
+            b"$10\r\nnamespaced\r\n"
+        );
+        // DBSIZE should show 2 keys
+        assert_eq!(
+            &*(dispatch(&mut args(&["DBSIZE"]), &store).0),
+            b":2\r\n"
+        );
     }
 }

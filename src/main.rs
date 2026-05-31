@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ fn install_metrics(config: &config::Config) {
 
 /// Build the backend (sharded or classic) and optionally return the classic store
 /// for persistence / EAR sweep.  Spawns background tasks onto the current tokio runtime.
-fn build_backend(config: &config::Config) -> (server::Backend, Option<Arc<RwLock<store::Db>>>) {
+fn build_backend(config: &config::Config) -> (server::Backend, Option<store::Store>) {
     if config.sharded_mode {
         if config.persist_path.is_some() {
             warn!("KVNS_PERSIST_PATH is ignored in sharded mode");
@@ -60,33 +60,29 @@ fn build_backend(config: &config::Config) -> (server::Backend, Option<Arc<RwLock
             None,
         )
     } else {
-        let initial_db = match &config.persist_path {
-            None => store::Db::new(config.memory_limit),
-            Some(path) => {
-                let p = PathBuf::from(path);
-                match persist::load(&p, config.memory_limit) {
-                    Ok(db) => {
-                        let key_count: usize = db.entries.values().map(|ns| ns.len()).sum();
-                        info!(path = %path, keys = key_count, "loaded store from disk");
-                        db
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        info!(path = %path, "no existing store file, starting fresh");
-                        store::Db::new(config.memory_limit)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, path = %path, "failed to load store from disk, starting fresh");
-                        store::Db::new(config.memory_limit)
-                    }
+        let store = Arc::new(
+            store::StoreShards::new(config.memory_limit, config.shard_count).with_eviction(
+                config.eviction_threshold,
+                config.eviction_policy.clone(),
+                config.namespace_eviction_policies.clone(),
+            ),
+        );
+        if let Some(path) = &config.persist_path {
+            let p = PathBuf::from(path);
+            match persist::load(&p, config.memory_limit) {
+                Ok(db) => {
+                    let key_count: usize = db.entries.values().map(|ns| ns.len()).sum();
+                    store.load_entries(db.entries);
+                    info!(path = %path, keys = key_count, "loaded store from disk");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    info!(path = %path, "no existing store file, starting fresh");
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %path, "failed to load store from disk, starting fresh");
                 }
             }
-        };
-        let initial_db = initial_db.with_eviction(
-            config.eviction_threshold,
-            config.eviction_policy.clone(),
-            config.namespace_eviction_policies.clone(),
-        );
-        let store = Arc::new(RwLock::new(initial_db));
+        }
         if let Some(ref path) = config.persist_path {
             tokio::spawn(persist::run_periodic_flush(
                 Arc::clone(&store),
@@ -113,10 +109,10 @@ fn build_server_limits(config: &config::Config) -> server::ServerLimits {
     }
 }
 
-async fn shutdown_flush(persist_path: Option<&String>, classic_store: Option<&Arc<RwLock<store::Db>>>) {
+async fn shutdown_flush(persist_path: Option<&String>, classic_store: Option<&store::Store>) {
     if let (Some(path), Some(store)) = (persist_path, classic_store) {
         info!(path = %path, "flushing store to disk on shutdown");
-        let snapshot = { let db = store.read().await; db.entries.clone() };
+        let snapshot = store.snapshot_entries();
         let shutdown_path = PathBuf::from(path);
         match tokio::task::spawn_blocking(move || persist::save_entries(&snapshot, &shutdown_path)).await {
             Ok(Ok(())) => info!(path = %path, "store flushed to disk"),
@@ -149,7 +145,7 @@ fn main() {
     // Everything else is set up inside tokio_uring::start on the first thread,
     // then cloned into subsequent threads.  We use a channel to hand the
     // constructed shared state to the worker threads.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(server::Backend, pubsub::PubSubHub, Arc<Semaphore>, server::ServerLimits, Option<Arc<RwLock<store::Db>>>, Option<String>)>(0);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(server::Backend, pubsub::PubSubHub, Arc<Semaphore>, server::ServerLimits, Option<store::Store>, Option<String>)>(0);
 
     // Thread 0: build shared state, then run the accept loop.
     let addr0 = addr.clone();
