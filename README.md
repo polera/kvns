@@ -13,7 +13,7 @@ This project is an experiment and in part uses code generated with models from A
 - Redis-like command surface across strings, lists, hashes, sets, and sorted sets
 - Key namespacing via `namespace/key` syntax
 - TTL/expiry management (`EXPIRE*`, `PEXPIRE*`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`)
-- Configurable memory limit with OOM rejection or namespace-scoped eviction (`lru`, `mru`)
+- Configurable memory limit with OOM rejection or namespace-scoped eviction (`lfu`, `mfu`)
 - Memory-limit guardrails when configured (`KVNS_MEMORY_LIMIT` is capped at 70% of host RAM)
 - Optional on-disk persistence with periodic flush and shutdown flush
 - Prometheus metrics endpoint with per-namespace labels
@@ -159,9 +159,9 @@ All settings are read from environment variables at startup.
 | `KVNS_PERSIST_PATH` | *(unset)* | Persistence file path; persistence is disabled if unset |
 | `KVNS_PERSIST_INTERVAL` | `300` | Seconds between automatic flushes |
 | `KVNS_SHARED_VALUES` | `true` | When `true`, entry values are stored via `Arc` so persistence snapshots clone pointers instead of payload bytes. See [Value sharing](#value-sharing). |
-| `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `lru`, `mru`, or `none` |
+| `KVNS_EVICTION_POLICY` | `none` | Global eviction policy: `none`, `lfu`, `mfu`, or `ear`. An unrecognized value aborts startup. |
 | `KVNS_EVICTION_THRESHOLD` | `1.0` | Fraction of memory limit (0.0-1.0) at which eviction starts |
-| `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lru,ns2:mru` |
+| `KVNS_NS_EVICTION` | *(unset)* | Per-namespace policy overrides, e.g. `ns1:lfu,ns2:mfu`. An unrecognized policy aborts startup. |
 | `KVNS_SHARDED_MODE` | `false` | Enable experimental sharded lock backend (currently supports `PING`, `QUIT`, `SELECT`, `DBSIZE`, `SET`, `GET`, `GETSET`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `MSETNX`, `SETNX`, `APPEND`, `STRLEN`, `TYPE`, `INCR`, `INCRBY`, `DECR`, `DECRBY`) |
 | `KVNS_SHARD_COUNT` | `4 * CPU cores` | Number of lock shards when `KVNS_SHARDED_MODE=true` |
 | `KVNS_MAX_CLIENTS` | `10000` | Maximum concurrent client connections accepted |
@@ -178,11 +178,11 @@ KVNS_PORT=6379 KVNS_MEMORY_LIMIT=536870912 cargo run
 # Enable persistence
 KVNS_PERSIST_PATH=/var/lib/kvns/db.rkyv KVNS_PERSIST_INTERVAL=60 cargo run
 
-# Enable LRU eviction at 80% memory usage
-KVNS_EVICTION_POLICY=lru KVNS_EVICTION_THRESHOLD=0.8 cargo run
+# Enable LFU eviction at 80% memory usage
+KVNS_EVICTION_POLICY=lfu KVNS_EVICTION_THRESHOLD=0.8 cargo run
 
-# Override one namespace to MRU while global policy is LRU
-KVNS_EVICTION_POLICY=lru KVNS_NS_EVICTION=cache:mru cargo run
+# Override one namespace to MFU while global policy is LFU
+KVNS_EVICTION_POLICY=lfu KVNS_NS_EVICTION=cache:mfu cargo run
 
 # Run the experimental sharded backend
 KVNS_SHARDED_MODE=true KVNS_SHARD_COUNT=64 cargo run
@@ -209,13 +209,19 @@ When a write would exceed the effective `KVNS_MEMORY_LIMIT`, kvns either rejects
 | Policy | Description |
 | --- | --- |
 | `none` | No eviction (default). Writes beyond limit return an error. |
-| `lru` | Evict lowest-hit keys first. |
-| `mru` | Evict highest-hit keys first. |
+| `lfu` | Least-frequently-used: evict lowest-hit keys first. |
+| `mfu` | Most-frequently-used: evict highest-hit keys first. |
 | `ear` | Expire-after-read: keys are deleted on the next background sweep after being read. Aliases: `expire_after_read`, `expireafterread`. |
 
 `KVNS_EVICTION_THRESHOLD` controls when eviction begins. With `1.0` (default), eviction starts only at full configured capacity. Lower values (for example `0.8`) start eviction earlier.
 
 `KVNS_NS_EVICTION` supports comma-separated `namespace:policy` overrides. Eviction is namespace-scoped: a write in one namespace never evicts keys from another namespace.
+
+An unrecognized policy in `KVNS_EVICTION_POLICY` or `KVNS_NS_EVICTION` is a fatal error: kvns logs the offending value and exits rather than starting up with eviction silently disabled. For example, `KVNS_EVICTION_POLICY=lru` (not a valid policy) aborts startup with:
+
+```
+ERROR kvns: invalid configuration: invalid KVNS_EVICTION_POLICY "lru"; expected one of: none, lfu, mfu, ear
+```
 
 ## Persistence
 

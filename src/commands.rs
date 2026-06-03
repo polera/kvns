@@ -7066,7 +7066,7 @@ mod tests {
         let store = Arc::new(
             StoreShards::new(config::DEFAULT_MEMORY_LIMIT, 8).with_eviction(
                 1.0,
-                config::EvictionPolicy::Lru,
+                config::EvictionPolicy::Lfu,
                 HashMap::new(),
             ),
         );

@@ -206,7 +206,7 @@ impl Clone for ValueCell {
 
 pub(crate) struct Entry {
     pub(crate) value: ValueCell,
-    /// Hit counter for LRU/MRU eviction.  Stored as an atomic so read commands
+    /// Hit counter for LFU/MFU eviction.  Stored as an atomic so read commands
     /// can increment it while holding only a read lock on the store.
     pub(crate) hits: AtomicU64,
     pub(crate) expiry: Option<Instant>,
@@ -365,15 +365,15 @@ impl Db {
     fn policy_for_namespace(&self, namespace: &str) -> EvictionPolicy {
         self.namespace_eviction_policies
             .get(namespace)
-            .cloned()
-            .unwrap_or_else(|| self.eviction_policy.clone())
+            .copied()
+            .unwrap_or(self.eviction_policy)
     }
 
     /// Whether reads in `namespace` should update hit counters for eviction.
     pub(crate) fn tracks_hits(&self, namespace: &str) -> bool {
         matches!(
             self.policy_for_namespace(namespace),
-            EvictionPolicy::Lru | EvictionPolicy::Mru
+            EvictionPolicy::Lfu | EvictionPolicy::Mfu
         )
     }
 
@@ -457,8 +457,8 @@ impl Db {
             // 6. Sort sample by eviction order (sample is ≤ 32 items; plain sort
             //    is fine).
             match policy {
-                EvictionPolicy::Lru => candidates.sort_unstable_by_key(|(_, hits, _)| *hits),
-                EvictionPolicy::Mru => {
+                EvictionPolicy::Lfu => candidates.sort_unstable_by_key(|(_, hits, _)| *hits),
+                EvictionPolicy::Mfu => {
                     candidates.sort_unstable_by_key(|(_, hits, _)| Reverse(*hits))
                 }
                 EvictionPolicy::None | EvictionPolicy::ExpireAfterRead => unreachable!(),
@@ -737,7 +737,7 @@ impl StoreShards {
         for shard in self.shards.iter() {
             let mut db = shard.write();
             db.eviction_threshold = threshold;
-            db.eviction_policy = policy.clone();
+            db.eviction_policy = policy;
             db.namespace_eviction_policies = namespace_policies.clone();
         }
         self
@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn evict_for_write_returns_true_when_net_delta_zero() {
-        let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lru);
+        let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lfu);
         assert!(db.evict_for_write("ns", 0));
     }
 
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn evict_for_write_returns_false_below_threshold() {
         // threshold=1.0 → threshold_bytes=100; used_bytes=6 < 100 → no eviction
-        let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lru);
+        let mut db = make_db_with_eviction(100, 1.0, EvictionPolicy::Lfu);
         // "ns"(2) + "a"(1) + "vvv"(3) = 6
         db.put(
             "ns",
@@ -952,9 +952,9 @@ mod tests {
     }
 
     #[test]
-    fn evict_lru_evicts_lowest_hit_key_first() {
+    fn evict_lfu_evicts_lowest_hit_key_first() {
         // memory_limit=30, threshold=0.0 → always triggers
-        let mut db = make_db_with_eviction(30, 0.0, EvictionPolicy::Lru);
+        let mut db = make_db_with_eviction(30, 0.0, EvictionPolicy::Lfu);
         // Each entry: "ns"(2)+"x"(1)+"vvv"(3) = 6 bytes; 3 entries = 18 used
         let entry_size = populate_ns(&mut db, "ns", &[("a", 3), ("b", 1), ("c", 5)], b"vvv");
         assert_eq!(db.used_bytes, entry_size * 3);
@@ -969,8 +969,8 @@ mod tests {
     }
 
     #[test]
-    fn evict_mru_evicts_highest_hit_key_first() {
-        let mut db = make_db_with_eviction(30, 0.0, EvictionPolicy::Mru);
+    fn evict_mfu_evicts_highest_hit_key_first() {
+        let mut db = make_db_with_eviction(30, 0.0, EvictionPolicy::Mfu);
         populate_ns(&mut db, "ns", &[("a", 3), ("b", 1), ("c", 5)], b"vvv");
         // net_delta=15: overflow=3; c (hits=5) evicted first
         assert!(db.evict_for_write("ns", 15));
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn evict_for_write_returns_false_when_not_enough_keys_to_evict() {
-        let mut db = make_db_with_eviction(10, 0.0, EvictionPolicy::Lru);
+        let mut db = make_db_with_eviction(10, 0.0, EvictionPolicy::Lfu);
         // "ns"(2)+"a"(1)+"vvv"(3) = 6 bytes; net_delta=10 → need 6+10=16, overflow=6
         // Only 6 bytes available to free (evict "a"), but 6 < overflow=6 → freed=6 >= overflow=6 → fits
         // Actually 6-6+10 = 10 <= 10 → true. Let's use a bigger delta.
@@ -1002,7 +1002,7 @@ mod tests {
         // memory_limit=12, threshold=0.0, LRU
         // "ns"(2)+"a"(1)+"vvv"(3)=6, "ns"(2)+"b"(1)+"vvv"(3)=6 → used=12
         // net_delta=6: 12+6=18, overflow=6; evict "a"(6) → used=6, 6+6=12 <= 12 → true
-        let mut db = make_db_with_eviction(12, 0.0, EvictionPolicy::Lru);
+        let mut db = make_db_with_eviction(12, 0.0, EvictionPolicy::Lfu);
         populate_ns(&mut db, "ns", &[("a", 0), ("b", 1)], b"vvv");
         assert_eq!(db.used_bytes, 12);
         assert!(db.evict_for_write("ns", 6));
@@ -1012,10 +1012,10 @@ mod tests {
     #[test]
     fn per_namespace_policy_overrides_global() {
         let mut ns_policies = HashMap::new();
-        ns_policies.insert("special".to_owned(), EvictionPolicy::Mru);
-        let db = Db::new(100).with_eviction(1.0, EvictionPolicy::Lru, ns_policies);
-        assert_eq!(db.policy_for_namespace("special"), EvictionPolicy::Mru);
-        assert_eq!(db.policy_for_namespace("other"), EvictionPolicy::Lru);
+        ns_policies.insert("special".to_owned(), EvictionPolicy::Mfu);
+        let db = Db::new(100).with_eviction(1.0, EvictionPolicy::Lfu, ns_policies);
+        assert_eq!(db.policy_for_namespace("special"), EvictionPolicy::Mfu);
+        assert_eq!(db.policy_for_namespace("other"), EvictionPolicy::Lfu);
     }
 
     #[test]
@@ -1060,11 +1060,11 @@ mod tests {
     }
 
     #[test]
-    fn tracks_hits_returns_true_for_lru_and_mru() {
-        let db_lru = Db::new(1000).with_eviction(1.0, EvictionPolicy::Lru, HashMap::new());
-        assert!(db_lru.tracks_hits("any"));
-        let db_mru = Db::new(1000).with_eviction(1.0, EvictionPolicy::Mru, HashMap::new());
-        assert!(db_mru.tracks_hits("any"));
+    fn tracks_hits_returns_true_for_lfu_and_mfu() {
+        let db_lfu = Db::new(1000).with_eviction(1.0, EvictionPolicy::Lfu, HashMap::new());
+        assert!(db_lfu.tracks_hits("any"));
+        let db_mfu = Db::new(1000).with_eviction(1.0, EvictionPolicy::Mfu, HashMap::new());
+        assert!(db_mfu.tracks_hits("any"));
     }
 
     #[test]

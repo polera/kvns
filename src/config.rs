@@ -8,20 +8,22 @@ pub const DEFAULT_MAX_RESP_ARGS: usize = 1_024;
 pub const DEFAULT_MAX_RESP_BULK_LEN: usize = 16 * 1024 * 1024; // 16 MiB
 pub const DEFAULT_MAX_RESP_INLINE_LEN: usize = 64 * 1024; // 64 KiB
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum EvictionPolicy {
     #[default]
     None,
-    Lru,
-    Mru,
+    /// Least-frequently-used: evict lowest-hit keys first.
+    Lfu,
+    /// Most-frequently-used: evict highest-hit keys first.
+    Mfu,
     ExpireAfterRead,
 }
 
 impl EvictionPolicy {
     fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "lru" => Some(EvictionPolicy::Lru),
-            "mru" => Some(EvictionPolicy::Mru),
+            "lfu" => Some(EvictionPolicy::Lfu),
+            "mfu" => Some(EvictionPolicy::Mfu),
             "none" => Some(EvictionPolicy::None),
             "ear" | "expire_after_read" | "expireafterread" => {
                 Some(EvictionPolicy::ExpireAfterRead)
@@ -31,7 +33,35 @@ impl EvictionPolicy {
     }
 }
 
-#[derive(Clone)]
+/// Invalid configuration that should stop the server from starting rather than
+/// have it run with a surprising default (e.g. eviction silently disabled).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `KVNS_EVICTION_POLICY` was set to an unrecognised value.
+    InvalidEvictionPolicy(String),
+    /// A `namespace:policy` pair in `KVNS_NS_EVICTION` named an unknown policy.
+    InvalidNsEvictionPolicy { namespace: String, policy: String },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::InvalidEvictionPolicy(value) => write!(
+                f,
+                "invalid KVNS_EVICTION_POLICY {value:?}; expected one of: none, lfu, mfu, ear"
+            ),
+            ConfigError::InvalidNsEvictionPolicy { namespace, policy } => write!(
+                f,
+                "invalid eviction policy {policy:?} for namespace {namespace:?} in \
+                 KVNS_NS_EVICTION; expected one of: none, lfu, mfu, ear"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
     pub host: String,
@@ -104,7 +134,7 @@ impl Config {
             .unwrap_or(default)
     }
 
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, ConfigError> {
         let mut cfg = Self::from_vars(
             std::env::var("KVNS_PORT").ok().as_deref(),
             std::env::var("KVNS_HOST").ok().as_deref(),
@@ -116,7 +146,7 @@ impl Config {
             std::env::var("KVNS_EVICTION_THRESHOLD").ok().as_deref(),
             std::env::var("KVNS_EVICTION_POLICY").ok().as_deref(),
             std::env::var("KVNS_NS_EVICTION").ok().as_deref(),
-        );
+        )?;
         cfg.sharded_mode = std::env::var("KVNS_SHARDED_MODE")
             .ok()
             .as_deref()
@@ -132,7 +162,7 @@ impl Config {
         cfg.max_resp_args = Self::env_parse("KVNS_MAX_RESP_ARGS", cfg.max_resp_args, |v| *v > 0);
         cfg.max_resp_bulk_len = Self::env_parse("KVNS_MAX_RESP_BULK_LEN", cfg.max_resp_bulk_len, |v| *v > 0);
         cfg.max_resp_inline_len = Self::env_parse("KVNS_MAX_RESP_INLINE_LEN", cfg.max_resp_inline_len, |v| *v > 0);
-        cfg
+        Ok(cfg)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -147,9 +177,21 @@ impl Config {
         eviction_threshold: Option<&str>,
         eviction_policy: Option<&str>,
         ns_eviction: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self, ConfigError> {
         let defaults = Self::default();
-        Self {
+        // Eviction settings fail loudly on a bad value rather than silently
+        // falling back to "no eviction" — a misconfigured cache should not
+        // quietly behave as if eviction were disabled.
+        let eviction_policy = match eviction_policy {
+            None => defaults.eviction_policy,
+            Some(s) => EvictionPolicy::from_str(s)
+                .ok_or_else(|| ConfigError::InvalidEvictionPolicy(s.to_string()))?,
+        };
+        let namespace_eviction_policies = match ns_eviction {
+            None => HashMap::new(),
+            Some(s) => Self::parse_ns_eviction(s)?,
+        };
+        Ok(Self {
             port: port.and_then(|s| s.parse().ok()).unwrap_or(defaults.port),
             host: host.map(|s| s.to_string()).unwrap_or(defaults.host),
             memory_limit: Self::parse_memory_limit(memory_limit, defaults.memory_limit),
@@ -166,12 +208,8 @@ impl Config {
             eviction_threshold: eviction_threshold
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(defaults.eviction_threshold),
-            eviction_policy: eviction_policy
-                .and_then(EvictionPolicy::from_str)
-                .unwrap_or(defaults.eviction_policy),
-            namespace_eviction_policies: ns_eviction
-                .map(Self::parse_ns_eviction)
-                .unwrap_or_default(),
+            eviction_policy,
+            namespace_eviction_policies,
             sharded_mode: defaults.sharded_mode,
             shard_count: defaults.shard_count,
             shared_values: defaults.shared_values,
@@ -179,7 +217,7 @@ impl Config {
             max_resp_args: defaults.max_resp_args,
             max_resp_bulk_len: defaults.max_resp_bulk_len,
             max_resp_inline_len: defaults.max_resp_inline_len,
-        }
+        })
     }
 
     fn parse_bool(s: &str) -> Option<bool> {
@@ -245,15 +283,24 @@ impl Config {
         })
     }
 
-    /// Parse `"ns1:lru,ns2:mru"` into a `HashMap<String, EvictionPolicy>`.
-    fn parse_ns_eviction(s: &str) -> HashMap<String, EvictionPolicy> {
+    /// Parse `"ns1:lfu,ns2:mfu"` into a `HashMap<String, EvictionPolicy>`.
+    ///
+    /// Empty segments (e.g. a trailing comma) are ignored, but a segment that
+    /// names an unknown policy is rejected rather than silently dropped.
+    fn parse_ns_eviction(s: &str) -> Result<HashMap<String, EvictionPolicy>, ConfigError> {
         s.split(',')
-            .filter_map(|pair| {
+            .filter(|pair| !pair.trim().is_empty())
+            .map(|pair| {
                 let mut parts = pair.splitn(2, ':');
-                let ns = parts.next()?.trim().to_string();
-                let policy_str = parts.next()?.trim();
-                let policy = EvictionPolicy::from_str(policy_str)?;
-                Some((ns, policy))
+                let namespace = parts.next().unwrap_or("").trim().to_string();
+                let policy_str = parts.next().unwrap_or("").trim();
+                let policy = EvictionPolicy::from_str(policy_str).ok_or_else(|| {
+                    ConfigError::InvalidNsEvictionPolicy {
+                        namespace: namespace.clone(),
+                        policy: policy_str.to_string(),
+                    }
+                })?;
+                Ok((namespace, policy))
             })
             .collect()
     }
@@ -271,6 +318,37 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Thin wrapper for tests that expect a valid configuration; panics if
+    /// `from_vars` rejects the inputs. Tests that exercise the error path call
+    /// `Config::from_vars` directly and inspect the `Result`.
+    #[allow(clippy::too_many_arguments)]
+    fn from_vars(
+        port: Option<&str>,
+        host: Option<&str>,
+        memory_limit: Option<&str>,
+        metrics_port: Option<&str>,
+        metrics_host: Option<&str>,
+        persist_path: Option<&str>,
+        persist_interval: Option<&str>,
+        eviction_threshold: Option<&str>,
+        eviction_policy: Option<&str>,
+        ns_eviction: Option<&str>,
+    ) -> Config {
+        Config::from_vars(
+            port,
+            host,
+            memory_limit,
+            metrics_port,
+            metrics_host,
+            persist_path,
+            persist_interval,
+            eviction_threshold,
+            eviction_policy,
+            ns_eviction,
+        )
+        .expect("test config should be valid")
+    }
+
     #[test]
     fn defaults_are_correct() {
         let c = Config::default();
@@ -285,7 +363,7 @@ mod tests {
 
     #[test]
     fn from_vars_all_none_returns_defaults() {
-        let c = Config::from_vars(None, None, None, None, None, None, None, None, None, None);
+        let c = from_vars(None, None, None, None, None, None, None, None, None, None);
         assert_eq!(c.port, 6480);
         assert_eq!(c.host, "0.0.0.0");
         assert_eq!(c.memory_limit, DEFAULT_MEMORY_LIMIT);
@@ -297,7 +375,7 @@ mod tests {
 
     #[test]
     fn from_vars_port_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             Some("7000"),
             None,
             None,
@@ -314,7 +392,7 @@ mod tests {
 
     #[test]
     fn from_vars_host_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             Some("127.0.0.1"),
             None,
@@ -331,7 +409,7 @@ mod tests {
 
     #[test]
     fn from_vars_memory_limit_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             Some("2048"),
@@ -374,7 +452,7 @@ mod tests {
 
     #[test]
     fn from_vars_zero_memory_limit_uses_detected_cap() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             Some("0"),
@@ -402,7 +480,7 @@ mod tests {
         let cap = Config::clamp_memory_limit_to_system(0, total_memory_bytes);
         let configured = cap.saturating_add(1);
         let configured_str = configured.to_string();
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             Some(&configured_str),
@@ -419,7 +497,7 @@ mod tests {
 
     #[test]
     fn from_vars_invalid_port_falls_back_to_default() {
-        let c = Config::from_vars(
+        let c = from_vars(
             Some("not_a_port"),
             None,
             None,
@@ -436,7 +514,7 @@ mod tests {
 
     #[test]
     fn from_vars_invalid_memory_limit_falls_back_to_default() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             Some("not_a_number"),
@@ -459,7 +537,7 @@ mod tests {
 
     #[test]
     fn listen_addr_custom_host_and_port() {
-        let c = Config::from_vars(
+        let c = from_vars(
             Some("9000"),
             Some("127.0.0.1"),
             None,
@@ -483,7 +561,7 @@ mod tests {
 
     #[test]
     fn from_vars_metrics_port_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -500,7 +578,7 @@ mod tests {
 
     #[test]
     fn from_vars_metrics_host_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -517,7 +595,7 @@ mod tests {
 
     #[test]
     fn from_vars_invalid_metrics_port_falls_back_to_default() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -547,7 +625,7 @@ mod tests {
 
     #[test]
     fn from_vars_persist_path_set() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -564,7 +642,7 @@ mod tests {
 
     #[test]
     fn from_vars_persist_interval_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -581,7 +659,7 @@ mod tests {
 
     #[test]
     fn from_vars_persist_interval_invalid_falls_back_to_default() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -607,13 +685,13 @@ mod tests {
     }
 
     #[test]
-    fn eviction_policy_from_str_parses_lru() {
-        assert_eq!(EvictionPolicy::from_str("lru"), Some(EvictionPolicy::Lru));
+    fn eviction_policy_from_str_parses_lfu() {
+        assert_eq!(EvictionPolicy::from_str("lfu"), Some(EvictionPolicy::Lfu));
     }
 
     #[test]
-    fn eviction_policy_from_str_parses_mru() {
-        assert_eq!(EvictionPolicy::from_str("mru"), Some(EvictionPolicy::Mru));
+    fn eviction_policy_from_str_parses_mfu() {
+        assert_eq!(EvictionPolicy::from_str("mfu"), Some(EvictionPolicy::Mfu));
     }
 
     #[test]
@@ -623,8 +701,8 @@ mod tests {
 
     #[test]
     fn eviction_policy_from_str_case_insensitive() {
-        assert_eq!(EvictionPolicy::from_str("LRU"), Some(EvictionPolicy::Lru));
-        assert_eq!(EvictionPolicy::from_str("MRU"), Some(EvictionPolicy::Mru));
+        assert_eq!(EvictionPolicy::from_str("LFU"), Some(EvictionPolicy::Lfu));
+        assert_eq!(EvictionPolicy::from_str("MFU"), Some(EvictionPolicy::Mfu));
         assert_eq!(EvictionPolicy::from_str("NONE"), Some(EvictionPolicy::None));
     }
 
@@ -656,7 +734,7 @@ mod tests {
 
     #[test]
     fn from_vars_ns_eviction_ear() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -676,34 +754,45 @@ mod tests {
 
     #[test]
     fn parse_ns_eviction_single_pair() {
-        let map = Config::parse_ns_eviction("ns1:lru");
-        assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lru));
+        let map = Config::parse_ns_eviction("ns1:lfu").unwrap();
+        assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lfu));
     }
 
     #[test]
     fn parse_ns_eviction_multiple_pairs() {
-        let map = Config::parse_ns_eviction("ns1:lru,ns2:mru");
-        assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lru));
-        assert_eq!(map.get("ns2"), Some(&EvictionPolicy::Mru));
+        let map = Config::parse_ns_eviction("ns1:lfu,ns2:mfu").unwrap();
+        assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lfu));
+        assert_eq!(map.get("ns2"), Some(&EvictionPolicy::Mfu));
     }
 
     #[test]
     fn parse_ns_eviction_empty_string_returns_empty_map() {
-        let map = Config::parse_ns_eviction("");
+        let map = Config::parse_ns_eviction("").unwrap();
         assert!(map.is_empty());
     }
 
     #[test]
-    fn parse_ns_eviction_invalid_policy_skipped() {
-        let map = Config::parse_ns_eviction("ns1:lru,ns2:fifo,ns3:mru");
-        assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lru));
-        assert!(!map.contains_key("ns2"));
-        assert_eq!(map.get("ns3"), Some(&EvictionPolicy::Mru));
+    fn parse_ns_eviction_trailing_comma_is_ignored() {
+        let map = Config::parse_ns_eviction("ns1:lfu,").unwrap();
+        assert_eq!(map.get("ns1"), Some(&EvictionPolicy::Lfu));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn parse_ns_eviction_invalid_policy_errors() {
+        let err = Config::parse_ns_eviction("ns1:lfu,ns2:fifo,ns3:mfu").unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNsEvictionPolicy {
+                namespace: "ns2".to_string(),
+                policy: "fifo".to_string(),
+            }
+        );
     }
 
     #[test]
     fn from_vars_eviction_threshold_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -720,7 +809,7 @@ mod tests {
 
     #[test]
     fn from_vars_eviction_policy_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -729,15 +818,15 @@ mod tests {
             None,
             None,
             None,
-            Some("lru"),
+            Some("lfu"),
             None,
         );
-        assert_eq!(c.eviction_policy, EvictionPolicy::Lru);
+        assert_eq!(c.eviction_policy, EvictionPolicy::Lfu);
     }
 
     #[test]
     fn from_vars_ns_eviction_override() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -747,21 +836,21 @@ mod tests {
             None,
             None,
             None,
-            Some("ns1:lru,ns2:mru"),
+            Some("ns1:lfu,ns2:mfu"),
         );
         assert_eq!(
             c.namespace_eviction_policies.get("ns1"),
-            Some(&EvictionPolicy::Lru)
+            Some(&EvictionPolicy::Lfu)
         );
         assert_eq!(
             c.namespace_eviction_policies.get("ns2"),
-            Some(&EvictionPolicy::Mru)
+            Some(&EvictionPolicy::Mfu)
         );
     }
 
     #[test]
     fn from_vars_invalid_eviction_threshold_falls_back_to_default() {
-        let c = Config::from_vars(
+        let c = from_vars(
             None,
             None,
             None,
@@ -777,8 +866,8 @@ mod tests {
     }
 
     #[test]
-    fn from_vars_invalid_eviction_policy_falls_back_to_default() {
-        let c = Config::from_vars(
+    fn from_vars_invalid_eviction_policy_errors() {
+        let err = Config::from_vars(
             None,
             None,
             None,
@@ -789,7 +878,35 @@ mod tests {
             None,
             Some("fifo"),
             None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidEvictionPolicy("fifo".to_string())
         );
-        assert_eq!(c.eviction_policy, EvictionPolicy::None);
+    }
+
+    #[test]
+    fn from_vars_invalid_ns_eviction_policy_errors() {
+        let err = Config::from_vars(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("cache:bogus"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNsEvictionPolicy {
+                namespace: "cache".to_string(),
+                policy: "bogus".to_string(),
+            }
+        );
     }
 }

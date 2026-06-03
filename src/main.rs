@@ -28,6 +28,16 @@ fn init_tracing() {
         .init();
 }
 
+/// Load configuration from the environment, exiting with a clear message if it
+/// is invalid (e.g. an unknown `KVNS_EVICTION_POLICY`) so the server never
+/// starts up silently misconfigured.
+fn load_config() -> config::Config {
+    config::Config::from_env().unwrap_or_else(|e| {
+        error!("invalid configuration: {e}");
+        std::process::exit(1);
+    })
+}
+
 fn install_metrics(config: &config::Config) {
     let metrics_addr: SocketAddr = config
         .metrics_listen_addr()
@@ -63,7 +73,7 @@ fn build_backend(config: &config::Config) -> (server::Backend, Option<store::Sto
         let store = Arc::new(
             store::StoreShards::new(config.memory_limit, config.shard_count).with_eviction(
                 config.eviction_threshold,
-                config.eviction_policy.clone(),
+                config.eviction_policy,
                 config.namespace_eviction_policies.clone(),
             ),
         );
@@ -132,7 +142,7 @@ fn main() {
     use tracing::debug;
     init_tracing();
 
-    let config = config::Config::from_env();
+    let config = load_config();
     // Apply before anything constructs an Entry (including snapshot load).
     store::set_shared_values(config.shared_values);
     let addr = config.listen_addr();
@@ -260,7 +270,7 @@ async fn main() {
     use tracing::debug;
     init_tracing();
 
-    let config = config::Config::from_env();
+    let config = load_config();
     // Apply before anything constructs an Entry (including snapshot load).
     store::set_shared_values(config.shared_values);
     install_metrics(&config);
